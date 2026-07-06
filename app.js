@@ -219,6 +219,8 @@
     settingsTab: "api",
     activeProviderIndex: 0,
     pendingUploadFiles: [],
+    selectedPendingUploadKeys: [],
+    uploadProgress: null,
     selectedFragmentId: null,
     filterGroup: "all",
     selectedOutfitTags: [],
@@ -825,7 +827,6 @@
       <main class="login-screen">
         <form class="panel login-card" id="loginForm">
           <div class="brand">
-            <span class="brand-mark">PA</span>
             <div>
               <h1>프롬프트 아카이브</h1>
               <p>관리자 작업 화면으로 들어갑니다.</p>
@@ -856,7 +857,6 @@
     return `
       <header class="topbar album-topbar">
         <button class="brand-inline" data-view="gallery" type="button" aria-label="갤러리로 이동">
-          <span class="brand-mark">PA</span>
           <span>프롬프트 아카이브</span>
         </button>
         <div class="topbar-center">
@@ -925,11 +925,12 @@
     const sorters = {
       latest: (a, b) => b.createdAt - a.createdAt,
       oldest: (a, b) => a.createdAt - b.createdAt,
-      favorite: (a, b) => Number(b.isFavorite) - Number(a.isFavorite) || b.createdAt - a.createdAt,
+      favorite: (a, b) => b.createdAt - a.createdAt,
       failed: (a, b) => Number(b.status === "analysis_failed") - Number(a.status === "analysis_failed") || b.createdAt - a.createdAt,
       modified: (a, b) => b.updatedAt - a.updatedAt,
     };
-    return items.sort(sorters[ui.sort] || sorters.latest);
+    const sorter = sorters[ui.sort] || sorters.latest;
+    return items.sort((a, b) => Number(b.isFavorite) - Number(a.isFavorite) || sorter(a, b));
   }
 
   function renderGallery() {
@@ -942,17 +943,11 @@
     const showTopPager = ["top", "both"].includes(state.albumSettings.paginationPosition);
     const showBottomPager = ["bottom", "both"].includes(state.albumSettings.paginationPosition);
     return `
-      <div class="page-head album-head">
-        <div>
-          <h2 class="page-title">앨범</h2>
-          <p class="page-copy">${state.albumSettings.columns} x ${state.albumSettings.rows}, 페이지당 ${perPage}개 표시</p>
-        </div>
-        <div class="toolbar">
-          <button class="ghost-btn" data-action="bulkAnalyze" type="button">대기 항목 분석</button>
-          <button class="ghost-btn" data-action="exportJson" type="button">JSON 내보내기</button>
-        </div>
-      </div>
       ${renderAlbumFilters()}
+      <div class="album-action-row">
+        <button class="ghost-btn" data-action="bulkAnalyze" type="button">대기 항목 분석</button>
+        <button class="ghost-btn" data-action="exportJson" type="button">JSON 내보내기</button>
+      </div>
       ${showTopPager ? pager : ""}
       ${pageItems.length ? `<div class="gallery-grid album-grid" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map(renderImageCard).join("")}</div>` : renderEmptyGallery()}
       ${showBottomPager ? pager : ""}
@@ -962,13 +957,22 @@
   function renderAlbumFilters() {
     return `
       <div class="album-filter-bar">
-        <div class="category-tabs">
-          ${filterGroupButton("all", "전체")}
-          ${filterGroupButton("outfit", "복장")}
-          ${filterGroupButton("background", "배경")}
+        <div class="album-filter-summary">
+          <div class="category-tabs">
+            ${filterGroupButton("all", "전체")}
+            ${filterGroupButton("outfit", "복장")}
+            ${filterGroupButton("background", "배경")}
+          </div>
+          <div class="category-tabs album-category-tabs">
+            ${categoryFilterButton("all", "전체", "slate")}
+            ${state.categories.map((category) => categoryFilterButton(category.id, category.name, category.color)).join("")}
+            <button class="chip-btn subcategory-anchor" data-filter-group="${ui.filterGroup === "background" ? "outfit" : "background"}" type="button">하위 카테고리</button>
+          </div>
         </div>
-        ${ui.filterGroup === "outfit" ? renderTagFilter("outfit", state.outfitTagOptions, ui.selectedOutfitTags) : ""}
-        ${ui.filterGroup === "background" ? renderTagFilter("background", state.backgroundTagOptions, ui.selectedBackgroundTags) : ""}
+        <div class="subcategory-filter-stack">
+          ${renderTagFilter("outfit", state.outfitTagOptions, ui.selectedOutfitTags)}
+          ${renderTagFilter("background", state.backgroundTagOptions, ui.selectedBackgroundTags)}
+        </div>
       </div>
     `;
   }
@@ -977,10 +981,19 @@
     return `<button class="chip-btn ${ui.filterGroup === group ? "active" : ""}" data-filter-group="${group}" type="button">${label}</button>`;
   }
 
+  function categoryFilterButton(id, label, color) {
+    const active = ui.category === id;
+    return `<button class="chip-btn category-filter-chip category-${escapeHtml(color || "blue")} ${active ? "active" : ""}" data-category-filter="${escapeHtml(id)}" type="button">${escapeHtml(label)}</button>`;
+  }
+
   function renderTagFilter(type, options, selected) {
+    const label = type === "outfit" ? "복장" : "배경";
     return `
-      <div class="tag-filter-row">
+      <div class="subcategory-filter-row ${type === "outfit" ? "outfit-row" : "background-row"}">
+        <button class="chip-btn filter-row-label ${ui.filterGroup === type ? "active" : ""}" data-filter-group="${type}" type="button">${label}</button>
+        <div class="tag-filter-row">
         ${options.filter((tag) => tag.enabled !== false).map((tag) => `<button class="chip-btn ${selected.includes(tag.key) ? "active" : ""}" data-tag-filter="${type}" data-key="${tag.key}" type="button">${escapeHtml(tag.name)}</button>`).join("")}
+        </div>
       </div>
     `;
   }
@@ -1004,6 +1017,7 @@
       <article class="panel image-card" data-open-item="${item.id}" tabindex="0">
         <div class="thumb">
           <img src="${item.thumbnailUrl || item.imageUrl}" alt="${escapeHtml(title)}">
+          <button class="favorite-toggle ${item.isFavorite ? "active" : ""}" data-action="favorite" data-id="${item.id}" type="button" aria-label="${item.isFavorite ? "즐겨찾기 해제" : "즐겨찾기"}">${item.isFavorite ? "★" : "☆"}</button>
         </div>
         <div class="card-body">
           <h3 class="card-title">${escapeHtml(title)}</h3>
@@ -1107,10 +1121,13 @@
           </div>
         </div>
         ${renderPendingUploadFiles()}
-        <div class="toolbar" style="margin-top: var(--space-4);">
-          <button class="ghost-btn" data-action="clearPendingUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>선택 초기화</button>
-          <button class="ghost-btn" data-action="savePendingUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>저장</button>
+        <div class="upload-action-row">
+          <div class="toolbar">
+          <button class="ghost-btn" data-action="removeSelectedPendingUploads" type="button" ${ui.selectedPendingUploadKeys.length ? "" : "disabled"}>선택 지우기</button>
+          <button class="ghost-btn" data-action="clearUploadWorkspace" type="button" ${ui.pendingUploadFiles.length || ui.uploadQueue.length ? "" : "disabled"}>비우기</button>
           <button class="primary-btn" data-action="saveAndAnalyzeUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>저장 및 분석</button>
+          </div>
+          ${renderUploadProgress()}
         </div>
         <div id="queueList" class="queue-list">${renderQueue()}</div>
         <div class="form-grid" style="margin-top: var(--space-4);">
@@ -1167,15 +1184,27 @@
     if (!ui.pendingUploadFiles.length) return "";
     return `
       <div class="pending-preview-grid" aria-label="선택한 업로드 파일 미리보기">
-        ${ui.pendingUploadFiles.map((file) => `
-          <article class="pending-preview-card">
+        ${ui.pendingUploadFiles.map((file) => {
+          const key = pendingUploadKey(file);
+          const selected = ui.selectedPendingUploadKeys.includes(key);
+          return `
+          <button class="pending-preview-card ${selected ? "selected" : ""}" data-action="togglePendingUpload" data-key="${escapeHtml(key)}" type="button" aria-pressed="${selected ? "true" : "false"}">
             <img src="${escapeHtml(pendingUploadPreviewUrl(file))}" alt="${escapeHtml(file.name)}">
             <strong>${escapeHtml(file.name)}</strong>
             <span>${formatBytes(file.size)}</span>
-          </article>
-        `).join("")}
+          </button>
+        `; }).join("")}
       </div>
     `;
+  }
+
+  function renderUploadProgress() {
+    if (!ui.uploadProgress) return "";
+    return `<div class="upload-progress-pill" aria-live="polite">${ui.uploadProgress.done}/${ui.uploadProgress.total}</div>`;
+  }
+
+  function pendingUploadKey(file) {
+    return `${file.name}:${file.size}:${file.lastModified}`;
   }
 
   function pendingUploadPreviewUrl(file) {
@@ -1286,7 +1315,7 @@
             ` : ""}
             <div class="toolbar">
               <span class="status-pill">${statusLabel(item.status)}</span>
-              <button class="ghost-btn" data-action="saveMeta" data-id="${item.id}" type="button">메타 저장</button>
+              <button class="primary-btn" data-action="saveDetail" data-id="${item.id}" type="button">저장</button>
               <button class="danger-btn" data-action="deleteItem" data-id="${item.id}" type="button">삭제</button>
             </div>
             ${item.uploadMeta ? renderAssetSummary(item) : ""}
@@ -1883,6 +1912,13 @@
         render();
       });
     });
+    document.querySelectorAll("[data-category-filter]").forEach((node) => {
+      node.addEventListener("click", () => {
+        ui.category = node.dataset.categoryFilter;
+        ui.page = 1;
+        render();
+      });
+    });
     document.querySelectorAll("[data-tag-filter]").forEach((node) => {
       node.addEventListener("click", () => {
         const target = node.dataset.tagFilter === "outfit" ? ui.selectedOutfitTags : ui.selectedBackgroundTags;
@@ -1975,12 +2011,9 @@
       render();
     }
     if (action === "openUploaded") openItem(node.dataset.id);
-    if (action === "clearPendingUploads") {
-      revokePendingUploadUrls(ui.pendingUploadFiles);
-      ui.pendingUploadFiles = [];
-      render();
-    }
-    if (action === "savePendingUploads") await processPendingUploads(false);
+    if (action === "togglePendingUpload") togglePendingUpload(node.dataset.key);
+    if (action === "removeSelectedPendingUploads") removeSelectedPendingUploads();
+    if (action === "clearUploadWorkspace") clearUploadWorkspace();
     if (action === "saveAndAnalyzeUploads") await processPendingUploads(true);
     if (action === "analyzeOne") await analyzeItem(node.dataset.id);
     if (action === "bulkAnalyze") {
@@ -2002,7 +2035,7 @@
       render();
     }
     if (action === "regenerateSection") regenerateSection(node.dataset.id, node.dataset.section);
-    if (action === "saveMeta") saveMeta(node.dataset.id);
+    if (action === "saveDetail") saveDetail(node.dataset.id);
     if (action === "deleteItem") deleteItem(node.dataset.id);
     if (action === "addExcludeOption") addExcludeOption();
     if (action === "saveExcludeOption") saveExcludeOption(node.dataset.key);
@@ -2103,7 +2136,6 @@
         highlightPromptLink(ui.selectedSentenceId, null);
       });
       node.addEventListener("input", () => updateSentence(node));
-      node.addEventListener("blur", () => saveItemState(selectedItem()));
     });
   }
 
@@ -2145,15 +2177,17 @@
   function addPendingUploadFiles(fileList) {
     const files = [...(fileList || [])].filter((file) => file?.type?.startsWith("image/"));
     if (!files.length) return;
-    const existing = new Set(ui.pendingUploadFiles.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+    const existing = new Set(ui.pendingUploadFiles.map(pendingUploadKey));
     files.forEach((file) => {
-      const key = `${file.name}:${file.size}:${file.lastModified}`;
+      const key = pendingUploadKey(file);
       if (!existing.has(key)) {
         ui.pendingUploadFiles.push(file);
         existing.add(key);
       }
     });
     ui.pendingUploadFiles = ui.pendingUploadFiles.slice(0, state.advancedSettings.maxImagesPerBatch);
+    const validKeys = new Set(ui.pendingUploadFiles.map(pendingUploadKey));
+    ui.selectedPendingUploadKeys = ui.selectedPendingUploadKeys.filter((key) => validKeys.has(key));
     render();
   }
 
@@ -2171,7 +2205,37 @@
     const files = [...ui.pendingUploadFiles];
     revokePendingUploadUrls(ui.pendingUploadFiles);
     ui.pendingUploadFiles = [];
+    ui.selectedPendingUploadKeys = [];
     await processFiles(files, shouldAnalyze);
+  }
+
+  function togglePendingUpload(key) {
+    if (!key) return;
+    if (ui.selectedPendingUploadKeys.includes(key)) {
+      ui.selectedPendingUploadKeys = ui.selectedPendingUploadKeys.filter((entry) => entry !== key);
+    } else {
+      ui.selectedPendingUploadKeys = [...ui.selectedPendingUploadKeys, key];
+    }
+    render();
+  }
+
+  function removeSelectedPendingUploads() {
+    const selected = new Set(ui.selectedPendingUploadKeys);
+    if (!selected.size) return;
+    const removed = ui.pendingUploadFiles.filter((file) => selected.has(pendingUploadKey(file)));
+    revokePendingUploadUrls(removed);
+    ui.pendingUploadFiles = ui.pendingUploadFiles.filter((file) => !selected.has(pendingUploadKey(file)));
+    ui.selectedPendingUploadKeys = [];
+    render();
+  }
+
+  function clearUploadWorkspace() {
+    revokePendingUploadUrls(ui.pendingUploadFiles);
+    ui.pendingUploadFiles = [];
+    ui.selectedPendingUploadKeys = [];
+    ui.uploadQueue = [];
+    ui.uploadProgress = null;
+    render();
   }
 
   async function processFiles(fileList, shouldAnalyze = false) {
@@ -2181,7 +2245,9 @@
     const tags = [];
     const customInstruction = document.getElementById("uploadCustomInstruction")?.value.trim() || "";
     const excludeOptions = selectedCheckboxValues("uploadExclude");
-    for (const file of files) {
+    ui.uploadProgress = files.length ? { done: 0, total: files.length } : null;
+    render();
+    for (const [index, file] of files.entries()) {
       try {
         validateUploadFile(file);
         if (state.uploadSettings.detectDuplicates && isDuplicateFile(file)) {
@@ -2239,6 +2305,9 @@
           status: "업로드 오류",
           error: error.message || "이미지 변환에 실패했습니다.",
         });
+        render();
+      } finally {
+        if (ui.uploadProgress) ui.uploadProgress = { done: index + 1, total: files.length };
         render();
       }
     }
@@ -2387,9 +2456,24 @@
     return prompt;
   }
 
-  function saveMeta(id) {
+  function collectPromptEditsFromDom(item) {
+    if (!item?.promptJson) return;
+    document.querySelectorAll(".sentence[data-sentence-id][data-lang]").forEach((node) => {
+      const sentenceId = node.dataset.sentenceId;
+      const lang = node.dataset.lang;
+      Object.values(item.promptJson).forEach((section) => {
+        section.sentences.forEach((sentence) => {
+          if (sentence.id === sentenceId) sentence[lang] = node.textContent.trim();
+        });
+      });
+    });
+    item.finalPrompt = promptText(item, "final");
+  }
+
+  function saveDetail(id) {
     const item = findItem(id);
     if (!item) return;
+    collectPromptEditsFromDom(item);
     item.title = document.getElementById("detailTitle").value.trim();
     item.categoryId = document.getElementById("detailCategory").value;
     item.outfitTags = namesToTagKeys(document.getElementById("detailOutfitTags")?.value || "", "outfit");
@@ -2397,8 +2481,13 @@
     item.memo = document.getElementById("detailMemo").value.trim();
     item.customInstruction = document.getElementById("detailCustomInstruction")?.value.trim() || "";
     item.excludeOptions = selectedCheckboxValues("detailExclude");
+    if (item.promptJson) {
+      item.status = "modified";
+      item.finalPrompt = promptText(item, "final");
+    }
     item.updatedAt = Date.now();
     saveItemState(item);
+    showToast("저장했습니다.", "success", 1200);
     render();
   }
 
