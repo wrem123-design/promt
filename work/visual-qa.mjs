@@ -6,6 +6,7 @@ const require = createRequire("C:/Users/sy.lee/.cache/codex-runtimes/codex-prima
 const { chromium } = require("playwright");
 
 const evidenceDir = "C:/Users/sy.lee/Documents/Codex/2026-07-06/codex/.superloopy/evidence/frontend/20260706-165023-prompt-archive";
+const baseUrl = process.env.BASE_URL || "http://127.0.0.1:5173";
 fs.mkdirSync(evidenceDir, { recursive: true });
 
 const browser = await chromium.launch({
@@ -15,7 +16,7 @@ const browser = await chromium.launch({
 const results = [];
 
 async function login(page) {
-  await page.goto("http://127.0.0.1:5173", { waitUntil: "networkidle" });
+  await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.fill("#adminPassword", "archive-admin");
   await page.click("button[type='submit']");
   await page.waitForSelector(".gallery-grid, .empty-state");

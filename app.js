@@ -2,6 +2,9 @@
   const STORAGE_KEY = "promptArchiveState.v2";
   const LEGACY_STORAGE_KEY = "promptArchiveState.v1";
   const SESSION_KEY = "promptArchiveAdminSession";
+  const SERVER_STATE_ENDPOINT = "/api/state";
+  let serverAvailable = false;
+  let saveTimer = null;
 
   const defaultInstruction = `You are an expert prompt engineer for AI image generation.
 
@@ -203,6 +206,7 @@ Exclude rules:
 
   document.documentElement.dataset.theme = state.theme;
   applyThemeOptions();
+  bootServerState();
 
   function loadState() {
     const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -443,7 +447,49 @@ Exclude rules:
   }
 
   function saveState() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    if (!serverAvailable) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      return;
+    }
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(syncStateToServer, 180);
+  }
+
+  async function bootServerState() {
+    try {
+      const response = await fetch(SERVER_STATE_ENDPOINT, { cache: "no-store" });
+      if (!response.ok) return;
+      serverAvailable = true;
+      const payload = await response.json();
+      if (payload?.state) {
+        Object.assign(state, normalizeState(payload.state));
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+      } else {
+        await syncStateToServer();
+      }
+      render();
+    } catch (error) {
+      serverAvailable = false;
+    }
+  }
+
+  async function syncStateToServer() {
+    try {
+      const response = await fetch(SERVER_STATE_ENDPOINT, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state }),
+      });
+      if (!response.ok) throw new Error("Server state save failed");
+      const payload = await response.json();
+      if (payload?.state) Object.assign(state, normalizeState(payload.state));
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+    } catch (error) {
+      serverAvailable = false;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
   }
 
   function uid(prefix) {

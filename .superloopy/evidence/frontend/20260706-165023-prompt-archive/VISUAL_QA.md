@@ -2,11 +2,11 @@
 
 Project: 프롬프트 아카이브
 
-Local target: `http://127.0.0.1:5173`
+Local target: `http://127.0.0.1:5174` during the Node server test, `http://127.0.0.1:5173` for the default run script.
 
 ## Browser Checks
 
-Ran with Microsoft Edge through Playwright using the bundled Node runtime.
+Ran with Microsoft Edge through Playwright using the bundled Node runtime. The app was served through `server.js` during the final pass so `/api/health`, `/api/state`, file-backed state, and `/uploads` serving were exercised.
 
 Screenshots:
 - `qa-390-gallery.png`
@@ -38,6 +38,7 @@ Viewport results:
 - Upload view rendered the per-image custom instruction textarea and exclude-element checkboxes.
 - Upload and settings views opened as modal layers from the top icon menu.
 - Upload view rendered optimization settings summary, generated display/thumbnail/analysis assets, and showed original versus optimized size in the queue.
+- Server mode persisted state through `/api/state` and converted data URL image assets into files under `/uploads`.
 - Manual analysis generated the five prompt sections when an item had no prompt.
 - Detail view rendered per-image custom instruction and exclude-element editing controls.
 - Detail view rendered image optimization metadata when available.
