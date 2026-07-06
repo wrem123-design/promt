@@ -226,6 +226,8 @@
     selectedOutfitTags: [],
     selectedBackgroundTags: [],
     page: 1,
+    galleryLoadedPages: 1,
+    galleryLoading: false,
     uploadQueue: [],
   };
 
@@ -936,22 +938,35 @@
   function renderGallery() {
     const items = getFilteredItems();
     const perPage = state.albumSettings.columns * state.albumSettings.rows;
-    const pageCount = Math.max(1, Math.ceil(items.length / perPage));
-    ui.page = Math.min(Math.max(1, ui.page), pageCount);
-    const pageItems = items.slice((ui.page - 1) * perPage, ui.page * perPage);
-    const pager = renderPagination(pageCount);
-    const showTopPager = ["top", "both"].includes(state.albumSettings.paginationPosition);
-    const showBottomPager = ["bottom", "both"].includes(state.albumSettings.paginationPosition);
+    ui.galleryLoadedPages = Math.max(1, ui.galleryLoadedPages || 1);
+    const visibleCount = ui.galleryLoadedPages * perPage;
+    const pageItems = items.slice(0, visibleCount);
+    const hasMore = visibleCount < items.length;
     return `
       ${renderAlbumFilters()}
       <div class="album-action-row">
         <button class="ghost-btn" data-action="bulkAnalyze" type="button">대기 항목 분석</button>
         <button class="ghost-btn" data-action="exportJson" type="button">JSON 내보내기</button>
       </div>
-      ${showTopPager ? pager : ""}
       ${pageItems.length ? `<div class="gallery-grid album-grid" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map(renderImageCard).join("")}</div>` : renderEmptyGallery()}
-      ${showBottomPager ? pager : ""}
+      ${renderGalleryLoadMore(hasMore, pageItems.length, items.length)}
     `;
+  }
+
+  function renderGalleryLoadMore(hasMore, shownCount, totalCount) {
+    if (!totalCount) return "";
+    if (ui.galleryLoading) {
+      return `
+        <div class="infinite-loader" aria-live="polite">
+          <span class="loader-ring" aria-hidden="true"></span>
+          <span>${shownCount}/${totalCount} 불러오는 중</span>
+        </div>
+      `;
+    }
+    if (hasMore) {
+      return `<div class="infinite-loader subtle" aria-live="polite">${shownCount}/${totalCount} 표시 중, 아래로 더 스크롤하면 다음 묶음을 불러옵니다.</div>`;
+    }
+    return `<div class="infinite-loader subtle" aria-live="polite">전체 ${totalCount}개를 모두 표시했습니다.</div>`;
   }
 
   function renderAlbumFilters() {
@@ -1349,6 +1364,7 @@
         <div class="toolbar" style="margin: 0;">
           <button class="ghost-btn" data-action="copyPrompt" data-mode="ko" data-id="${item.id}" type="button">번역 전체 복사</button>
           <button class="ghost-btn" data-action="copyPrompt" data-mode="both" data-id="${item.id}" type="button">영어+번역 복사</button>
+          <button class="ghost-btn" data-action="copyPrompt" data-mode="withoutAppearance" data-id="${item.id}" type="button">외모빼고 복사</button>
           <button class="primary-btn" data-action="copyPrompt" data-mode="final" data-id="${item.id}" type="button">최종 프롬프트 복사</button>
         </div>
         <button class="ghost-btn" data-action="toggleEdit" type="button">${ui.editMode ? "보기 모드" : "수정 모드"}</button>
@@ -1908,14 +1924,14 @@
     document.querySelectorAll("[data-filter-group]").forEach((node) => {
       node.addEventListener("click", () => {
         ui.filterGroup = node.dataset.filterGroup;
-        ui.page = 1;
+        resetGalleryWindow();
         render();
       });
     });
     document.querySelectorAll("[data-category-filter]").forEach((node) => {
       node.addEventListener("click", () => {
         ui.category = node.dataset.categoryFilter;
-        ui.page = 1;
+        resetGalleryWindow();
         render();
       });
     });
@@ -1926,7 +1942,7 @@
         const index = target.indexOf(key);
         if (index >= 0) target.splice(index, 1);
         else target.push(key);
-        ui.page = 1;
+        resetGalleryWindow();
         render();
       });
     });
@@ -1947,7 +1963,7 @@
       search.addEventListener("input", (event) => {
         ui.query = event.target.value;
         if (ui.view !== "gallery") ui.view = "gallery";
-        ui.page = 1;
+        resetGalleryWindow();
         render();
       });
     }
@@ -1955,6 +1971,7 @@
     if (sort) {
       sort.addEventListener("change", (event) => {
         ui.sort = event.target.value;
+        resetGalleryWindow();
         render();
       });
     }
@@ -1965,6 +1982,7 @@
   }
 
   function bindViewEvents() {
+    bindGalleryInfiniteScroll();
     document.querySelectorAll("[data-open-item]").forEach((node) => {
       node.addEventListener("click", (event) => {
         if (event.target.closest("button")) return;
@@ -2137,6 +2155,41 @@
       });
       node.addEventListener("input", () => updateSentence(node));
     });
+  }
+
+  function resetGalleryWindow() {
+    ui.page = 1;
+    ui.galleryLoadedPages = 1;
+    ui.galleryLoading = false;
+  }
+
+  function bindGalleryInfiniteScroll() {
+    if (window.promptArchiveGalleryScrollHandler) {
+      window.removeEventListener("scroll", window.promptArchiveGalleryScrollHandler);
+      window.promptArchiveGalleryScrollHandler = null;
+    }
+    if (ui.view !== "gallery" || ui.modal) return;
+    window.promptArchiveGalleryScrollHandler = () => maybeLoadMoreGallery();
+    window.addEventListener("scroll", window.promptArchiveGalleryScrollHandler, { passive: true });
+    maybeLoadMoreGallery();
+  }
+
+  function maybeLoadMoreGallery() {
+    if (ui.view !== "gallery" || ui.modal || ui.galleryLoading) return;
+    const perPage = state.albumSettings.columns * state.albumSettings.rows;
+    const totalCount = getFilteredItems().length;
+    if ((ui.galleryLoadedPages || 1) * perPage >= totalCount) return;
+    const scrollBottom = window.scrollY + window.innerHeight;
+    const distanceToBottom = document.documentElement.scrollHeight - scrollBottom;
+    if (distanceToBottom > 420) return;
+    ui.galleryLoading = true;
+    render();
+    window.setTimeout(() => {
+      ui.galleryLoadedPages = (ui.galleryLoadedPages || 1) + 1;
+      ui.galleryLoading = false;
+      render();
+      window.setTimeout(() => maybeLoadMoreGallery(), 0);
+    }, 260);
   }
 
   function bindSettingsEvents() {
@@ -2594,7 +2647,7 @@
       showStatus: false,
       showFavorite: false,
     });
-    ui.page = 1;
+    resetGalleryWindow();
     saveSettingsState();
     render();
   }
@@ -2933,6 +2986,7 @@
     if (!item?.promptJson) return "";
     if (mode === "en") return sectionBlockPromptText(item, "en", { includeTitles: state.copyDisplaySettings.includeSectionTitles });
     if (mode === "final") return sectionBlockPromptText(item, "en", { includeTitles: false });
+    if (mode === "withoutAppearance") return sectionBlockPromptText(item, "en", { includeTitles: false, excludeSections: ["appearance"] });
     if (mode === "ko") return sectionBlockPromptText(item, "ko", { includeTitles: state.copyDisplaySettings.includeSectionTitles });
     if (mode === "both") return sectionBlockPromptText(item, "both", { includeTitles: state.copyDisplaySettings.includeSectionTitles });
     const lines = [];
@@ -2956,7 +3010,8 @@
   }
 
   function sectionBlockPromptText(item, mode, options = {}) {
-    const blocks = enabledSections().map((section) => {
+    const excludeSections = new Set(options.excludeSections || []);
+    const blocks = enabledSections().filter((section) => !excludeSections.has(section.key)).map((section) => {
       const sentences = item.promptJson[section.key]?.sentences || [];
       const lines = [];
       if (options.includeTitles) {
