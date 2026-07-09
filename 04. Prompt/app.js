@@ -896,44 +896,79 @@
     const modeLabel = isExifPromptMode() ? "EXIF" : "API 분석";
     return `
       <header class="topbar album-topbar">
-        <button class="brand-inline" data-view="gallery" type="button" aria-label="갤러리로 이동">
-          <span>프롬프트 아카이브</span>
-        </button>
+        <div class="topbar-left">
+          <button class="brand-inline" data-view="gallery" type="button" aria-label="갤러리로 이동">
+            <span class="brand-mark" aria-hidden="true">${brandMarkSvg()}</span>
+            <span class="brand-copy">
+              <strong>프롬프트 아카이브</strong>
+              <small>Studio Console</small>
+            </span>
+          </button>
+          <nav class="topbar-nav" aria-label="주요 이동">
+            <button class="nav-pill ${ui.view === "gallery" && !ui.modal ? "active" : ""}" data-view="gallery" type="button">
+              ${navIcon("gallery")} 갤러리
+            </button>
+          </nav>
+          <span class="mode-chip ${isExifPromptMode() ? "mode-exif" : "mode-api"}" title="업로드 설정 모드">
+            <span class="mode-dot" aria-hidden="true"></span>${modeLabel}
+          </span>
+        </div>
         <div class="topbar-center">
-          <button class="gallery-jump-btn" data-view="gallery" type="button">갤러리</button>
-          <span class="mode-chip ${isExifPromptMode() ? "mode-exif" : "mode-api"}" title="업로드 설정 모드">${modeLabel}</span>
           <div class="search-wrap compact-search">
+            <span class="search-icon" aria-hidden="true">${navIcon("search")}</span>
             <label class="sr-only" for="globalSearch">검색</label>
-            <input class="input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 태그, 프롬프트 검색">
+            <input class="input search-input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 태그, 프롬프트 검색">
           </div>
-          <select class="select compact-select" id="sortSelect">
-            <option value="latest" ${ui.sort === "latest" ? "selected" : ""}>최신순</option>
-            <option value="oldest" ${ui.sort === "oldest" ? "selected" : ""}>오래된순</option>
-            <option value="favorite" ${ui.sort === "favorite" ? "selected" : ""}>즐겨찾기순</option>
-            <option value="failed" ${ui.sort === "failed" ? "selected" : ""}>분석 실패순</option>
-            <option value="modified" ${ui.sort === "modified" ? "selected" : ""}>수정일순</option>
-          </select>
-          <select class="select compact-select" id="originFilterSelect">
-            <option value="all" ${ui.originFilter === "all" ? "selected" : ""}>전체 상태</option>
-            <option value="original" ${ui.originFilter === "original" ? "selected" : ""}>원본만</option>
-            <option value="modified" ${ui.originFilter === "modified" ? "selected" : ""}>수정됨만</option>
-          </select>
-          <label class="topbar-toggle"><input id="favoriteOnlyToggle" type="checkbox" ${ui.favoriteOnly ? "checked" : ""}> 즐겨찾기</label>
-          <label class="topbar-toggle"><input id="duplicatesOnlyToggle" type="checkbox" ${ui.showDuplicatesOnly ? "checked" : ""}> 중복</label>
+          <div class="topbar-filter-group" aria-label="정렬 및 필터">
+            <select class="select compact-select" id="sortSelect" aria-label="정렬">
+              <option value="latest" ${ui.sort === "latest" ? "selected" : ""}>최신순</option>
+              <option value="oldest" ${ui.sort === "oldest" ? "selected" : ""}>오래된순</option>
+              <option value="favorite" ${ui.sort === "favorite" ? "selected" : ""}>즐겨찾기순</option>
+              <option value="failed" ${ui.sort === "failed" ? "selected" : ""}>분석 실패순</option>
+              <option value="modified" ${ui.sort === "modified" ? "selected" : ""}>수정일순</option>
+            </select>
+            <select class="select compact-select" id="originFilterSelect" aria-label="상태">
+              <option value="all" ${ui.originFilter === "all" ? "selected" : ""}>전체</option>
+              <option value="original" ${ui.originFilter === "original" ? "selected" : ""}>원본</option>
+              <option value="modified" ${ui.originFilter === "modified" ? "selected" : ""}>수정됨</option>
+            </select>
+            <div class="topbar-toggle-group">
+              <label class="topbar-toggle pill-toggle ${ui.favoriteOnly ? "active" : ""}"><input id="favoriteOnlyToggle" type="checkbox" ${ui.favoriteOnly ? "checked" : ""}><span>★ 즐겨찾기</span></label>
+              <label class="topbar-toggle pill-toggle ${ui.showDuplicatesOnly ? "active" : ""}"><input id="duplicatesOnlyToggle" type="checkbox" ${ui.showDuplicatesOnly ? "checked" : ""}><span>중복</span></label>
+            </div>
+          </div>
         </div>
         <div class="topbar-actions">
-          ${iconButton("upload", "업로드", "+")}
-          ${iconButton("toggleBulkDeleteMode", ui.bulkDeleteMode ? "삭제 모드 닫기" : "게시물 삭제", "🗑", ui.bulkDeleteMode ? "active-danger" : "")}
-          ${iconButton("toggleBulkCategoryMode", ui.bulkCategoryMode ? "분류 모드 닫기" : "일괄 분류", "🏷", ui.bulkCategoryMode ? "active" : "")}
-          ${iconButton("cycleTheme", "테마", "◐")}
-          ${iconButton("settings", "설정", "⚙")}
+          ${iconButton("upload", "업로드", "upload", "primary-icon")}
+          ${iconButton("toggleBulkDeleteMode", ui.bulkDeleteMode ? "삭제 모드 닫기" : "게시물 삭제", "trash", ui.bulkDeleteMode ? "active-danger" : "")}
+          ${iconButton("toggleBulkCategoryMode", ui.bulkCategoryMode ? "분류 모드 닫기" : "일괄 분류", "tag", ui.bulkCategoryMode ? "active" : "")}
+          ${iconButton("cycleTheme", "테마", "theme")}
+          ${iconButton("settings", "설정", "settings")}
         </div>
       </header>
     `;
   }
 
+  function brandMarkSvg() {
+    return `<svg viewBox="0 0 32 32" width="28" height="28" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="2" y="2" width="28" height="28" rx="9" fill="url(#brandGrad)"/><path d="M9 11.5h6.2v9H9V11.5zm8.3 0H23v4.1h-5.7V11.5zm0 6.2H23V20.5h-5.7v-2.8z" fill="#fff" fill-opacity=".95"/><defs><linearGradient id="brandGrad" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop stop-color="#2563eb"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs></svg>`;
+  }
+
+  function navIcon(name) {
+    const icons = {
+      gallery: `<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><rect x="2.5" y="2.5" width="6.5" height="6.5" rx="1.5" fill="currentColor"/><rect x="11" y="2.5" width="6.5" height="6.5" rx="1.5" fill="currentColor" opacity=".7"/><rect x="2.5" y="11" width="6.5" height="6.5" rx="1.5" fill="currentColor" opacity=".7"/><rect x="11" y="11" width="6.5" height="6.5" rx="1.5" fill="currentColor" opacity=".45"/></svg>`,
+      search: `<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="9" cy="9" r="5.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M13.2 13.2L17 17" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>`,
+      upload: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 13.5V4.8M10 4.8L6.8 8M10 4.8L13.2 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 14.5v1.2A1.8 1.8 0 0 0 5.8 17.5h8.4a1.8 1.8 0 0 0 1.8-1.8v-1.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>`,
+      trash: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M4.5 6h11M8 6V4.8A1.3 1.3 0 0 1 9.3 3.5h1.4A1.3 1.3 0 0 1 12 4.8V6m2.2 0v9.2a1.3 1.3 0 0 1-1.3 1.3H7.1a1.3 1.3 0 0 1-1.3-1.3V6h8.4z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+      tag: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M3.5 10.8V4.8A1.3 1.3 0 0 1 4.8 3.5h6l5.7 5.7a1.3 1.3 0 0 1 0 1.8l-4.5 4.5a1.3 1.3 0 0 1-1.8 0L3.5 10.8z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/><circle cx="7.2" cy="7.2" r="1.1" fill="currentColor"/></svg>`,
+      theme: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 3a7 7 0 1 0 7 7 5.2 5.2 0 0 1-7-7z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/></svg>`,
+      settings: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="10" cy="10" r="2.4" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M10 3.2v1.6M10 15.2v1.6M3.2 10h1.6M15.2 10h1.6M5.2 5.2l1.1 1.1M13.7 13.7l1.1 1.1M14.8 5.2l-1.1 1.1M6.3 13.7l-1.1 1.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`,
+    };
+    return icons[name] || "";
+  }
+
   function iconButton(action, label, icon, extraClass = "") {
-    return `<button class="icon-btn ${extraClass}" data-action="${action}" type="button" aria-label="${label}" data-tooltip="${label}">${icon}</button>`;
+    const glyph = navIcon(icon) || escapeHtml(String(icon || ""));
+    return `<button class="icon-btn ${extraClass}" data-action="${action}" type="button" aria-label="${label}" data-tooltip="${label}"><span class="icon-btn-glyph">${glyph}</span></button>`;
   }
 
   function renderView() {
@@ -1070,17 +1105,22 @@
 
   function renderAlbumFilters() {
     return `
-      <div class="album-filter-bar">
+      <div class="album-filter-bar surface-card">
         <div class="album-filter-summary">
-          <div class="category-tabs">
-            ${filterGroupButton("all", "전체")}
-            ${filterGroupButton("outfit", "복장")}
-            ${filterGroupButton("background", "배경")}
+          <div class="filter-section">
+            <span class="filter-section-label">보기</span>
+            <div class="category-tabs segmented-tabs">
+              ${filterGroupButton("all", "전체")}
+              ${filterGroupButton("outfit", "복장")}
+              ${filterGroupButton("background", "배경")}
+            </div>
           </div>
-          <div class="category-tabs album-category-tabs">
-            ${categoryFilterButton("all", "전체", "slate")}
-            ${state.categories.map((category) => categoryFilterButton(category.id, category.name, category.color)).join("")}
-            <button class="chip-btn subcategory-anchor" data-filter-group="${ui.filterGroup === "background" ? "outfit" : "background"}" type="button">하위 카테고리</button>
+          <div class="filter-section filter-section-grow">
+            <span class="filter-section-label">카테고리</span>
+            <div class="category-tabs album-category-tabs">
+              ${categoryFilterButton("all", "전체", "slate")}
+              ${state.categories.map((category) => categoryFilterButton(category.id, category.name, category.color)).join("")}
+            </div>
           </div>
         </div>
         <div class="subcategory-filter-stack">
