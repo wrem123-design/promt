@@ -20,6 +20,7 @@
   let toastTimer = null;
   let serverBootComplete = false;
   let changedBeforeServerBoot = false;
+  let modalBackdropPointerDown = false;
 
   const sectionBoundaryRules = `Section boundary rules:
 - Appearance must not include expression, gaze, camera angle, pose, composition, background, accessories, outfit mood, or clothing atmosphere.
@@ -238,11 +239,22 @@
     uploadQueue: [],
     bulkDeleteMode: false,
     selectedBulkDeleteIds: [],
+    bulkCategoryMode: false,
+    selectedBulkCategoryIds: [],
+    promptCompareMode: false,
+    reviseAlsoRetag: true,
+    reviseAlsoRetitle: false,
+    originFilter: "all",
+    favoriteOnly: false,
+    showDuplicatesOnly: false,
   };
 
   document.documentElement.dataset.theme = state.theme;
   applyThemeOptions();
-  bootServerState();
+  migrateAllPromptBaselines();
+  bootServerState().then(() => {
+    migrateAllPromptBaselines();
+  });
 
   function loadState() {
     const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -498,6 +510,7 @@
       versions: Array.isArray(item.versions) ? item.versions : [],
       promptBaselineSource: item.promptBaselineSource || "",
       promptBaselineFingerprint: item.promptBaselineFingerprint || "",
+      promptBaselineJson: item.promptBaselineJson || null,
       promptEditAction: item.promptEditAction || "",
       promptEditState: item.promptEditState || "",
     };
@@ -880,6 +893,7 @@
   }
 
   function renderTopbar() {
+    const modeLabel = isExifPromptMode() ? "EXIF" : "API 분석";
     return `
       <header class="topbar album-topbar">
         <button class="brand-inline" data-view="gallery" type="button" aria-label="갤러리로 이동">
@@ -887,9 +901,10 @@
         </button>
         <div class="topbar-center">
           <button class="gallery-jump-btn" data-view="gallery" type="button">갤러리</button>
+          <span class="mode-chip ${isExifPromptMode() ? "mode-exif" : "mode-api"}" title="업로드 설정 모드">${modeLabel}</span>
           <div class="search-wrap compact-search">
             <label class="sr-only" for="globalSearch">검색</label>
-            <input class="input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 프롬프트 내용 검색">
+            <input class="input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 태그, 프롬프트 검색">
           </div>
           <select class="select compact-select" id="sortSelect">
             <option value="latest" ${ui.sort === "latest" ? "selected" : ""}>최신순</option>
@@ -898,10 +913,18 @@
             <option value="failed" ${ui.sort === "failed" ? "selected" : ""}>분석 실패순</option>
             <option value="modified" ${ui.sort === "modified" ? "selected" : ""}>수정일순</option>
           </select>
+          <select class="select compact-select" id="originFilterSelect">
+            <option value="all" ${ui.originFilter === "all" ? "selected" : ""}>전체 상태</option>
+            <option value="original" ${ui.originFilter === "original" ? "selected" : ""}>원본만</option>
+            <option value="modified" ${ui.originFilter === "modified" ? "selected" : ""}>수정됨만</option>
+          </select>
+          <label class="topbar-toggle"><input id="favoriteOnlyToggle" type="checkbox" ${ui.favoriteOnly ? "checked" : ""}> 즐겨찾기</label>
+          <label class="topbar-toggle"><input id="duplicatesOnlyToggle" type="checkbox" ${ui.showDuplicatesOnly ? "checked" : ""}> 중복</label>
         </div>
         <div class="topbar-actions">
           ${iconButton("upload", "업로드", "+")}
           ${iconButton("toggleBulkDeleteMode", ui.bulkDeleteMode ? "삭제 모드 닫기" : "게시물 삭제", "🗑", ui.bulkDeleteMode ? "active-danger" : "")}
+          ${iconButton("toggleBulkCategoryMode", ui.bulkCategoryMode ? "분류 모드 닫기" : "일괄 분류", "🏷", ui.bulkCategoryMode ? "active" : "")}
           ${iconButton("cycleTheme", "테마", "◐")}
           ${iconButton("settings", "설정", "⚙")}
         </div>
@@ -948,14 +971,30 @@
         return [displayTitle(item), item.memo, item.customInstruction, item.tags.join(" "), tagNames(item.outfitTags, "outfit").join(" "), tagNames(item.backgroundTags, "background").join(" "), prompt].join(" ").toLowerCase().includes(query);
       });
     }
+    if (ui.favoriteOnly) items = items.filter((item) => item.isFavorite);
+    if (ui.originFilter === "original") items = items.filter((item) => {
+      ensurePromptBaseline(item);
+      syncPromptEditState(item);
+      return item.promptEditState === "original";
+    });
+    if (ui.originFilter === "modified") items = items.filter((item) => {
+      ensurePromptBaseline(item);
+      syncPromptEditState(item);
+      return item.promptEditState === "modified";
+    });
+    if (ui.showDuplicatesOnly) {
+      const dupIds = new Set(Object.values(buildDuplicateGroups()).filter((group) => group.length > 1).flat());
+      items = items.filter((item) => dupIds.has(item.id));
+    }
     const sorters = {
       latest: (a, b) => b.createdAt - a.createdAt,
       oldest: (a, b) => a.createdAt - b.createdAt,
-      favorite: (a, b) => b.createdAt - a.createdAt,
+      favorite: (a, b) => Number(b.isFavorite) - Number(a.isFavorite) || b.updatedAt - a.updatedAt || b.createdAt - a.createdAt,
       failed: (a, b) => Number(b.status === "analysis_failed") - Number(a.status === "analysis_failed") || b.createdAt - a.createdAt,
       modified: (a, b) => b.updatedAt - a.updatedAt,
     };
     const sorter = sorters[ui.sort] || sorters.latest;
+    if (ui.sort === "favorite") return items.sort(sorter);
     return items.sort((a, b) => Number(b.isFavorite) - Number(a.isFavorite) || sorter(a, b));
   }
 
@@ -969,18 +1008,33 @@
     return `
       ${renderAlbumFilters()}
       <div class="album-action-row ${ui.bulkDeleteMode ? "delete-mode" : ""}">
-        ${ui.bulkDeleteMode ? renderBulkDeleteControls(pageItems) : ""}
+        ${ui.bulkDeleteMode || ui.bulkCategoryMode ? renderBulkDeleteControls(pageItems) : ""}
         <div class="album-action-buttons">
           <button class="ghost-btn" data-action="bulkAnalyze" type="button">대기 항목 분석</button>
           <button class="ghost-btn" data-action="exportJson" type="button">JSON 내보내기</button>
         </div>
       </div>
-      ${pageItems.length ? `<div class="gallery-grid album-grid ${ui.bulkDeleteMode ? "bulk-delete-gallery" : ""}" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map(renderImageCard).join("")}</div>` : renderEmptyGallery()}
+      ${pageItems.length ? `<div class="gallery-grid album-grid ${ui.bulkDeleteMode || ui.bulkCategoryMode ? "bulk-delete-gallery" : ""}" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map(renderImageCard).join("")}</div>` : renderEmptyGallery()}
       ${renderGalleryLoadMore(hasMore, pageItems.length, items.length)}
     `;
   }
 
   function renderBulkDeleteControls(pageItems) {
+    if (ui.bulkCategoryMode) {
+      const selectedCount = (ui.selectedBulkCategoryIds || []).filter((id) => state.items.some((item) => item.id === id)).length;
+      return `
+        <div class="bulk-delete-bar">
+          <strong>일괄 분류</strong>
+          <span>${selectedCount}개 선택</span>
+          <select class="select" id="bulkCategorySelect">
+            ${state.categories.map((cat) => `<option value="${cat.id}">${escapeHtml(cat.name)}</option>`).join("")}
+          </select>
+          <button class="primary-btn" data-action="applyBulkCategory" type="button" ${selectedCount ? "" : "disabled"}>선택 항목 분류 적용</button>
+          <button class="ghost-btn" data-action="cancelBulkCategoryMode" type="button">닫기</button>
+        </div>
+      `;
+    }
+
     const selectedIds = new Set(ui.selectedBulkDeleteIds || []);
     const visibleIds = pageItems.map((item) => item.id);
     const visibleSelectedCount = visibleIds.filter((id) => selectedIds.has(id)).length;
@@ -1074,19 +1128,40 @@
   function renderImageCard(item) {
     const title = displayTitle(item);
     const selectedForDelete = (ui.selectedBulkDeleteIds || []).includes(item.id);
+    const selectedForCategory = (ui.selectedBulkCategoryIds || []).includes(item.id);
+    ensurePromptBaseline(item);
+    syncPromptEditState(item);
+    const placeTags = tagNames(item.backgroundTags, "background").filter((name) => name && name !== "기타").slice(0, 2);
+    const outfitTagsShown = tagNames(item.outfitTags, "outfit").filter((name) => name && name !== "기타").slice(0, 1);
+    const isDup = isDuplicateItem(item);
+    const originClass = item.promptEditState === "modified" ? "is-modified" : item.promptEditState === "original" ? "is-original" : "";
+    const showMeta = state.albumSettings.showTags !== false || state.albumSettings.showStatus !== false;
     return `
-      <article class="panel image-card ${ui.bulkDeleteMode ? "bulk-delete-mode" : ""} ${selectedForDelete ? "selected-for-delete" : ""}" data-open-item="${item.id}" tabindex="0">
+      <article class="panel image-card ${ui.bulkDeleteMode ? "bulk-delete-mode" : ""} ${ui.bulkCategoryMode ? "bulk-category-mode" : ""} ${selectedForDelete || selectedForCategory ? "selected-for-delete" : ""} ${isDup ? "is-duplicate" : ""} ${originClass}" data-open-item="${item.id}" tabindex="0">
         <div class="thumb">
-          <img src="${item.thumbnailUrl || item.imageUrl}" alt="${escapeHtml(title)}">
+          <img src="${item.thumbnailUrl || item.imageUrl || ""}" alt="${escapeHtml(title)}" loading="lazy" onerror="this.classList.add('broken-image');this.alt='이미지 없음';">
           ${ui.bulkDeleteMode ? `
             <label class="bulk-delete-check" aria-label="삭제할 게시물 선택">
               <input class="bulk-delete-checkbox" data-action="bulkToggleItem" data-bulk-delete-id="${item.id}" type="checkbox" ${selectedForDelete ? "checked" : ""}>
               <span>삭제 선택</span>
             </label>
-          ` : `<button class="favorite-toggle ${item.isFavorite ? "active" : ""}" data-action="favorite" data-id="${item.id}" type="button" aria-label="${item.isFavorite ? "즐겨찾기 해제" : "즐겨찾기"}">${item.isFavorite ? "★" : "☆"}</button>`}
+          ` : ui.bulkCategoryMode ? `
+            <label class="bulk-delete-check" aria-label="분류할 게시물 선택">
+              <input class="bulk-delete-checkbox" data-action="bulkCategoryToggleItem" data-bulk-category-id="${item.id}" type="checkbox" ${selectedForCategory ? "checked" : ""}>
+              <span>분류 선택</span>
+            </label>
+          ` : (state.albumSettings.showFavorite !== false ? `<button class="favorite-toggle ${item.isFavorite ? "active" : ""}" data-action="favorite" data-id="${item.id}" type="button" aria-label="${item.isFavorite ? "즐겨찾기 해제" : "즐겨찾기"}">${item.isFavorite ? "★" : "☆"}</button>` : "")}
+          ${isDup ? `<span class="card-badge dup-badge">중복</span>` : ""}
+          ${state.albumSettings.showStatus !== false && item.promptEditState === "modified" ? `<span class="card-badge edit-badge">수정</span>` : ""}
         </div>
         <div class="card-body">
-          <h3 class="card-title">${escapeHtml(title)}</h3>
+          ${state.albumSettings.showTitle !== false ? `<h3 class="card-title">${escapeHtml(title)}</h3>` : ""}
+          ${showMeta ? `
+            <div class="card-meta">
+              ${state.albumSettings.showTags !== false ? [...placeTags, ...outfitTagsShown].map((name) => `<span class="card-chip">${escapeHtml(name)}</span>`).join("") : ""}
+              ${state.albumSettings.showStatus !== false ? `<span class="card-chip subtle">${item.promptEditState === "modified" ? "수정됨" : "원본"}</span>` : ""}
+            </div>
+          ` : ""}
         </div>
       </article>
     `;
@@ -1200,7 +1275,7 @@
       <div class="page-head">
         <div>
           <h2 class="page-title">업로드</h2>
-          <p class="page-copy">${exifMode ? "EXIF / 이미지 메타데이터에 저장된 프롬프트를 읽어 5문단으로 저장합니다. 이미지 분석 API는 호출하지 않습니다." : "파일을 먼저 고른 뒤 요청사항과 제외 요소를 확인하고 저장합니다. 분석은 저장 및 분석 버튼을 누를 때만 실행됩니다."}</p>
+          <p class="page-copy">${exifMode ? "EXIF / 메타데이터 프롬프트를 읽어 저장합니다." : "파일 선택 후 요청·제외를 확인하고 저장 및 분석합니다."}</p>
         </div>
       </div>
       <section class="panel" style="padding: var(--space-4);">
@@ -1209,7 +1284,7 @@
           <span>${exifMode ? "EXIF 프롬프트 읽기" : "API 이미지 분석"}</span>
           ${exifMode ? `<span>${state.uploadSettings.translateExifPrompt ? "한국어 자동 번역" : "번역 안 함"}</span>` : ""}
         </div>
-        ${exifMode ? `<p class="notice upload-mode-notice">EXIF 모드에서는 이미지 안의 prompt, parameters, description, UserComment 같은 메타데이터에서 프롬프트를 찾습니다. 5문단을 찾지 못한 파일은 빨간색으로 표시되며 제거 후 다시 저장하는 것이 좋습니다.</p>` : ""}
+        ${exifMode ? `<p class="notice upload-mode-notice">메타데이터에서 5문단을 찾지 못한 파일은 빨간색으로 표시됩니다.</p>` : ""}
         <div class="optimization-summary">
           <strong>업로드 전 자동 최적화</strong>
           <span>${state.uploadSettings.autoCompress ? "켜짐" : "꺼짐"}</span>
@@ -1222,21 +1297,12 @@
         <div class="upload-zone" id="dropZone">
           <div>
             <h2>이미지를 놓거나 선택하세요</h2>
-            <p>jpg, jpeg, png, webp 파일을 지원합니다. ${state.uploadSettings.allowClipboardPaste ? "클립보드 붙여넣기도 가능합니다." : "클립보드 붙여넣기는 설정에서 꺼져 있습니다."}</p>
+            <p>jpg, jpeg, png, webp${state.uploadSettings.allowClipboardPaste ? " · 클립보드 붙여넣기" : ""}</p>
             <input class="sr-only" id="fileInput" type="file" accept="image/jpeg,image/png,image/webp" multiple>
             <button class="primary-btn" id="pickFiles" type="button">파일 선택</button>
           </div>
         </div>
         ${renderPendingUploadFiles()}
-        <div class="upload-action-row">
-          <div class="toolbar">
-          <button class="ghost-btn" data-action="removeSelectedPendingUploads" type="button" ${ui.selectedPendingUploadKeys.length ? "" : "disabled"}>선택 지우기</button>
-          <button class="ghost-btn" data-action="clearUploadWorkspace" type="button" ${ui.pendingUploadFiles.length || ui.uploadQueue.length ? "" : "disabled"}>비우기</button>
-          <button class="primary-btn" data-action="saveAndAnalyzeUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>${exifMode ? "EXIF 읽고 저장" : "저장 및 분석"}</button>
-          </div>
-          ${renderUploadProgress()}
-        </div>
-        <div id="queueList" class="queue-list">${renderQueue()}</div>
         <div class="form-grid" style="margin-top: var(--space-4);">
           <div class="field">
             <label for="uploadTitle">공통 제목</label>
@@ -1250,17 +1316,24 @@
         <div class="analysis-options">
           <div class="field">
             <label for="uploadCustomInstruction">이 이미지에만 적용할 추가 요청사항</label>
-            <textarea class="textarea" id="uploadCustomInstruction" placeholder="뒷 유리 그림은 프롬프트에 포함하지 말 것&#10;캐릭터 외모만 중심으로 분석할 것"></textarea>
-            <p class="field-help">업로드·이미지 분석 시에만 반영됩니다. 게시물 상세의 프롬프트 수정과는 별개입니다.</p>
+            <textarea class="textarea" id="uploadCustomInstruction" placeholder="뒷 유리 그림은 프롬프트에 포함하지 말 것"></textarea>
           </div>
           <fieldset class="option-fieldset">
             <legend>프롬프트에서 제외할 요소</legend>
-            <p>체크된 요소는 이미지 분석/EXIF 저장 시 최종 프롬프트에 넣지 않습니다. 게시물 상세의 제외 체크·프롬프트 수정과는 별개입니다. 마지막 체크값은 다음 업로드에도 유지됩니다.</p>
             <div class="option-grid">
               ${enabledExcludeOptions().map((option) => renderExcludeCheckbox(option, uploadExcludeKeys.includes(option.key), "uploadExclude")).join("")}
             </div>
           </fieldset>
         </div>
+        <div class="upload-action-row">
+          <div class="toolbar">
+          <button class="ghost-btn" data-action="removeSelectedPendingUploads" type="button" ${ui.selectedPendingUploadKeys.length ? "" : "disabled"}>선택 지우기</button>
+          <button class="ghost-btn" data-action="clearUploadWorkspace" type="button" ${ui.pendingUploadFiles.length || ui.uploadQueue.length ? "" : "disabled"}>비우기</button>
+          <button class="primary-btn" data-action="saveAndAnalyzeUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>${exifMode ? "EXIF 읽고 저장" : "저장 및 분석"}</button>
+          </div>
+          ${renderUploadProgress()}
+        </div>
+        <div id="queueList" class="queue-list">${renderQueue()}</div>
       </section>
     `;
   }
@@ -1371,27 +1444,30 @@
     const title = displayTitle(item);
     const exifMode = isExifPromptMode();
     const analyzeLabel = item.promptJson ? "재분석" : "수동 분석";
+    const canRestore = Boolean(item.promptBaselineJson && item.promptEditState === "modified");
     return `
       <div class="page-head">
         <div>
           <h2 class="page-title">${escapeHtml(title)}</h2>
-          <p class="page-copy">${escapeHtml(item.memo || "메모가 없습니다.")}</p>
-          <p class="page-copy meta-line">현재 업로드 모드: ${exifMode ? "EXIF / 메타데이터" : "API 이미지 분석"}</p>
+          <p class="page-copy">${escapeHtml(item.memo || "")}</p>
         </div>
-        <div class="toolbar">
+        <div class="toolbar detail-primary-actions">
           <button class="ghost-btn" data-view="gallery" type="button">갤러리</button>
-          <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button" ${exifMode ? "disabled" : ""} title="${exifMode ? "EXIF 모드에서는 API 재분석을 쓰지 않습니다. EXIF 원본 불러오기를 사용하세요." : "이미지 분석 API로 프롬프트를 다시 생성합니다."}">${analyzeLabel}</button>
-          <button class="ghost-btn" data-action="reloadExif" data-id="${item.id}" type="button" ${exifMode ? "" : "disabled"} title="${exifMode ? "저장된 EXIF/메타 원본 또는 원본 이미지에서 프롬프트를 다시 읽습니다." : "API 모드에서는 EXIF 원본 불러오기를 쓰지 않습니다. 재분석을 사용하세요."}">EXIF 원본 불러오기</button>
+          <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button" ${exifMode ? "disabled" : ""}>${analyzeLabel}</button>
+          <button class="ghost-btn" data-action="reloadExif" data-id="${item.id}" type="button" ${exifMode ? "" : "disabled"}>EXIF 원본 불러오기</button>
         </div>
       </div>
       <div class="detail-grid">
         <section class="panel detail-media">
-          <img src="${item.imageUrl}" alt="${escapeHtml(title)}">
+          <img src="${item.imageUrl || ""}" alt="${escapeHtml(title)}" onerror="this.classList.add('broken-image');">
           <div class="detail-meta">
             <div class="form-grid">
               <div class="field">
                 <label for="detailTitle">제목</label>
-                <input class="input" id="detailTitle" value="${escapeHtml(title)}">
+                <div class="inline-field-row">
+                  <input class="input" id="detailTitle" value="${escapeHtml(title)}">
+                  <button class="tiny-btn" data-action="retitleOne" data-id="${item.id}" type="button" ${item.promptJson ? "" : "disabled"}>제목 요약</button>
+                </div>
               </div>
               <div class="field">
                 <label for="detailCategory">카테고리</label>
@@ -1400,46 +1476,110 @@
                 </select>
               </div>
             </div>
-            <div class="form-grid">
-              <div class="field">
-                <label for="detailOutfitTags">복장 태그</label>
-                <input class="input" id="detailOutfitTags" value="${escapeHtml(tagNames(item.outfitTags, "outfit").join(", "))}" placeholder="교복, 캐주얼">
-              </div>
-              <div class="field">
-                <label for="detailBackgroundTags">배경 태그</label>
-                <input class="input" id="detailBackgroundTags" value="${escapeHtml(tagNames(item.backgroundTags, "background").join(", "))}" placeholder="학교, 스튜디오">
-              </div>
+            <div class="field">
+              <label>복장 태그</label>
+              ${renderDetailTagChips(item, "outfit")}
             </div>
             <div class="field">
-              <label for="detailMemo">메모/글 내용</label>
-              <textarea class="textarea" id="detailMemo">${escapeHtml(item.memo)}</textarea>
+              <label>장소 태그</label>
+              ${renderDetailTagChips(item, "background")}
+            </div>
+            <div class="toolbar" style="margin:0 0 var(--space-2)">
+              <button class="tiny-btn" data-action="retagOne" data-id="${item.id}" type="button" ${item.promptJson ? "" : "disabled"}>태그 재추론</button>
             </div>
             <div class="field">
-              <label for="detailCustomInstruction">이 이미지 전용 추가 요청사항</label>
-              <textarea class="textarea" id="detailCustomInstruction" placeholder="예: 안경 제거, 배경을 카페로, 미소 강조. 프롬프트 수정 버튼에 사용됩니다.">${escapeHtml(item.customInstruction || "")}</textarea>
-              <p class="field-help">업로드 화면의 요청사항과 별개입니다. 여기서는 이미 저장된 프롬프트를 고칠 때만 씁니다.</p>
+              <label for="detailMemo">메모</label>
+              <textarea class="textarea" id="detailMemo">${escapeHtml(item.memo || "")}</textarea>
+            </div>
+            <div class="field">
+              <label for="detailCustomInstruction">추가 요청사항</label>
+              <textarea class="textarea" id="detailCustomInstruction" placeholder="예: 안경 제거, 배경을 카페로">${escapeHtml(item.customInstruction || "")}</textarea>
             </div>
             <fieldset class="option-fieldset">
-              <legend>프롬프트에서 제외할 요소</legend>
-              <p>체크한 요소는 <strong>프롬프트 수정</strong> 시 현재 문장에서 최소 수정으로 제거합니다. 이미지를 다시 분석하지 않습니다. (업로드 시 제외 체크와는 별개)</p>
+              <legend>제외할 요소</legend>
               <div class="option-grid">
                 ${enabledExcludeOptions().map((option) => renderExcludeCheckbox(option, item.excludeOptions?.includes(option.key), "detailExclude")).join("")}
               </div>
             </fieldset>
+            <div class="option-grid revise-options">
+              <label class="option-item"><input id="reviseAlsoRetag" type="checkbox" ${ui.reviseAlsoRetag ? "checked" : ""}><span>수정 후 태그 재추론</span></label>
+              <label class="option-item"><input id="reviseAlsoRetitle" type="checkbox" ${ui.reviseAlsoRetitle ? "checked" : ""}><span>수정 후 제목 재요약</span></label>
+            </div>
             ${renderPromptOriginStatus(item)}
-            <div class="toolbar">
+            <div class="toolbar detail-action-group">
               <button class="primary-btn" data-action="saveDetail" data-id="${item.id}" type="button">저장</button>
-              <button class="ghost-btn" data-action="revisePrompt" data-id="${item.id}" type="button" ${item.promptJson ? "" : "disabled"} title="현재 프롬프트 텍스트만 최소 수정합니다. 이미지 재분석이 아닙니다.">프롬프트 수정</button>
+              <button class="ghost-btn" data-action="revisePrompt" data-id="${item.id}" type="button" ${item.promptJson ? "" : "disabled"}>프롬프트 수정</button>
+              <button class="ghost-btn" data-action="restoreBaseline" data-id="${item.id}" type="button" ${canRestore ? "" : "disabled"}>원본 되돌리기</button>
               <button class="danger-btn" data-action="deleteItem" data-id="${item.id}" type="button">삭제</button>
             </div>
+            ${renderVersionHistory(item)}
             ${item.uploadMeta ? renderAssetSummary(item) : ""}
             ${item.errorMessage ? `<p class="notice">${escapeHtml(item.errorMessage)}</p>` : ""}
           </div>
         </section>
         <section class="panel prompt-panel">
           ${renderPromptTools(item)}
+          ${ui.promptCompareMode && item.promptBaselineJson ? renderPromptCompare(item) : ""}
           ${item.promptJson ? renderPromptColumns(item) : renderNoPrompt(item)}
         </section>
+      </div>
+    `;
+  }
+
+  function renderDetailTagChips(item, type) {
+    const selected = new Set(type === "outfit" ? (item.outfitTags || []) : (item.backgroundTags || []));
+    const options = tagOptions(type).filter((tag) => tag.enabled !== false);
+    return `
+      <div class="detail-tag-chips" data-tag-type="${type}">
+        ${options.map((tag) => `
+          <button class="chip-btn ${selected.has(tag.key) ? "active" : ""}" data-action="toggleDetailTag" data-type="${type}" data-key="${tag.key}" data-id="${item.id}" type="button">${escapeHtml(tag.name)}</button>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderVersionHistory(item) {
+    const versions = Array.isArray(item.versions) ? item.versions.slice(0, 8) : [];
+    if (!versions.length) return "";
+    return `
+      <details class="version-history">
+        <summary>이전 버전 ${versions.length}개</summary>
+        <div class="version-list">
+          ${versions.map((version, index) => `
+            <div class="version-row">
+              <span>${new Date(version.createdAt || Date.now()).toLocaleString()}</span>
+              <button class="tiny-btn" data-action="restoreVersion" data-id="${item.id}" data-index="${index}" type="button">복원</button>
+            </div>
+          `).join("")}
+        </div>
+      </details>
+    `;
+  }
+
+  function renderPromptCompare(item) {
+    const baseline = item.promptBaselineJson || {};
+    const current = item.promptJson || {};
+    const rows = sectionMeta.map((section) => {
+      const baseText = (baseline[section.key]?.sentences || []).map((s) => s.en || "").join("\n");
+      const curText = (current[section.key]?.sentences || []).map((s) => s.en || "").join("\n");
+      const changed = baseText.trim() !== curText.trim();
+      return `
+        <div class="compare-section ${changed ? "changed" : ""}">
+          <h4>${escapeHtml(section.labelEn)} ${changed ? "· 변경" : ""}</h4>
+          <div class="compare-grid">
+            <pre class="compare-col">${escapeHtml(baseText || "(없음)")}</pre>
+            <pre class="compare-col">${escapeHtml(curText || "(없음)")}</pre>
+          </div>
+        </div>
+      `;
+    }).join("");
+    return `
+      <div class="prompt-compare-panel">
+        <div class="prompt-compare-head">
+          <strong>원본 vs 현재 (English)</strong>
+          <button class="tiny-btn" data-action="togglePromptCompare" type="button">비교 닫기</button>
+        </div>
+        ${rows}
       </div>
     `;
   }
@@ -1519,11 +1659,25 @@
     return (hash >>> 0).toString(16);
   }
 
+  function clonePromptJson(promptJson) {
+    try {
+      return structuredClone(promptJson);
+    } catch (_error) {
+      return JSON.parse(JSON.stringify(promptJson || null));
+    }
+  }
+
   function ensurePromptBaseline(item) {
     if (!item?.promptJson) return;
-    if (item.promptBaselineFingerprint) return;
+    if (item.promptBaselineFingerprint) {
+      if (!item.promptBaselineJson && item.promptEditState !== "modified") {
+        item.promptBaselineJson = clonePromptJson(item.promptJson);
+      }
+      return;
+    }
     item.promptBaselineSource = item.promptBaselineSource || guessPromptBaselineSource(item) || "analysis";
     item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptBaselineJson = clonePromptJson(item.promptJson);
     item.promptEditState = "original";
     item.promptEditAction = "";
   }
@@ -1532,8 +1686,54 @@
     if (!item?.promptJson) return;
     item.promptBaselineSource = source || guessPromptBaselineSource(item) || "analysis";
     item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptBaselineJson = clonePromptJson(item.promptJson);
     item.promptEditState = "original";
     item.promptEditAction = "";
+  }
+
+  function migrateAllPromptBaselines() {
+    let changed = false;
+    (state.items || []).forEach((item) => {
+      if (!item?.promptJson) return;
+      const before = item.promptBaselineFingerprint || "";
+      const hadSnapshot = Boolean(item.promptBaselineJson);
+      ensurePromptBaseline(item);
+      syncPromptEditState(item);
+      if ((item.promptBaselineFingerprint || "") !== before || (!hadSnapshot && item.promptBaselineJson)) changed = true;
+    });
+    if (changed && serverBootComplete) saveItemsState();
+  }
+
+  function restorePromptBaseline(item) {
+    if (!item?.promptBaselineJson) {
+      throw new Error("저장된 원본 프롬프트 스냅샷이 없습니다.");
+    }
+    applyPrompt(item, clonePromptJson(item.promptBaselineJson));
+    item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptEditState = "original";
+    item.promptEditAction = "";
+    applyLocalTagsFromPrompt(item);
+  }
+
+  function buildDuplicateGroups() {
+    const groups = {};
+    state.items.forEach((item) => {
+      const name = item.uploadMeta?.originalName || "";
+      const size = item.uploadMeta?.originalSize || 0;
+      if (!name || !size) return;
+      const key = `${name}::${size}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(item.id);
+    });
+    return groups;
+  }
+
+  function isDuplicateItem(item) {
+    const name = item.uploadMeta?.originalName || "";
+    const size = item.uploadMeta?.originalSize || 0;
+    if (!name || !size) return false;
+    const group = buildDuplicateGroups()[`${name}::${size}`] || [];
+    return group.length > 1;
   }
 
   function syncPromptEditState(item, preferredAction = "") {
@@ -1569,14 +1769,17 @@
 
   function renderPromptTools(item) {
     return `
-      <div class="prompt-actions">
+      <div class="prompt-actions prompt-actions-sticky">
         <div class="toolbar" style="margin: 0;">
-          <button class="ghost-btn" data-action="copyPrompt" data-mode="ko" data-id="${item.id}" type="button">번역 전체 복사</button>
-          <button class="ghost-btn" data-action="copyPrompt" data-mode="both" data-id="${item.id}" type="button">영어+번역 복사</button>
-          <button class="ghost-btn" data-action="copyPrompt" data-mode="withoutAppearance" data-id="${item.id}" type="button">외모빼고 복사</button>
-          <button class="primary-btn" data-action="copyPrompt" data-mode="final" data-id="${item.id}" type="button">최종 프롬프트 복사</button>
+          <button class="primary-btn" data-action="copyPrompt" data-mode="final" data-id="${item.id}" type="button">최종 복사</button>
+          <button class="ghost-btn" data-action="copyPrompt" data-mode="ko" data-id="${item.id}" type="button">번역 복사</button>
+          <button class="ghost-btn" data-action="copyPrompt" data-mode="both" data-id="${item.id}" type="button">영+한 복사</button>
+          <button class="ghost-btn" data-action="copyPrompt" data-mode="withoutAppearance" data-id="${item.id}" type="button">외모제외</button>
         </div>
-        <button class="ghost-btn" data-action="toggleEdit" type="button">${ui.editMode ? "보기 모드" : "수정 모드"}</button>
+        <div class="toolbar" style="margin: 0;">
+          <button class="ghost-btn" data-action="toggleEdit" type="button">${ui.editMode ? "보기 모드" : "수정 모드"}</button>
+          <button class="ghost-btn ${ui.promptCompareMode ? "active" : ""}" data-action="togglePromptCompare" type="button" ${item.promptBaselineJson ? "" : "disabled"}>원본 비교</button>
+        </div>
       </div>
     `;
   }
@@ -2000,6 +2203,12 @@
             </select>
           </div>
         </div>
+        <div class="option-grid" style="margin-top: var(--space-3);">
+          ${checkboxOption("showTitle", state.albumSettings.showTitle !== false, "카드 제목 표시")}
+          ${checkboxOption("showTags", state.albumSettings.showTags !== false, "카드 태그 표시")}
+          ${checkboxOption("showStatus", state.albumSettings.showStatus !== false, "원본/수정 상태 표시")}
+          ${checkboxOption("showFavorite", state.albumSettings.showFavorite !== false, "즐겨찾기 버튼 표시")}
+        </div>
         <div class="toolbar"><button class="primary-btn" data-action="saveAlbumSettings" type="button">갤러리 설정 저장</button></div>
       </div>
     `;
@@ -2093,8 +2302,15 @@
           <button class="primary-btn" data-action="saveAdvancedSettings" type="button">고급 설정 저장</button>
           <button class="ghost-btn" data-action="retryFailed" type="button">실패 항목 재시도</button>
           <button class="ghost-btn" data-action="exportJson" type="button">JSON 백업</button>
+          <button class="ghost-btn" data-action="exportArchive" type="button">아카이브 백업 저장</button>
           <button class="ghost-btn" data-action="exportCsv" type="button">CSV 내보내기</button>
           <button class="danger-btn" data-action="resetSettingsOnly" type="button">설정 기본값 복원</button>
+        </div>
+        <h3 class="card-title" style="margin-top: var(--space-5);">배치 작업</h3>
+        <div class="toolbar">
+          <button class="ghost-btn" data-action="batchRetitle" type="button">전체 제목 재요약</button>
+          <button class="ghost-btn" data-action="batchRetag" type="button">전체 태그 재추론</button>
+          <button class="ghost-btn" data-action="migrateBaselines" type="button">원본 기준 보정</button>
         </div>
       </div>
     `;
@@ -2192,6 +2408,30 @@
         render();
       });
     }
+    const originFilter = document.getElementById("originFilterSelect");
+    if (originFilter) {
+      originFilter.addEventListener("change", (event) => {
+        ui.originFilter = event.target.value;
+        resetGalleryWindow();
+        render();
+      });
+    }
+    const favoriteOnly = document.getElementById("favoriteOnlyToggle");
+    if (favoriteOnly) {
+      favoriteOnly.addEventListener("change", (event) => {
+        ui.favoriteOnly = event.target.checked;
+        resetGalleryWindow();
+        render();
+      });
+    }
+    const duplicatesOnly = document.getElementById("duplicatesOnlyToggle");
+    if (duplicatesOnly) {
+      duplicatesOnly.addEventListener("change", (event) => {
+        ui.showDuplicatesOnly = event.target.checked;
+        resetGalleryWindow();
+        render();
+      });
+    }
     document.querySelector('[data-action="logout"]')?.addEventListener("click", () => {
       sessionStorage.removeItem(SESSION_KEY);
       render();
@@ -2208,6 +2448,15 @@
           render();
           return;
         }
+        if (ui.bulkCategoryMode) {
+          const id = node.dataset.openItem;
+          const selected = new Set(ui.selectedBulkCategoryIds || []);
+          if (selected.has(id)) selected.delete(id);
+          else selected.add(id);
+          ui.selectedBulkCategoryIds = [...selected];
+          render();
+          return;
+        }
         openItem(node.dataset.openItem);
       });
       node.addEventListener("keydown", (event) => {
@@ -2217,15 +2466,47 @@
           render();
           return;
         }
+        if (ui.bulkCategoryMode) {
+          const id = node.dataset.openItem;
+          const selected = new Set(ui.selectedBulkCategoryIds || []);
+          if (selected.has(id)) selected.delete(id);
+          else selected.add(id);
+          ui.selectedBulkCategoryIds = [...selected];
+          render();
+          return;
+        }
         openItem(node.dataset.openItem);
       });
     });
     document.querySelectorAll("[data-action]").forEach((node) => {
       node.addEventListener("click", (event) => handleAction(event, node));
     });
+    bindModalBackdropGuard();
     bindUploadEvents();
     bindPromptEvents();
     bindSettingsEvents();
+  }
+
+  function bindModalBackdropGuard() {
+    const backdrop = document.querySelector(".modal-backdrop");
+    if (!backdrop) {
+      modalBackdropPointerDown = false;
+      return;
+    }
+    // Only close when the press starts on the dimmed backdrop itself.
+    // Prevents text-selection drags from inputs closing the modal on mouseup outside.
+    backdrop.addEventListener("pointerdown", (event) => {
+      modalBackdropPointerDown = event.target === backdrop;
+    }, true);
+    backdrop.querySelector("[data-modal-panel]")?.addEventListener("pointerdown", () => {
+      modalBackdropPointerDown = false;
+    }, true);
+    window.addEventListener("pointerup", () => {
+      // Keep flag until the following click handler runs, then clear on next tick.
+      setTimeout(() => {
+        modalBackdropPointerDown = false;
+      }, 0);
+    }, { once: true });
   }
 
   async function handleAction(event, node) {
@@ -2237,13 +2518,29 @@
       return;
     }
     if (action === "closeModal") {
-      if (node.classList.contains("modal-backdrop") && event.target !== node) return;
+      if (node.classList.contains("modal-backdrop")) {
+        // Require both target and pointer-down origin to be the backdrop.
+        if (event.target !== node || !modalBackdropPointerDown) return;
+      }
+      modalBackdropPointerDown = false;
       ui.modal = null;
       render();
       return;
     }
     if (action === "toggleBulkDeleteMode") {
       ui.bulkDeleteMode = !ui.bulkDeleteMode;
+      ui.selectedBulkDeleteIds = [];
+      ui.bulkCategoryMode = false;
+      ui.selectedBulkCategoryIds = [];
+      ui.view = "gallery";
+      ui.modal = null;
+      render();
+      return;
+    }
+    if (action === "toggleBulkCategoryMode") {
+      ui.bulkCategoryMode = !ui.bulkCategoryMode;
+      ui.selectedBulkCategoryIds = [];
+      ui.bulkDeleteMode = false;
       ui.selectedBulkDeleteIds = [];
       ui.view = "gallery";
       ui.modal = null;
@@ -2254,6 +2551,28 @@
       ui.bulkDeleteMode = false;
       ui.selectedBulkDeleteIds = [];
       render();
+      return;
+    }
+    if (action === "cancelBulkCategoryMode") {
+      ui.bulkCategoryMode = false;
+      ui.selectedBulkCategoryIds = [];
+      render();
+      return;
+    }
+    if (action === "bulkCategoryToggleItem") {
+      event.preventDefault();
+      event.stopPropagation();
+      const id = node.dataset.bulkCategoryId;
+      const selected = new Set(ui.selectedBulkCategoryIds || []);
+      if (selected.has(id)) selected.delete(id);
+      else selected.add(id);
+      ui.selectedBulkCategoryIds = [...selected];
+      render();
+      return;
+    }
+    if (action === "applyBulkCategory") {
+      const categoryId = document.getElementById("bulkCategorySelect")?.value;
+      applyBulkCategory(categoryId);
       return;
     }
     if (action === "bulkToggleItem") {
@@ -2332,6 +2651,63 @@
     if (action === "retranslateSection") await retranslateSection(node.dataset.id, node.dataset.section);
     if (action === "saveDetail") saveDetail(node.dataset.id);
     if (action === "revisePrompt") await revisePromptFromDetail(node.dataset.id);
+    if (action === "restoreBaseline") {
+      const item = findItem(node.dataset.id);
+      if (!item) return;
+      try {
+        restorePromptBaseline(item);
+        item.updatedAt = Date.now();
+        saveItemState(item);
+        render();
+        showToast("원본 프롬프트로 되돌렸습니다.", "success");
+      } catch (error) {
+        showToast(error.message || "원본 되돌리기 실패", "warning");
+      }
+    }
+    if (action === "restoreVersion") {
+      const item = findItem(node.dataset.id);
+      const index = Number(node.dataset.index);
+      const version = item?.versions?.[index];
+      if (!item || !version?.promptJson) return;
+      applyPrompt(item, clonePromptJson(version.promptJson));
+      syncPromptEditState(item, "manual");
+      item.status = "modified";
+      applyLocalTagsFromPrompt(item);
+      saveItemState(item);
+      render();
+      showToast("이전 버전을 복원했습니다.", "success");
+    }
+    if (action === "togglePromptCompare") {
+      ui.promptCompareMode = !ui.promptCompareMode;
+      render();
+    }
+    if (action === "retitleOne") await retitleOneItem(node.dataset.id);
+    if (action === "retagOne") retagOneItem(node.dataset.id);
+    if (action === "toggleDetailTag") {
+      event.preventDefault();
+      event.stopPropagation();
+      const item = findItem(node.dataset.id);
+      if (!item) return;
+      const type = node.dataset.type;
+      const key = node.dataset.key;
+      const field = type === "outfit" ? "outfitTags" : "backgroundTags";
+      const list = new Set(item[field] || []);
+      if (list.has(key)) list.delete(key);
+      else list.add(key);
+      item[field] = [...list];
+      item.updatedAt = Date.now();
+      saveItemState(item);
+      render();
+    }
+    if (action === "batchRetitle") await batchRetitleAll();
+    if (action === "batchRetag") batchRetagAll();
+    if (action === "migrateBaselines") {
+      migrateAllPromptBaselines();
+      saveItemsState();
+      render();
+      showToast("원본 기준을 보정했습니다.", "success");
+    }
+    if (action === "exportArchive") exportArchiveBackup();
     if (action === "deleteItem") deleteItem(node.dataset.id);
     if (action === "addExcludeOption") addExcludeOption();
     if (action === "saveExcludeOption") saveExcludeOption(node.dataset.key);
@@ -2770,13 +3146,18 @@
           source: item.uploadMeta?.exifPromptSource || "stored-exif-raw",
         };
       }
+      throw new Error("저장된 EXIF 원문 파싱 실패");
     }
 
     const file = await itemImageAsFile(item);
     if (!file) {
-      throw new Error("보관된 EXIF 원문과 원본 이미지가 없어 다시 읽을 수 없습니다. 업로드 시 원본 보관(preserveOriginal)을 켜거나 이미지를 다시 업로드하세요.");
+      throw new Error("EXIF 원문 미보관 · 원본 이미지 없음");
     }
-    return readExifPromptFromFile(file);
+    try {
+      return await readExifPromptFromFile(file);
+    } catch (error) {
+      throw new Error(`이미지 메타 읽기 실패: ${error.message || error}`);
+    }
   }
 
   async function itemImageAsFile(item) {
@@ -3096,11 +3477,12 @@
     collectPromptEditsFromDom(item);
     item.title = document.getElementById("detailTitle")?.value.trim() || item.title || "";
     item.categoryId = document.getElementById("detailCategory")?.value || item.categoryId || "";
-    item.outfitTags = namesToTagKeys(document.getElementById("detailOutfitTags")?.value || "", "outfit");
-    item.backgroundTags = namesToTagKeys(document.getElementById("detailBackgroundTags")?.value || "", "background");
+    // Tags are managed via chip toggles on the item object directly.
     item.memo = document.getElementById("detailMemo")?.value.trim() || "";
     item.customInstruction = document.getElementById("detailCustomInstruction")?.value.trim() || "";
     item.excludeOptions = selectedCheckboxValues("detailExclude");
+    ui.reviseAlsoRetag = document.getElementById("reviseAlsoRetag")?.checked !== false;
+    ui.reviseAlsoRetitle = document.getElementById("reviseAlsoRetitle")?.checked === true;
   }
 
   async function revisePromptFromDetail(id) {
@@ -3154,9 +3536,14 @@
       }
       const nextPrompt = normalizeAnalysisPrompt(payload.promptJson || payload.promptSections);
       applyPrompt(item, nextPrompt);
-      applyLocalTagsFromPrompt(item);
+      if (ui.reviseAlsoRetag) applyLocalTagsFromPrompt(item);
       item.status = "modified";
       syncPromptEditState(item, "api_revise");
+      if (ui.reviseAlsoRetitle) {
+        try {
+          await ensureKoreanTitle(item, { force: true });
+        } catch (_titleError) {}
+      }
       item.errorMessage = "";
       item.updatedAt = Date.now();
       saveItemState(item);
@@ -3169,6 +3556,109 @@
       render();
       showToast(item.errorMessage, "warning", 2800);
     }
+  }
+
+  async function retitleOneItem(id, options = {}) {
+    const item = findItem(id);
+    if (!item?.promptJson) return;
+    try {
+      await ensureKoreanTitle(item, { force: true });
+      saveItemState(item);
+      if (!options.silent) {
+        render();
+        showToast("제목 요약을 갱신했습니다.", "success");
+      }
+    } catch (error) {
+      if (!options.silent) showToast(error.message || "제목 요약 실패", "warning");
+      throw error;
+    }
+  }
+
+  function retagOneItem(id, options = {}) {
+    const item = findItem(id);
+    if (!item?.promptJson) return;
+    applyLocalTagsFromPrompt(item);
+    item.updatedAt = Date.now();
+    saveItemState(item);
+    if (!options.silent) {
+      render();
+      showToast("태그를 재추론했습니다.", "success");
+    }
+  }
+
+  async function batchRetitleAll() {
+    const targets = state.items.filter((item) => item.promptJson);
+    let ok = 0;
+    for (const item of targets) {
+      try {
+        await ensureKoreanTitle(item, { force: true });
+        ok += 1;
+      } catch (_error) {}
+    }
+    saveItemsState();
+    render();
+    showToast(`제목 요약 ${ok}/${targets.length} 완료`, ok ? "success" : "warning");
+  }
+
+  function batchRetagAll() {
+    const targets = state.items.filter((item) => item.promptJson);
+    targets.forEach((item) => applyLocalTagsFromPrompt(item));
+    saveItemsState();
+    render();
+    showToast(`${targets.length}개 태그 재추론 완료`, "success");
+  }
+
+  function applyBulkCategory(categoryId) {
+    const ids = ui.selectedBulkCategoryIds || [];
+    if (!ids.length || !categoryId) return;
+    ids.forEach((id) => {
+      const item = findItem(id);
+      if (!item) return;
+      item.categoryId = categoryId;
+      item.updatedAt = Date.now();
+    });
+    saveItemsState();
+    ui.selectedBulkCategoryIds = [];
+    ui.bulkCategoryMode = false;
+    render();
+    showToast(`${ids.length}개 분류 변경`, "success");
+  }
+
+  function exportArchiveBackup() {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      settings: {
+        theme: state.theme,
+        categories: state.categories,
+        promptInstruction: state.promptInstruction,
+        promptSettings: state.promptSettings,
+        uploadSettings: state.uploadSettings,
+        albumSettings: state.albumSettings,
+        copyDisplaySettings: state.copyDisplaySettings,
+        categorySettings: state.categorySettings,
+        themeSettings: state.themeSettings,
+        advancedSettings: state.advancedSettings,
+        excludeOptions: state.excludeOptions,
+        outfitTagOptions: state.outfitTagOptions,
+        backgroundTagOptions: state.backgroundTagOptions,
+      },
+      providers: state.providers,
+      items: state.items.map((item) => ({
+        ...item,
+        displayImage: item.displayImage ? { ...item.displayImage, dataUrl: item.displayImage.dataUrl?.startsWith("data:") ? undefined : item.displayImage.dataUrl } : null,
+        analysisImage: item.analysisImage ? { ...item.analysisImage, dataUrl: item.analysisImage.dataUrl?.startsWith("data:") ? undefined : item.analysisImage.dataUrl } : null,
+        thumbnailImage: item.thumbnailImage ? { ...item.thumbnailImage, dataUrl: item.thumbnailImage.dataUrl?.startsWith("data:") ? undefined : item.thumbnailImage.dataUrl } : null,
+        originalImage: item.originalImage ? { ...item.originalImage, dataUrl: item.originalImage.dataUrl?.startsWith("data:") ? undefined : item.originalImage.dataUrl } : null,
+      })),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `prompt-archive-backup-${Date.now()}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    showToast("아카이브 백업 파일을 저장했습니다.", "success");
   }
 
   function deleteItem(id) {
@@ -3310,10 +3800,10 @@
       rows: document.getElementById("albumRows")?.value,
       paginationPosition: document.getElementById("paginationPosition")?.value,
       cardAspectRatio: document.getElementById("cardAspectRatio")?.value,
-      showTitle: true,
-      showTags: false,
-      showStatus: false,
-      showFavorite: false,
+      showTitle: document.getElementById("showTitle")?.checked !== false,
+      showTags: document.getElementById("showTags")?.checked !== false,
+      showStatus: document.getElementById("showStatus")?.checked !== false,
+      showFavorite: document.getElementById("showFavorite")?.checked !== false,
     });
     resetGalleryWindow();
     saveSettingsState();
@@ -4526,12 +5016,43 @@
 
   function bindBackspaceNavigation() {
     document.addEventListener("keydown", (event) => {
-      if (event.key !== "Backspace") return;
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (isTextEditingTarget(event.target)) return;
-      if (!goBackInApp()) return;
-      event.preventDefault();
+      if (event.key === "Backspace") {
+        if (!goBackInApp()) return;
+        event.preventDefault();
+        return;
+      }
+      if (event.key === "j" || event.key === "J") {
+        if (navigateAdjacentItem(1)) event.preventDefault();
+        return;
+      }
+      if (event.key === "k" || event.key === "K") {
+        if (navigateAdjacentItem(-1)) event.preventDefault();
+        return;
+      }
+      if (event.key === "c" || event.key === "C") {
+        const item = selectedItem();
+        if (ui.view === "detail" && item?.promptJson) {
+          copyPrompt(item.id, "final");
+          event.preventDefault();
+        }
+      }
     });
+  }
+
+  function navigateAdjacentItem(delta) {
+    const items = getFilteredItems();
+    if (!items.length) return false;
+    if (ui.view !== "detail") {
+      openItem(items[0].id);
+      return true;
+    }
+    const index = items.findIndex((item) => item.id === ui.selectedId);
+    const next = items[Math.max(0, Math.min(items.length - 1, (index < 0 ? 0 : index) + delta))];
+    if (!next || next.id === ui.selectedId) return false;
+    openItem(next.id);
+    return true;
   }
 
   function isTextEditingTarget(target) {
