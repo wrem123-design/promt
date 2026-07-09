@@ -21,6 +21,8 @@
   let serverBootComplete = false;
   let changedBeforeServerBoot = false;
   let modalBackdropPointerDown = false;
+  let searchImeComposing = false;
+  let searchRefreshTimer = null;
 
   const sectionBoundaryRules = `Section boundary rules:
 - Appearance must not include expression, gaze, camera angle, pose, composition, background, accessories, outfit mood, or clothing atmosphere.
@@ -172,6 +174,12 @@
     maxImagesPerBatch: 30,
     maxRegenerationsPerImage: 20,
     logs: [],
+    shortcuts: {
+      nextItem: "",
+      prevItem: "",
+      copyFinal: "",
+      goBack: "",
+    },
   };
 
   const defaultOutfitTags = [
@@ -472,6 +480,7 @@
   }
 
   function normalizeAdvancedSettings(settings = {}) {
+    const shortcuts = settings.shortcuts && typeof settings.shortcuts === "object" ? settings.shortcuts : {};
     return {
       ...defaultAdvancedSettings,
       ...settings,
@@ -480,7 +489,18 @@
       maxImagesPerBatch: clampNumber(settings.maxImagesPerBatch, 1, 200, defaultAdvancedSettings.maxImagesPerBatch),
       maxRegenerationsPerImage: clampNumber(settings.maxRegenerationsPerImage, 1, 200, defaultAdvancedSettings.maxRegenerationsPerImage),
       logs: Array.isArray(settings.logs) ? settings.logs : [],
+      shortcuts: {
+        nextItem: normalizeShortcutValue(shortcuts.nextItem, defaultAdvancedSettings.shortcuts.nextItem),
+        prevItem: normalizeShortcutValue(shortcuts.prevItem, defaultAdvancedSettings.shortcuts.prevItem),
+        copyFinal: normalizeShortcutValue(shortcuts.copyFinal, defaultAdvancedSettings.shortcuts.copyFinal),
+        goBack: normalizeShortcutValue(shortcuts.goBack, defaultAdvancedSettings.shortcuts.goBack),
+      },
     };
+  }
+
+  function normalizeShortcutValue(value, fallback = "") {
+    if (value == null) return fallback;
+    return String(value).trim();
   }
 
   function clampNumber(value, min, max, fallback) {
@@ -914,12 +934,12 @@
           </span>
         </div>
         <div class="topbar-center">
-          <div class="search-wrap compact-search">
-            <span class="search-icon" aria-hidden="true">${navIcon("search")}</span>
-            <label class="sr-only" for="globalSearch">검색</label>
-            <input class="input search-input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 태그, 프롬프트 검색">
-          </div>
-          <div class="topbar-filter-group" aria-label="정렬 및 필터">
+          <div class="topbar-center-cluster" aria-label="검색 및 필터">
+            <div class="search-wrap compact-search">
+              <span class="search-icon" aria-hidden="true">${navIcon("search")}</span>
+              <label class="sr-only" for="globalSearch">검색</label>
+              <input class="input search-input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 태그, 프롬프트 검색">
+            </div>
             <select class="select compact-select" id="sortSelect" aria-label="정렬">
               <option value="latest" ${ui.sort === "latest" ? "selected" : ""}>최신순</option>
               <option value="oldest" ${ui.sort === "oldest" ? "selected" : ""}>오래된순</option>
@@ -932,7 +952,7 @@
               <option value="original" ${ui.originFilter === "original" ? "selected" : ""}>원본</option>
               <option value="modified" ${ui.originFilter === "modified" ? "selected" : ""}>수정됨</option>
             </select>
-            <div class="topbar-toggle-group">
+            <div class="topbar-toggle-group" aria-label="빠른 필터">
               <label class="topbar-toggle pill-toggle ${ui.favoriteOnly ? "active" : ""}"><input id="favoriteOnlyToggle" type="checkbox" ${ui.favoriteOnly ? "checked" : ""}><span>★ 즐겨찾기</span></label>
               <label class="topbar-toggle pill-toggle ${ui.showDuplicatesOnly ? "active" : ""}"><input id="duplicatesOnlyToggle" type="checkbox" ${ui.showDuplicatesOnly ? "checked" : ""}><span>중복</span></label>
             </div>
@@ -976,6 +996,105 @@
     return renderGallery();
   }
 
+  function scheduleSearchRefresh(options = {}) {
+    clearTimeout(searchRefreshTimer);
+    const run = () => {
+      searchRefreshTimer = null;
+      refreshGalleryWithoutTopbar();
+    };
+    if (options.immediate) run();
+    else searchRefreshTimer = setTimeout(run, 80);
+  }
+
+  function refreshGalleryWithoutTopbar() {
+    // Update only main content so the search input keeps IME composition state.
+    if (ui.modal) return;
+    if (ui.view !== "gallery") ui.view = "gallery";
+    resetGalleryWindow();
+    const content = document.querySelector("main > .content");
+    if (!content) {
+      render();
+      return;
+    }
+    content.innerHTML = renderGallery();
+    bindGalleryContentEvents();
+  }
+
+  function bindGalleryContentEvents() {
+    document.querySelectorAll("[data-filter-group]").forEach((node) => {
+      node.addEventListener("click", () => {
+        ui.filterGroup = node.dataset.filterGroup;
+        resetGalleryWindow();
+        refreshGalleryWithoutTopbar();
+      });
+    });
+    document.querySelectorAll("[data-category-filter]").forEach((node) => {
+      node.addEventListener("click", () => {
+        ui.category = node.dataset.categoryFilter;
+        resetGalleryWindow();
+        refreshGalleryWithoutTopbar();
+      });
+    });
+    document.querySelectorAll("[data-tag-filter]").forEach((node) => {
+      node.addEventListener("click", () => {
+        const target = node.dataset.tagFilter === "outfit" ? ui.selectedOutfitTags : ui.selectedBackgroundTags;
+        const key = node.dataset.key;
+        const index = target.indexOf(key);
+        if (index >= 0) target.splice(index, 1);
+        else target.push(key);
+        resetGalleryWindow();
+        refreshGalleryWithoutTopbar();
+      });
+    });
+    document.querySelectorAll("[data-page]").forEach((node) => {
+      node.addEventListener("click", () => {
+        const pageCount = Math.max(1, Math.ceil(getFilteredItems().length / (state.albumSettings.columns * state.albumSettings.rows)));
+        const command = node.dataset.page;
+        if (command === "first") ui.page = 1;
+        else if (command === "prev") ui.page = Math.max(1, ui.page - 1);
+        else if (command === "next") ui.page = Math.min(pageCount, ui.page + 1);
+        else if (command === "last") ui.page = pageCount;
+        else ui.page = Number(command);
+        refreshGalleryWithoutTopbar();
+      });
+    });
+    document.querySelectorAll("[data-open-item]").forEach((node) => {
+      node.addEventListener("click", (event) => {
+        if (event.target.closest("button, input, label, .bulk-delete-check")) return;
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          refreshGalleryWithoutTopbar();
+          return;
+        }
+        if (ui.bulkCategoryMode) {
+          const id = node.dataset.openItem;
+          const selected = new Set(ui.selectedBulkCategoryIds || []);
+          if (selected.has(id)) selected.delete(id);
+          else selected.add(id);
+          ui.selectedBulkCategoryIds = [...selected];
+          refreshGalleryWithoutTopbar();
+          return;
+        }
+        openItem(node.dataset.openItem);
+      });
+      node.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          refreshGalleryWithoutTopbar();
+          return;
+        }
+        openItem(node.dataset.openItem);
+      });
+    });
+    document.querySelectorAll("[data-action]").forEach((node) => {
+      // Only bind actions inside content to avoid double-binding topbar actions.
+      if (node.closest("header.topbar")) return;
+      node.addEventListener("click", (event) => handleAction(event, node));
+    });
+    bindGalleryInfiniteScroll();
+  }
+
   function renderModal() {
     if (!ui.modal) return "";
     const title = ui.modal === "upload" ? "업로드" : "설정";
@@ -993,18 +1112,38 @@
     `;
   }
 
+  function normalizeSearchText(value) {
+    return String(value || "")
+      .normalize("NFC")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function itemSearchBlob(item) {
+    return normalizeSearchText([
+      displayTitle(item),
+      item.title,
+      item.titleSummary,
+      item.memo,
+      item.customInstruction,
+      item.tags?.join(" "),
+      tagNames(item.outfitTags, "outfit").join(" "),
+      tagNames(item.backgroundTags, "background").join(" "),
+      promptText(item, "both"),
+      promptText(item, "final"),
+    ].filter(Boolean).join(" "));
+  }
+
   function getFilteredItems() {
-    const query = ui.query.trim().toLowerCase();
+    const query = normalizeSearchText(ui.query);
     let items = [...state.items];
     if (ui.status !== "all") items = items.filter((item) => item.status === ui.status);
     if (ui.category !== "all") items = items.filter((item) => item.categoryId === ui.category);
     if (ui.selectedOutfitTags.length) items = items.filter((item) => ui.selectedOutfitTags.every((tag) => (item.outfitTags || []).includes(tag)));
     if (ui.selectedBackgroundTags.length) items = items.filter((item) => ui.selectedBackgroundTags.every((tag) => (item.backgroundTags || []).includes(tag)));
     if (query) {
-      items = items.filter((item) => {
-        const prompt = promptText(item, "both").toLowerCase();
-        return [displayTitle(item), item.memo, item.customInstruction, item.tags.join(" "), tagNames(item.outfitTags, "outfit").join(" "), tagNames(item.backgroundTags, "background").join(" "), prompt].join(" ").toLowerCase().includes(query);
-      });
+      items = items.filter((item) => itemSearchBlob(item).includes(query));
     }
     if (ui.favoriteOnly) items = items.filter((item) => item.isFavorite);
     if (ui.originFilter === "original") items = items.filter((item) => {
@@ -2352,6 +2491,26 @@
           <button class="ghost-btn" data-action="batchRetag" type="button">전체 태그 재추론</button>
           <button class="ghost-btn" data-action="migrateBaselines" type="button">원본 기준 보정</button>
         </div>
+        <h3 class="card-title" style="margin-top: var(--space-5);">단축키</h3>
+        <p class="field-help">비워 두면 해당 단축키는 비활성입니다. 입력칸을 클릭한 뒤 원하는 키를 누르면 등록됩니다.</p>
+        <div class="form-grid shortcut-grid">
+          ${shortcutField("shortcutNextItem", "다음 게시물", state.advancedSettings.shortcuts?.nextItem || "")}
+          ${shortcutField("shortcutPrevItem", "이전 게시물", state.advancedSettings.shortcuts?.prevItem || "")}
+          ${shortcutField("shortcutCopyFinal", "최종 프롬프트 복사", state.advancedSettings.shortcuts?.copyFinal || "")}
+          ${shortcutField("shortcutGoBack", "뒤로", state.advancedSettings.shortcuts?.goBack || "")}
+        </div>
+        <div class="toolbar">
+          <button class="ghost-btn" data-action="clearShortcuts" type="button">단축키 모두 비우기</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function shortcutField(id, label, value) {
+    return `
+      <div class="field">
+        <label for="${id}">${label}</label>
+        <input class="input shortcut-input" id="${id}" type="text" value="${escapeHtml(value)}" placeholder="비활성" readonly data-shortcut-field="${id}">
       </div>
     `;
   }
@@ -2433,11 +2592,27 @@
     });
     const search = document.getElementById("globalSearch");
     if (search) {
+      // Keep the input node stable. Full app re-render destroys Hangul IME composition.
+      search.addEventListener("compositionstart", () => {
+        searchImeComposing = true;
+      });
+      search.addEventListener("compositionend", (event) => {
+        searchImeComposing = false;
+        ui.query = event.target.value;
+        scheduleSearchRefresh();
+      });
       search.addEventListener("input", (event) => {
         ui.query = event.target.value;
-        if (ui.view !== "gallery") ui.view = "gallery";
-        resetGalleryWindow();
-        render();
+        if (searchImeComposing || event.isComposing) {
+          // Still refresh results with current composition text, without touching the input DOM.
+          scheduleSearchRefresh({ immediate: false });
+          return;
+        }
+        scheduleSearchRefresh({ immediate: true });
+      });
+      search.addEventListener("keydown", (event) => {
+        // Prevent global shortcuts from stealing keys while searching.
+        event.stopPropagation();
       });
     }
     const sort = document.getElementById("sortSelect");
@@ -2525,6 +2700,7 @@
     bindUploadEvents();
     bindPromptEvents();
     bindSettingsEvents();
+    bindShortcutCaptureFields();
   }
 
   function bindModalBackdropGuard() {
@@ -2759,6 +2935,7 @@
     if (action === "saveCopyDisplaySettings") saveCopyDisplaySettings();
     if (action === "saveThemeSettings") saveThemeSettings();
     if (action === "saveAdvancedSettings") saveAdvancedSettings();
+    if (action === "clearShortcuts") clearAllShortcuts();
     if (action === "saveCategorySettings") saveCategorySettings();
     if (action === "addCategory") addCategory();
     if (action === "saveCategory") saveCategory(node.dataset.id);
@@ -2877,13 +3054,26 @@
     const distanceToBottom = document.documentElement.scrollHeight - scrollBottom;
     if (distanceToBottom > 420) return;
     ui.galleryLoading = true;
-    render();
+    refreshGalleryContentPreservingSearch();
     window.setTimeout(() => {
       ui.galleryLoadedPages = (ui.galleryLoadedPages || 1) + 1;
       ui.galleryLoading = false;
-      render();
+      refreshGalleryContentPreservingSearch();
       window.setTimeout(() => maybeLoadMoreGallery(), 0);
     }, 260);
+  }
+
+  function refreshGalleryContentPreservingSearch() {
+    const search = document.getElementById("globalSearch");
+    if (search && (document.activeElement === search || searchImeComposing)) {
+      const content = document.querySelector("main > .content");
+      if (content && ui.view === "gallery" && !ui.modal) {
+        content.innerHTML = renderGallery();
+        bindGalleryContentEvents();
+        return;
+      }
+    }
+    render();
   }
 
   function bindSettingsEvents() {
@@ -3884,9 +4074,57 @@
       monthlyMaxAnalyses: document.getElementById("monthlyMaxAnalyses")?.value,
       maxImagesPerBatch: document.getElementById("maxImagesPerBatch")?.value,
       maxRegenerationsPerImage: document.getElementById("maxRegenerationsPerImage")?.value,
+      shortcuts: {
+        nextItem: document.getElementById("shortcutNextItem")?.value || "",
+        prevItem: document.getElementById("shortcutPrevItem")?.value || "",
+        copyFinal: document.getElementById("shortcutCopyFinal")?.value || "",
+        goBack: document.getElementById("shortcutGoBack")?.value || "",
+      },
     });
     saveSettingsState();
     render();
+  }
+
+  function clearAllShortcuts() {
+    state.advancedSettings = normalizeAdvancedSettings({
+      ...state.advancedSettings,
+      shortcuts: {
+        nextItem: "",
+        prevItem: "",
+        copyFinal: "",
+        goBack: "",
+      },
+    });
+    saveSettingsState();
+    render();
+    showToast("단축키를 모두 비웠습니다.", "success");
+  }
+
+  function bindShortcutCaptureFields() {
+    document.querySelectorAll("[data-shortcut-field]").forEach((input) => {
+      input.addEventListener("keydown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.key === "Escape" || event.key === "Tab") return;
+        if (event.key === "Backspace" || event.key === "Delete") {
+          input.value = "";
+          return;
+        }
+        input.value = shortcutLabelFromEvent(event);
+      });
+    });
+  }
+
+  function shortcutLabelFromEvent(event) {
+    if (event.key === " ") return "Space";
+    return event.key;
+  }
+
+  function shortcutMatches(event, binding) {
+    const value = String(binding || "").trim();
+    if (!value) return false;
+    if (value === "Space") return event.key === " ";
+    return event.key === value || event.key.toLowerCase() === value.toLowerCase();
   }
 
   function saveCategorySettings() {
@@ -4214,12 +4452,17 @@
     const item = findItem(id);
     const sectionConfig = state.promptSettings.sections.find((section) => section.key === sectionKey);
     const sentences = item?.promptJson?.[sectionKey]?.sentences || [];
-    const mode = state.copyDisplaySettings.defaultCopyMode || lang || "en";
+    // Prefer the column language from the button (en/ko). defaultCopyMode is only a fallback.
+    const mode = ["en", "ko", "both", "final"].includes(lang)
+      ? lang
+      : (state.copyDisplaySettings.defaultCopyMode || "en");
     const parts = [];
-    if (state.copyDisplaySettings.includeSectionTitles && sectionConfig) parts.push(mode === "ko" ? sectionConfig.labelKo : sectionConfig.labelEn);
+    if (state.copyDisplaySettings.includeSectionTitles && sectionConfig) {
+      parts.push(mode === "ko" ? sectionConfig.labelKo : sectionConfig.labelEn);
+    }
     if (mode === "both") parts.push(...sentences.map((sentence) => `${sentence.en}\n${sentence.ko}`));
-    else if (mode === "ko") parts.push(...sentences.map((sentence) => sentence.ko));
-    else parts.push(...sentences.map((sentence) => sentence.en));
+    else if (mode === "ko") parts.push(...sentences.map((sentence) => sentence.ko).filter(Boolean));
+    else parts.push(...sentences.map((sentence) => sentence.en).filter(Boolean));
     writeClipboard(joinCopiedLines(parts, mode === "final"), "문단을 복사했습니다.");
   }
 
@@ -5058,20 +5301,22 @@
     document.addEventListener("keydown", (event) => {
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (isTextEditingTarget(event.target)) return;
-      if (event.key === "Backspace") {
+      if (event.target?.closest?.("[data-shortcut-field]")) return;
+      const shortcuts = state.advancedSettings?.shortcuts || {};
+      if (shortcutMatches(event, shortcuts.goBack)) {
         if (!goBackInApp()) return;
         event.preventDefault();
         return;
       }
-      if (event.key === "j" || event.key === "J") {
+      if (shortcutMatches(event, shortcuts.nextItem)) {
         if (navigateAdjacentItem(1)) event.preventDefault();
         return;
       }
-      if (event.key === "k" || event.key === "K") {
+      if (shortcutMatches(event, shortcuts.prevItem)) {
         if (navigateAdjacentItem(-1)) event.preventDefault();
         return;
       }
-      if (event.key === "c" || event.key === "C") {
+      if (shortcutMatches(event, shortcuts.copyFinal)) {
         const item = selectedItem();
         if (ui.view === "detail" && item?.promptJson) {
           copyPrompt(item.id, "final");
@@ -5084,10 +5329,8 @@
   function navigateAdjacentItem(delta) {
     const items = getFilteredItems();
     if (!items.length) return false;
-    if (ui.view !== "detail") {
-      openItem(items[0].id);
-      return true;
-    }
+    // Only navigate when already viewing a detail item.
+    if (ui.view !== "detail") return false;
     const index = items.findIndex((item) => item.id === ui.selectedId);
     const next = items[Math.max(0, Math.min(items.length - 1, (index < 0 ? 0 : index) + delta))];
     if (!next || next.id === ui.selectedId) return false;

@@ -320,14 +320,18 @@ button:disabled {
 }
 
 .album-topbar {
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  justify-content: stretch;
+  gap: var(--space-3);
 }
 
 .topbar-left {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  min-width: max-content;
+  min-width: 0;
+  justify-self: start;
 }
 
 .brand-inline {
@@ -415,16 +419,27 @@ button:disabled {
 .topbar-center {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
-  flex: 1;
+  justify-content: center;
+  justify-self: center;
   min-width: 0;
-  max-width: 920px;
+  max-width: none;
+  flex: none;
+  grid-column: 2;
+}
+
+.topbar-center-cluster {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 10px;
 }
 
 .compact-search {
   position: relative;
-  flex: 1 1 280px;
-  min-width: 200px;
+  flex: 0 0 520px;
+  width: 520px;
+  max-width: 520px;
+  min-width: 280px;
 }
 
 .search-icon {
@@ -454,13 +469,6 @@ button:disabled {
   box-shadow: var(--ring);
 }
 
-.topbar-filter-group {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
 .filter-section-label {
   color: var(--muted);
   font-size: 0.68rem;
@@ -470,22 +478,28 @@ button:disabled {
 }
 
 .compact-select {
-  max-width: 140px;
-  min-height: 38px;
+  width: 112px;
+  max-width: 112px;
+  min-height: 40px;
   border-radius: 10px;
+  flex: 0 0 auto;
 }
 
 .topbar-toggle-group {
   display: inline-flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 6px;
-  padding-bottom: 1px;
+  flex: 0 0 auto;
 }
 
 .topbar-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
+  justify-self: end;
+  grid-column: 3;
 }
 
 .icon-btn {
@@ -2023,8 +2037,8 @@ button:disabled {
   white-space: nowrap;
 }
 .pill-toggle {
-  min-height: 34px;
-  padding: 0 10px;
+  min-height: 40px;
+  padding: 0 12px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--panel);
@@ -2038,7 +2052,6 @@ button:disabled {
   background: color-mix(in srgb, var(--primary) 10%, var(--panel));
   font-weight: 740;
 }
-.topbar-center { flex-wrap: wrap; gap: var(--space-2); }
 .album-action-row {
   margin-bottom: var(--space-3);
 }
