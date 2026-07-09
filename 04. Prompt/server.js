@@ -43,6 +43,9 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/providers" && req.method === "PUT") return saveProviders(req, res);
     if (url.pathname === "/api/providers/test" && req.method === "POST") return testProvider(req, res);
     if (url.pathname === "/api/analyze" && req.method === "POST") return analyzeImage(req, res);
+    if (url.pathname === "/api/translate-section" && req.method === "POST") return translateSection(req, res);
+    if (url.pathname === "/api/title-summary" && req.method === "POST") return generateTitleSummary(req, res);
+    if (url.pathname === "/api/edit-prompt" && req.method === "POST") return editPrompt(req, res);
     if (url.pathname === "/api/tags" && req.method === "GET") return sendTags(res);
     if (url.pathname === "/api/tags" && req.method === "PUT") return saveTags(req, res);
     if (url.pathname === "/api/items" && req.method === "GET") return sendItems(res);
@@ -173,18 +176,296 @@ async function analyzeImage(req, res) {
   const payload = JSON.parse(body || "{}");
   const provider = selectProvider(null, "useForImageAnalysis");
   if (!provider) return sendJson(res, 400, { error: "provider_not_configured", message: "이미지 분석에 사용할 API 공급자가 없습니다." });
+
+  const image = readRequestImage(payload.item || {});
+  if (!image) {
+    return sendJson(res, 400, {
+      error: "missing_image",
+      message: "분석할 이미지가 서버 요청에 포함되지 않았습니다.",
+      provider: provider.name,
+    });
+  }
+
+  let rawText = "";
+  try {
+    rawText = await callProvider(provider, {
+      prompt: payload.request || "",
+      image,
+      timeoutSeconds: provider.timeoutSeconds || 60,
+    });
+    const parsed = parseProviderJson(rawText);
+    const normalized = normalizeProviderResult(parsed);
+    return sendJson(res, 200, { ok: true, provider: provider.name, ...normalized });
+  } catch (error) {
+    console.error("[analysis_failed]", {
+      provider: provider.name,
+      message: error.message,
+      rawPreview: String(rawText || "").slice(0, 1500),
+      stack: error.stack,
+    });
+    return sendJson(res, 502, { error: "analysis_failed", message: error.message, provider: provider.name });
+  }
+}
+
+async function translateSection(req, res) {
+  const body = await readBody(req);
+  const payload = JSON.parse(body || "{}");
+  const provider = selectProvider(null, "useForTranslation");
+  if (!provider) return sendJson(res, 400, { error: "provider_not_configured", message: "한국어 번역에 사용할 API 공급자가 없습니다." });
+  const sentences = Array.isArray(payload.sentences) ? payload.sentences.map((sentence, index) => ({
+    id: String(sentence.id || `sentence-${index + 1}`),
+    en: String(sentence.en || "").trim(),
+  })).filter((sentence) => sentence.en) : [];
+  if (!sentences.length) return sendJson(res, 400, { error: "empty_sentences", message: "번역할 영어 문장이 없습니다." });
+  const prompt = [
+    "Translate the English prompt sentences into natural Korean.",
+    "Return strict JSON only. Do not add markdown.",
+    "Keep the same sentence ids. Do not add meaning that is not present in English. Do not omit meaning.",
+    "Output format: {\"translations\":[{\"id\":\"...\",\"ko\":\"...\"}]}",
+    `Section: ${String(payload.sectionLabel || payload.sectionKey || "").trim()}`,
+    `Sentences: ${JSON.stringify(sentences)}`,
+  ].join("\n");
   try {
     const text = await callProvider(provider, {
-      prompt: payload.request || "",
-      image: readRequestImage(payload.item || {}),
+      prompt,
+      image: null,
+      timeoutSeconds: provider.timeoutSeconds || 60,
+    });
+    const parsed = parseProviderJson(text);
+    const translations = normalizeSectionTranslations(parsed, sentences);
+    return sendJson(res, 200, { ok: true, provider: provider.name, translations });
+  } catch (error) {
+    return sendJson(res, 502, { error: "translation_failed", message: error.message, provider: provider.name });
+  }
+}
+
+async function editPrompt(req, res) {
+  const body = await readBody(req);
+  const payload = JSON.parse(body || "{}");
+  const provider = selectProvider(null, "useForTranslation");
+  if (!provider) {
+    return sendJson(res, 400, {
+      error: "provider_not_configured",
+      message: "프롬프트 수정에 사용할 번역·텍스트 공급자가 없습니다.",
+    });
+  }
+
+  const sourceSections = payload.promptJson || payload.promptSections || {};
+  const sectionKeys = ["appearance", "outfit", "background", "expression_pose", "details"];
+  const compactSections = {};
+  let sentenceCount = 0;
+  for (const key of sectionKeys) {
+    const section = sourceSections[key] || {};
+    const sentences = Array.isArray(section.sentences) ? section.sentences : Array.isArray(section) ? section : [];
+    const normalized = sentences.map((sentence, index) => ({
+      id: String(sentence.id || `${key}-${index + 1}`),
+      en: String(sentence.en || "").trim(),
+      ko: String(sentence.ko || "").trim(),
+    })).filter((sentence) => sentence.en || sentence.ko);
+    if (normalized.length) {
+      compactSections[key] = {
+        title_ko: String(section.title_ko || "").trim(),
+        sentences: normalized,
+      };
+      sentenceCount += normalized.length;
+    }
+  }
+  if (!sentenceCount) {
+    return sendJson(res, 400, { error: "empty_prompt", message: "수정할 현재 프롬프트가 없습니다." });
+  }
+
+  const customInstruction = String(payload.customInstruction || "").trim();
+  const excludeLabels = Array.isArray(payload.excludeLabels)
+    ? payload.excludeLabels.map((label) => String(label || "").trim()).filter(Boolean)
+    : [];
+  if (!customInstruction && !excludeLabels.length) {
+    return sendJson(res, 400, {
+      error: "empty_edit_request",
+      message: "추가 요청사항 또는 제외 요소를 하나 이상 지정해 주세요.",
+    });
+  }
+
+  const prompt = [
+    "You are editing an existing AI image prompt archive entry.",
+    "Do NOT re-analyze any image. Work only from the provided prompt JSON.",
+    "Apply the user edit request and exclusion list with MINIMAL text changes.",
+    "Return strict JSON only. No markdown.",
+    "",
+    "Output format:",
+    "{\"promptSections\":{",
+    "  \"appearance\":[{\"id\":\"...\",\"en\":\"...\",\"ko\":\"...\"}],",
+    "  \"outfit\":[{\"id\":\"...\",\"en\":\"...\",\"ko\":\"...\"}],",
+    "  \"background\":[{\"id\":\"...\",\"en\":\"...\",\"ko\":\"...\"}],",
+    "  \"expression_pose\":[{\"id\":\"...\",\"en\":\"...\",\"ko\":\"...\"}],",
+    "  \"details\":[{\"id\":\"...\",\"en\":\"...\",\"ko\":\"...\"}]",
+    "}}",
+    "",
+    "Rules:",
+    "- Keep the same section keys and the same sentence ids whenever possible.",
+    "- Prefer deleting/rewriting only the phrases that must change.",
+    "- Do not rewrite the whole prompt from scratch.",
+    "- Do not invent major new scene facts unless the user request explicitly asks for them.",
+    "- If an element is listed under exclusions, remove descriptions of that element even if visible in the old text.",
+    "- Keep English and Korean aligned 1:1 for each sentence id.",
+    "- Preserve overall style, structure, and high visual density.",
+    "- If a section needs no change, return it almost unchanged.",
+    "",
+    `User additional request: ${customInstruction || "(none)"}`,
+    `Elements to remove/exclude from the prompt: ${excludeLabels.length ? excludeLabels.join(", ") : "(none)"}`,
+    "",
+    "Current prompt JSON:",
+    JSON.stringify(compactSections).slice(0, 12000),
+  ].join("\n");
+
+  try {
+    const text = await callProvider(provider, {
+      prompt,
+      image: null,
       timeoutSeconds: provider.timeoutSeconds || 60,
     });
     const parsed = parseProviderJson(text);
     const normalized = normalizeProviderResult(parsed);
-    return sendJson(res, 200, { ok: true, provider: provider.name, ...normalized });
+    const merged = mergeEditedPromptSections(compactSections, normalized.promptJson);
+    return sendJson(res, 200, {
+      ok: true,
+      provider: provider.name,
+      promptJson: merged,
+    });
   } catch (error) {
-    return sendJson(res, 502, { error: "analysis_failed", message: error.message, provider: provider.name });
+    return sendJson(res, 502, {
+      error: "edit_prompt_failed",
+      message: error.message,
+      provider: provider.name,
+    });
   }
+}
+
+function mergeEditedPromptSections(sourceSections, editedSections) {
+  const keys = ["appearance", "outfit", "background", "expression_pose", "details"];
+  return Object.fromEntries(keys.map((key) => {
+    const source = sourceSections[key] || { title_ko: "", sentences: [] };
+    const edited = editedSections?.[key] || {};
+    const editedSentences = Array.isArray(edited.sentences) ? edited.sentences : [];
+    const byId = new Map(editedSentences.map((sentence) => [String(sentence.id || ""), sentence]));
+    let sentences = (source.sentences || []).map((sentence, index) => {
+      const match = byId.get(String(sentence.id || "")) || editedSentences[index];
+      if (!match) return sentence;
+      return {
+        id: sentence.id,
+        en: String(match.en || sentence.en || "").trim(),
+        ko: String(match.ko || sentence.ko || "").trim(),
+      };
+    }).filter((sentence) => sentence.en || sentence.ko);
+
+    // If model returns new sentence ids only, fall back to edited list.
+    if (!sentences.length && editedSentences.length) {
+      sentences = editedSentences.map((sentence, index) => ({
+        id: String(sentence.id || `${key}-${index + 1}`),
+        en: String(sentence.en || "").trim(),
+        ko: String(sentence.ko || "").trim(),
+      })).filter((sentence) => sentence.en || sentence.ko);
+    }
+
+    return [key, {
+      title_ko: String(edited.title_ko || source.title_ko || "").trim(),
+      sentences,
+    }];
+  }));
+}
+
+async function generateTitleSummary(req, res) {
+  const body = await readBody(req);
+  const payload = JSON.parse(body || "{}");
+  // Title summary shares the translation provider role (text-only Korean labeling).
+  const provider = selectProvider(null, "useForTranslation");
+  if (!provider) {
+    return sendJson(res, 400, {
+      error: "provider_not_configured",
+      message: "번역·제목 요약에 사용할 API 공급자가 없습니다.",
+    });
+  }
+
+  const promptText = String(payload.promptText || "").trim();
+  const sections = payload.sections && typeof payload.sections === "object" ? payload.sections : {};
+  const sectionLines = ["appearance", "outfit", "background", "expression_pose", "details"]
+    .map((key) => {
+      const value = String(sections[key] || "").trim();
+      return value ? `${key}: ${value}` : "";
+    })
+    .filter(Boolean);
+  // Tags are local; only place/background tags are useful title context.
+  const placeTags = Array.isArray(payload.backgroundTags)
+    ? payload.backgroundTags.map((tag) => String(tag || "").trim()).filter(Boolean)
+    : Array.isArray(payload.placeTags)
+      ? payload.placeTags.map((tag) => String(tag || "").trim()).filter(Boolean)
+      : [];
+  const source = [promptText, ...sectionLines].join("\n").trim();
+  if (!source) {
+    return sendJson(res, 400, { error: "empty_prompt", message: "제목 요약에 사용할 프롬프트가 없습니다." });
+  }
+
+  const prompt = [
+    "You write short Korean album titles for an AI image prompt archive.",
+    "Read the prompt sections and place tags, then summarize what kind of picture it is in one Korean line.",
+    "Return strict JSON only. No markdown.",
+    "Output format: {\"titleSummary\":\"...\"}",
+    "",
+    "Rules:",
+    "- Korean only.",
+    "- One natural one-line summary (about 20-48 characters, max 60).",
+    "- Capture distinctive outfit, place/background, pose or camera framing, and mood.",
+    "- Use place tags only as location hints; do not invent unrelated places.",
+    "- Do not copy English prompt word fragments like \"adult Korean woman with fair porcelain\".",
+    "- Do not use filenames, hashes, ids, or source names.",
+    "- Prefer a readable phrase over a long comma list.",
+    "- Examples: \"캐리어 끄는 도시 거리 캐주얼 전신 스냅\", \"하늘색 플리츠 크롭탑 실내 패션 상반신\"",
+    "",
+    placeTags.length ? `Place tags: ${placeTags.join(", ")}` : "Place tags: (none)",
+    "",
+    "Prompt content:",
+    source.slice(0, 6000),
+  ].join("\n");
+
+  try {
+    const text = await callProvider(provider, {
+      prompt,
+      image: null,
+      timeoutSeconds: Math.min(provider.timeoutSeconds || 60, 60),
+    });
+    const parsed = parseProviderJson(text);
+    const titleSummary = cleanGeneratedTitleSummary(
+      parsed.titleSummary || parsed.title || parsed.summary || parsed.ko || ""
+    );
+    if (!titleSummary) {
+      return sendJson(res, 502, {
+        error: "title_summary_empty",
+        message: "API가 유효한 한글 제목을 반환하지 않았습니다.",
+        provider: provider.name,
+      });
+    }
+    return sendJson(res, 200, { ok: true, provider: provider.name, titleSummary });
+  } catch (error) {
+    return sendJson(res, 502, {
+      error: "title_summary_failed",
+      message: error.message,
+      provider: provider.name,
+    });
+  }
+}
+
+function cleanGeneratedTitleSummary(value) {
+  let text = String(value || "")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/\.(jpe?g|png|webp|gif|bmp|avif)\b/ig, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  if (text.length > 60) {
+    text = text.slice(0, 60).replace(/\s+\S*$/, "").trim();
+  }
+  const hangul = (text.match(/[가-힣]/g) || []).length;
+  if (hangul < 2) return "";
+  return text;
 }
 
 function sendTags(res) {
@@ -369,10 +650,23 @@ function geminiApiKeysFromSecret(secret) {
   return [];
 }
 
+function resolveProviderModel(provider) {
+  return String(provider.model || provider.visionModel || provider.textModel || "").trim();
+}
+
 async function callOpenAiCompatibleProvider(provider, request) {
-  const endpoint = normalizeOpenAiCompatibleEndpoint(provider.apiUrl || defaultOpenAiCompatibleEndpoint(provider.name));
-  const model = provider.visionModel || provider.model || provider.textModel;
+  const model = resolveProviderModel(provider);
   if (!model) throw new Error(`${provider.name} 모델명이 비어 있습니다.`);
+
+  if (shouldUseOpenAiResponsesApi(provider, model)) {
+    return callOpenAiResponsesProvider(provider, request, model);
+  }
+
+  return callOpenAiChatCompletionsProvider(provider, request, model);
+}
+
+async function callOpenAiChatCompletionsProvider(provider, request, model) {
+  const endpoint = normalizeOpenAiCompatibleEndpoint(provider.apiUrl || defaultOpenAiCompatibleEndpoint(provider.name));
   const content = [{ type: "text", text: request.prompt }];
   if (request.image) {
     content.push({
@@ -386,8 +680,12 @@ async function callOpenAiCompatibleProvider(provider, request) {
       { role: "system", content: "Return strict JSON only. No markdown." },
       { role: "user", content },
     ],
-    temperature: 0.2,
+    temperature: 1,
   };
+  const maxTokens = Number(provider.maxOutputTokens || provider.maxTokens || 0);
+  if (maxTokens > 0) payload.max_tokens = maxTokens;
+  if (provider.responseFormatJson === true) payload.response_format = { type: "json_object" };
+
   const response = await fetchWithTimeout(endpoint, {
     method: "POST",
     headers: {
@@ -401,6 +699,44 @@ async function callOpenAiCompatibleProvider(provider, request) {
   return json.choices?.[0]?.message?.content || "";
 }
 
+async function callOpenAiResponsesProvider(provider, request, model) {
+  const endpoint = normalizeOpenAiResponsesEndpoint(provider.apiUrl || defaultOpenAiCompatibleEndpoint(provider.name));
+  const content = [{ type: "input_text", text: request.prompt }];
+  if (request.image) {
+    content.push({
+      type: "input_image",
+      image_url: `data:${request.image.mimeType};base64,${request.image.data}`,
+      detail: provider.imageDetail || "high",
+    });
+  }
+
+  const payload = {
+    model,
+    instructions: "Return strict JSON only. No markdown.",
+    input: [
+      { role: "user", content },
+    ],
+    text: { format: { type: "json_object" } },
+    truncation: "auto",
+  };
+  const maxOutputTokens = Number(provider.maxOutputTokens || provider.maxTokens || 6000);
+  if (maxOutputTokens > 0) payload.max_output_tokens = maxOutputTokens;
+
+  const response = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKeyFromSecret(provider.secret)}`,
+    },
+    body: JSON.stringify(payload),
+  }, request.timeoutSeconds);
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(json.error?.message || `${provider.name} Responses API 오류 ${response.status}`);
+  const text = extractOpenAiResponsesText(json);
+  if (!text) throw new Error(`${provider.name} Responses API 응답에 output_text가 없습니다.`);
+  return text;
+}
+
 function defaultOpenAiCompatibleEndpoint(name) {
   if (name === "xAI Grok") return "https://api.x.ai/v1/chat/completions";
   if (name === "Cerebras Cloud") return "https://api.cerebras.ai/v1/chat/completions";
@@ -411,7 +747,37 @@ function normalizeOpenAiCompatibleEndpoint(value) {
   const endpoint = String(value || "").trim().replace(/\/+$/, "");
   if (!endpoint) return "";
   if (endpoint.endsWith("/chat/completions")) return endpoint;
+  if (endpoint.endsWith("/responses")) return endpoint.replace(/\/responses$/, "/chat/completions");
   return `${endpoint}/chat/completions`;
+}
+
+function normalizeOpenAiResponsesEndpoint(value) {
+  const endpoint = String(value || "").trim().replace(/\/+$/, "");
+  if (!endpoint) return "https://api.openai.com/v1/responses";
+  if (endpoint.endsWith("/responses")) return endpoint;
+  if (endpoint.endsWith("/chat/completions")) return endpoint.replace(/\/chat\/completions$/, "/responses");
+  return `${endpoint}/responses`;
+}
+
+function shouldUseOpenAiResponsesApi(provider, _model) {
+  if (provider.forceChatCompletions === true) return false;
+  if (provider.forceResponsesApi === true) return true;
+  const endpoint = String(provider.apiUrl || defaultOpenAiCompatibleEndpoint(provider.name) || "").toLowerCase();
+  return endpoint.includes("api.openai.com");
+}
+
+function extractOpenAiResponsesText(json) {
+  if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text;
+  const parts = [];
+  for (const item of Array.isArray(json?.output) ? json.output : []) {
+    if (typeof item?.text === "string") parts.push(item.text);
+    if (typeof item?.output_text === "string") parts.push(item.output_text);
+    for (const content of Array.isArray(item?.content) ? item.content : []) {
+      if (typeof content?.text === "string") parts.push(content.text);
+      if (typeof content?.output_text === "string") parts.push(content.output_text);
+    }
+  }
+  return parts.join("\n").trim();
 }
 
 function normalizeGeminiModelName(_providerName, model, fallback) {
@@ -429,7 +795,7 @@ function normalizeVertexLocation(provider, serviceAccount, model) {
 async function callGeminiApiProvider(provider, request) {
   const keys = geminiApiKeysFromSecret(provider.secret);
   if (!keys.length) throw new Error("Gemini API Key가 설정되지 않았습니다.");
-  const model = normalizeGeminiModelName(provider.name, provider.visionModel || provider.model || provider.textModel, "gemini-2.5-flash");
+  const model = normalizeGeminiModelName(provider.name, resolveProviderModel(provider), "gemini-2.5-flash");
   const secret = typeof provider.secret === "object" && provider.secret ? provider.secret : {};
   let currentIndex = Math.max(0, Math.min(Number(secret.currentKeyIndex || 0), keys.length - 1));
   let lastError = new Error("Gemini API 요청에 실패했습니다.");
@@ -472,7 +838,7 @@ async function callGeminiApiProvider(provider, request) {
 async function callVertexProvider(provider, request) {
   const serviceAccount = parseVertexSecret(vertexJsonFromSecret(provider.secret));
   const accessToken = await getVertexAccessToken(serviceAccount, request.timeoutSeconds);
-  const model = normalizeGeminiModelName(provider.name, provider.visionModel || provider.model || provider.textModel, "gemini-2.5-flash");
+  const model = normalizeGeminiModelName(provider.name, resolveProviderModel(provider), "gemini-2.5-flash");
   const location = normalizeVertexLocation(provider, serviceAccount, model);
   const vertexHost = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
   const endpoint = `https://${vertexHost}/v1/projects/${encodeURIComponent(serviceAccount.project_id)}/locations/${encodeURIComponent(location)}/publishers/google/models/${encodeURIComponent(model)}:generateContent`;
@@ -602,6 +968,8 @@ function parseProviderJson(text) {
 
 function normalizeProviderResult(result) {
   const promptSections = result.promptSections || result.promptJson || {};
+  const detectedElements = Array.isArray(result.detectedElements) ? result.detectedElements : [];
+  const detectedButExcludedElements = Array.isArray(result.detectedButExcludedElements) ? result.detectedButExcludedElements : [];
   return {
     promptJson: Object.fromEntries(["appearance", "outfit", "background", "expression_pose", "details"].map((key) => {
       const section = promptSections[key] || {};
@@ -619,8 +987,18 @@ function normalizeProviderResult(result) {
     backgroundTags: Array.isArray(result.backgroundTags) ? result.backgroundTags : [],
     generalTags: Array.isArray(result.generalTags) ? result.generalTags : [],
     titleSummary: typeof result.titleSummary === "string" ? result.titleSummary.trim() : "",
-    detectedButExcludedElements: Array.isArray(result.detectedButExcludedElements) ? result.detectedButExcludedElements : [],
+    detectedElements,
+    detectedButExcludedElements,
   };
+}
+
+function normalizeSectionTranslations(result, sourceSentences) {
+  const translations = Array.isArray(result.translations) ? result.translations : Array.isArray(result.sentences) ? result.sentences : [];
+  const byId = new Map(translations.map((entry) => [String(entry.id || ""), String(entry.ko || entry.translation || "").trim()]));
+  return sourceSentences.map((sentence) => ({
+    id: sentence.id,
+    ko: byId.get(sentence.id) || "",
+  })).filter((sentence) => sentence.ko);
 }
 
 function readLegacyState() {

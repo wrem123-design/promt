@@ -340,8 +340,27 @@ button:disabled {
   max-width: 720px;
 }
 
+.gallery-jump-btn {
+  flex: 0 0 124px;
+  min-height: 38px;
+  padding: var(--space-2) var(--space-5);
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  font-weight: 760;
+  cursor: pointer;
+  transition: background var(--motion-fast), border-color var(--motion-fast), transform var(--motion-fast);
+}
+
+.gallery-jump-btn:hover {
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--border));
+  background: color-mix(in srgb, var(--accent) 26%, var(--panel));
+}
+
 .compact-search {
-  flex: 1;
+  flex: 1 1 420px;
+  min-width: 220px;
 }
 
 .compact-select {
@@ -393,6 +412,12 @@ button:disabled {
 .icon-btn:focus-visible::after {
   opacity: 1;
   transform: translateY(0);
+}
+
+.icon-btn.active-danger {
+  color: var(--on-primary);
+  background: var(--danger);
+  border-color: var(--danger);
 }
 
 .search-wrap {
@@ -475,6 +500,36 @@ button:disabled {
   justify-content: flex-end;
   gap: var(--space-2);
   margin-bottom: var(--space-4);
+}
+
+.album-action-row.delete-mode {
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.album-action-buttons,
+.bulk-delete-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.bulk-delete-controls {
+  padding: var(--space-2);
+  border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 8%, var(--panel));
+}
+
+.bulk-delete-title {
+  color: var(--danger);
+}
+
+.bulk-delete-count {
+  color: var(--muted);
+  font-size: var(--type-small-size);
 }
 
 .album-filter-bar {
@@ -623,6 +678,15 @@ button:disabled {
   transition: transform var(--motion-fast), box-shadow var(--motion-fast), border-color var(--motion-fast);
 }
 
+.image-card.bulk-delete-mode {
+  cursor: pointer;
+}
+
+.image-card.selected-for-delete {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 22%, transparent);
+}
+
 .image-card:hover {
   transform: translateY(-2px);
   box-shadow: var(--shadow-md);
@@ -684,6 +748,39 @@ button:disabled {
   color: var(--warning);
   background: color-mix(in srgb, var(--text) 52%, transparent);
   border-color: color-mix(in srgb, var(--warning) 56%, var(--border));
+}
+
+.bulk-delete-check {
+  position: absolute;
+  left: var(--space-2);
+  top: var(--space-2);
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 32px;
+  padding: 4px 8px 4px 5px;
+  border: 1px solid color-mix(in srgb, var(--danger) 42%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  box-shadow: var(--shadow-sm);
+  font-size: var(--type-micro-size);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.bulk-delete-checkbox {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--danger);
+  cursor: pointer;
+}
+
+.image-card.selected-for-delete .bulk-delete-check {
+  color: var(--on-primary);
+  background: var(--danger);
+  border-color: var(--danger);
 }
 
 .card-body {
@@ -823,30 +920,38 @@ button:disabled {
   accent-color: var(--primary);
 }
 
-.request-preview {
+.prompt-origin-status {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--panel) 78%, var(--bg));
-}
-
-.request-preview summary {
-  cursor: pointer;
-  padding: var(--space-2) var(--space-3);
-  color: var(--muted);
-  font-size: var(--type-small-size);
-  font-weight: 700;
-}
-
-.request-preview pre {
-  margin: 0;
-  max-height: 220px;
-  overflow: auto;
   padding: var(--space-3);
-  border-top: 1px solid var(--border);
-  font-family: var(--font-mono);
-  font-size: var(--type-micro-size);
-  line-height: 1.5;
-  white-space: pre-wrap;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.prompt-origin-status.is-original {
+  border-color: color-mix(in srgb, var(--success, #16a34a) 45%, var(--border));
+  background: color-mix(in srgb, var(--success, #16a34a) 8%, var(--panel));
+}
+
+.prompt-origin-status.is-modified {
+  border-color: color-mix(in srgb, var(--warning, #f59e0b) 45%, var(--border));
+  background: color-mix(in srgb, var(--warning, #f59e0b) 10%, var(--panel));
+}
+
+.prompt-origin-status.is-empty {
+  opacity: 0.9;
+}
+
+.prompt-origin-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.prompt-origin-status .field-help {
+  margin: 0;
 }
 
 .prompt-panel {
@@ -1581,6 +1686,11 @@ button:disabled {
     flex-basis: 100%;
   }
 
+  .gallery-jump-btn {
+    flex-basis: 96px;
+    padding-inline: var(--space-3);
+  }
+
   .topbar-actions {
     margin-left: auto;
   }
@@ -1656,4 +1766,41 @@ button:disabled {
   .image-card:hover {
     transform: none;
   }
+}
+
+.pending-preview-card.invalid {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 22%, transparent), var(--shadow-sm);
+}
+
+.pending-preview-card.invalid::after {
+  content: "EXIF 없음";
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-xs);
+  color: #fff;
+  background: var(--danger);
+  font-size: var(--type-micro-size);
+  font-weight: 760;
+}
+
+.pending-preview-card.invalid.selected::after {
+  content: "제거 권장";
+}
+
+.pending-error {
+  display: block;
+  overflow: hidden;
+  color: var(--danger);
+  font-size: var(--type-micro-size);
+  font-style: normal;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: normal;
+}
+
+.upload-mode-notice {
+  margin-bottom: var(--space-4);
 }

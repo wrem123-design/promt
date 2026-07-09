@@ -8,6 +8,9 @@
   const SERVER_TAGS_ENDPOINT = "/api/tags";
   const SERVER_ITEMS_ENDPOINT = "/api/items";
   const SERVER_ANALYZE_ENDPOINT = "/api/analyze";
+  const SERVER_TRANSLATE_ENDPOINT = "/api/translate-section";
+  const SERVER_TITLE_ENDPOINT = "/api/title-summary";
+  const SERVER_EDIT_PROMPT_ENDPOINT = "/api/edit-prompt";
   let serverAvailable = false;
   let saveTimer = null;
   let settingsSaveTimer = null;
@@ -59,6 +62,8 @@
   ];
 
   const defaultUploadSettings = {
+    promptSourceMode: "ai",
+    translateExifPrompt: true,
     preserveOriginal: false,
     autoCompress: true,
     stripExif: true,
@@ -220,6 +225,7 @@
     activeProviderIndex: 0,
     pendingUploadFiles: [],
     selectedPendingUploadKeys: [],
+    pendingUploadErrors: {},
     uploadProgress: null,
     selectedFragmentId: null,
     filterGroup: "all",
@@ -228,7 +234,10 @@
     page: 1,
     galleryLoadedPages: 1,
     galleryLoading: false,
+    previousView: null,
     uploadQueue: [],
+    bulkDeleteMode: false,
+    selectedBulkDeleteIds: [],
   };
 
   document.documentElement.dataset.theme = state.theme;
@@ -289,12 +298,14 @@
   }
 
   function defaultProvider(name, index) {
+    const model = defaultProviderModel(name, index);
     return {
       name,
       enabled: index === 0,
-      model: defaultProviderModel(name, index),
-      visionModel: defaultProviderVisionModel(name, index),
-      textModel: "",
+      model,
+      // Legacy mirrors kept in sync for older server/state compatibility.
+      visionModel: model,
+      textModel: model,
       hasServerKey: false,
       keyCount: 0,
       currentKeyIndex: 0,
@@ -306,8 +317,9 @@
       maxRetries: 2,
       useForImageAnalysis: index === 0,
       useForTranslation: index === 0,
-      useForPromptCleanup: index === 0,
-      useForTagging: index === 0,
+      // Retired roles kept false for older saved state compatibility.
+      useForPromptCleanup: false,
+      useForTagging: false,
       lastTestStatus: "",
     };
   }
@@ -315,12 +327,7 @@
   function defaultProviderModel(name, index) {
     if (name === "Google Gemini API") return "gemini-2.5-flash";
     if (name === "Google Vertex AI") return "gemini-2.5-flash";
-    return index === 0 ? "gpt-4.1" : "";
-  }
-
-  function defaultProviderVisionModel(name, index) {
-    if (name === "Google Gemini API") return "gemini-2.5-flash";
-    if (name === "Google Vertex AI") return "gemini-2.5-flash";
+    if (name === "Cerebras Cloud") return "gemma-4-31b";
     return index === 0 ? "gpt-4.1" : "";
   }
 
@@ -330,7 +337,7 @@
 
   function normalizeVertexLocation(provider) {
     const location = String(provider.location || "").trim();
-    const model = String(provider.visionModel || provider.model || provider.textModel || "").trim();
+    const model = String(provider.model || provider.visionModel || provider.textModel || "").trim();
     if (provider.name === "Google Vertex AI" && model === "gemini-3.5-flash" && location === "us-central1") {
       return "global";
     }
@@ -349,11 +356,21 @@
     return providerNames.map((name, index) => {
       const provider = { ...defaultProvider(name, index), ...(byName.get(name) || {}) };
       provider.name = name;
-      provider.model = normalizeGeminiModelName(name, provider.model || defaultProviderModel(name, index));
-      provider.visionModel = normalizeGeminiModelName(name, provider.visionModel || defaultProviderVisionModel(name, index));
-      provider.textModel = normalizeGeminiModelName(name, provider.textModel || "");
+      const unifiedModel = normalizeGeminiModelName(
+        name,
+        provider.model || provider.visionModel || provider.textModel || defaultProviderModel(name, index)
+      );
+      provider.model = unifiedModel;
+      provider.visionModel = unifiedModel;
+      provider.textModel = unifiedModel;
       provider.location = normalizeVertexLocation(provider);
       provider.lastTestStatus = repairText(provider.lastTestStatus, "");
+      provider.useForImageAnalysis = Boolean(provider.useForImageAnalysis);
+      provider.useForTranslation = Boolean(provider.useForTranslation);
+      // Retired roles: cleanup/tagging are no longer separate API duties.
+      provider.useForPromptCleanup = false;
+      provider.useForTagging = false;
+      provider.enabled = providerIsActive(provider);
       if (provider.name === "Google Vertex AI" && provider.lastTestStatus.includes("us-central1") && provider.lastTestStatus.includes("gemini-3.5-flash")) provider.lastTestStatus = "";
       if (provider.name === "Google Gemini API" && provider.lastTestStatus.includes("Vertex JSON")) provider.lastTestStatus = "";
       return provider;
@@ -386,9 +403,12 @@
   }
 
   function normalizeUploadSettings(settings = {}) {
+    const promptSourceMode = settings.promptSourceMode === "exif" ? "exif" : "ai";
     return {
       ...defaultUploadSettings,
       ...settings,
+      promptSourceMode,
+      translateExifPrompt: settings.translateExifPrompt !== false,
       displayMaxSize: clampNumber(settings.displayMaxSize, 512, 4096, defaultUploadSettings.displayMaxSize),
       analysisMaxSize: clampNumber(settings.analysisMaxSize, 512, 4096, defaultUploadSettings.analysisMaxSize),
       thumbnailSize: clampNumber(settings.thumbnailSize, 120, 1024, defaultUploadSettings.thumbnailSize),
@@ -476,6 +496,10 @@
       createdAt: item.createdAt || Date.now(),
       updatedAt: item.updatedAt || Date.now(),
       versions: Array.isArray(item.versions) ? item.versions : [],
+      promptBaselineSource: item.promptBaselineSource || "",
+      promptBaselineFingerprint: item.promptBaselineFingerprint || "",
+      promptEditAction: item.promptEditAction || "",
+      promptEditState: item.promptEditState || "",
     };
   }
 
@@ -862,6 +886,7 @@
           <span>프롬프트 아카이브</span>
         </button>
         <div class="topbar-center">
+          <button class="gallery-jump-btn" data-view="gallery" type="button">갤러리</button>
           <div class="search-wrap compact-search">
             <label class="sr-only" for="globalSearch">검색</label>
             <input class="input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 프롬프트 내용 검색">
@@ -876,8 +901,7 @@
         </div>
         <div class="topbar-actions">
           ${iconButton("upload", "업로드", "+")}
-          ${iconButton("searchFocus", "검색", "⌕")}
-          ${iconButton("toggleFilterGroup", "필터", "⌘")}
+          ${iconButton("toggleBulkDeleteMode", ui.bulkDeleteMode ? "삭제 모드 닫기" : "게시물 삭제", "🗑", ui.bulkDeleteMode ? "active-danger" : "")}
           ${iconButton("cycleTheme", "테마", "◐")}
           ${iconButton("settings", "설정", "⚙")}
         </div>
@@ -885,8 +909,8 @@
     `;
   }
 
-  function iconButton(action, label, icon) {
-    return `<button class="icon-btn" data-action="${action}" type="button" aria-label="${label}" data-tooltip="${label}">${icon}</button>`;
+  function iconButton(action, label, icon, extraClass = "") {
+    return `<button class="icon-btn ${extraClass}" data-action="${action}" type="button" aria-label="${label}" data-tooltip="${label}">${icon}</button>`;
   }
 
   function renderView() {
@@ -944,12 +968,33 @@
     const hasMore = visibleCount < items.length;
     return `
       ${renderAlbumFilters()}
-      <div class="album-action-row">
-        <button class="ghost-btn" data-action="bulkAnalyze" type="button">대기 항목 분석</button>
-        <button class="ghost-btn" data-action="exportJson" type="button">JSON 내보내기</button>
+      <div class="album-action-row ${ui.bulkDeleteMode ? "delete-mode" : ""}">
+        ${ui.bulkDeleteMode ? renderBulkDeleteControls(pageItems) : ""}
+        <div class="album-action-buttons">
+          <button class="ghost-btn" data-action="bulkAnalyze" type="button">대기 항목 분석</button>
+          <button class="ghost-btn" data-action="exportJson" type="button">JSON 내보내기</button>
+        </div>
       </div>
-      ${pageItems.length ? `<div class="gallery-grid album-grid" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map(renderImageCard).join("")}</div>` : renderEmptyGallery()}
+      ${pageItems.length ? `<div class="gallery-grid album-grid ${ui.bulkDeleteMode ? "bulk-delete-gallery" : ""}" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map(renderImageCard).join("")}</div>` : renderEmptyGallery()}
       ${renderGalleryLoadMore(hasMore, pageItems.length, items.length)}
+    `;
+  }
+
+  function renderBulkDeleteControls(pageItems) {
+    const selectedIds = new Set(ui.selectedBulkDeleteIds || []);
+    const visibleIds = pageItems.map((item) => item.id);
+    const visibleSelectedCount = visibleIds.filter((id) => selectedIds.has(id)).length;
+    const allVisibleSelected = visibleIds.length > 0 && visibleSelectedCount === visibleIds.length;
+    const selectedCount = selectedIds.size;
+    return `
+      <div class="bulk-delete-controls" aria-live="polite">
+        <strong class="bulk-delete-title">삭제 선택 모드</strong>
+        <span class="bulk-delete-count">선택 ${selectedCount}개</span>
+        <button class="ghost-btn" data-action="bulkSelectVisible" type="button" ${visibleIds.length ? "" : "disabled"}>${allVisibleSelected ? "표시 항목 선택 해제" : "표시 항목 전체 선택"}</button>
+        <button class="ghost-btn" data-action="clearBulkDeleteSelection" type="button" ${selectedCount ? "" : "disabled"}>선택 해제</button>
+        <button class="danger-btn" data-action="confirmBulkDelete" type="button" ${selectedCount ? "" : "disabled"}>삭제 확인</button>
+        <button class="ghost-btn" data-action="cancelBulkDeleteMode" type="button">취소</button>
+      </div>
     `;
   }
 
@@ -1028,11 +1073,17 @@
 
   function renderImageCard(item) {
     const title = displayTitle(item);
+    const selectedForDelete = (ui.selectedBulkDeleteIds || []).includes(item.id);
     return `
-      <article class="panel image-card" data-open-item="${item.id}" tabindex="0">
+      <article class="panel image-card ${ui.bulkDeleteMode ? "bulk-delete-mode" : ""} ${selectedForDelete ? "selected-for-delete" : ""}" data-open-item="${item.id}" tabindex="0">
         <div class="thumb">
           <img src="${item.thumbnailUrl || item.imageUrl}" alt="${escapeHtml(title)}">
-          <button class="favorite-toggle ${item.isFavorite ? "active" : ""}" data-action="favorite" data-id="${item.id}" type="button" aria-label="${item.isFavorite ? "즐겨찾기 해제" : "즐겨찾기"}">${item.isFavorite ? "★" : "☆"}</button>
+          ${ui.bulkDeleteMode ? `
+            <label class="bulk-delete-check" aria-label="삭제할 게시물 선택">
+              <input class="bulk-delete-checkbox" data-action="bulkToggleItem" data-bulk-delete-id="${item.id}" type="checkbox" ${selectedForDelete ? "checked" : ""}>
+              <span>삭제 선택</span>
+            </label>
+          ` : `<button class="favorite-toggle ${item.isFavorite ? "active" : ""}" data-action="favorite" data-id="${item.id}" type="button" aria-label="${item.isFavorite ? "즐겨찾기 해제" : "즐겨찾기"}">${item.isFavorite ? "★" : "☆"}</button>`}
         </div>
         <div class="card-body">
           <h3 class="card-title">${escapeHtml(title)}</h3>
@@ -1043,9 +1094,9 @@
 
   function displayTitle(item) {
     const title = String(item?.title || "").trim();
-    if (title && !looksLikeFileTitle(title)) return title;
+    if (isUsableAlbumTitle(title)) return title;
     const summary = String(item?.titleSummary || "").trim();
-    if (summary && !looksLikeFileTitle(summary)) return summary;
+    if (isUsableAlbumTitle(summary)) return summary;
     return compactImageTitle(item);
   }
 
@@ -1055,8 +1106,42 @@
     return /^[a-f0-9]{16,}$/i.test(base) || /^[a-z0-9_-]{24,}$/i.test(base);
   }
 
+  function looksLikeEnglishPromptSnippet(value) {
+    const text = String(value || "").trim();
+    if (!text) return false;
+    const hangul = (text.match(/[가-힣]/g) || []).length;
+    const latin = (text.match(/[a-zA-Z]/g) || []).length;
+    if (hangul >= 4 && hangul >= latin) return false;
+    if (latin < 8) return false;
+    return /^(adult|beautiful|young|korean|woman|girl|wearing|standing|sitting|close-?up|portrait)\b/i.test(text)
+      || (latin > hangul * 2 && text.split(/\s+/).length >= 4);
+  }
+
+  function isUsableAlbumTitle(value) {
+    const text = String(value || "").trim();
+    if (!text || looksLikeFileTitle(text)) return false;
+    if (looksLikeEnglishPromptSnippet(text)) return false;
+    return true;
+  }
+
+  function isKoreanTitleSummary(value) {
+    const text = String(value || "").trim();
+    if (!text || looksLikeFileTitle(text) || looksLikeEnglishPromptSnippet(text)) return false;
+    const hangul = (text.match(/[가-힣]/g) || []).length;
+    const latin = (text.match(/[a-zA-Z]/g) || []).length;
+    return hangul >= 4 && hangul >= latin;
+  }
+
   function compactImageTitle(item) {
     if (!item?.promptJson) return "분석 대기 이미지";
+    const koreanBits = sectionMeta
+      .flatMap((section) => (item.promptJson?.[section.key]?.sentences || []).map((sentence) => String(sentence.ko || "").trim()))
+      .filter(Boolean)
+      .join(" ");
+    if (koreanBits) {
+      const clipped = koreanBits.replace(/\s+/g, " ").trim().slice(0, 48).replace(/\s+\S*$/, "").trim();
+      if (clipped.length >= 8) return clipped;
+    }
     const parts = [
       ...tagNames(item.backgroundTags, "background").filter((name) => name !== "기타").slice(0, 1),
       ...extractTitlePhrases(item.promptJson.outfit?.sentences?.map((sentence) => sentence.ko || sentence.en).join(" "), "outfit").slice(0, 1),
@@ -1066,7 +1151,7 @@
       ...tagNames(item.outfitTags, "outfit").filter((name) => name !== "기타").slice(0, 1),
       ...(item.tags || []).slice(0, 2),
     ];
-    return uniqueCompact(parts.length ? parts : fallbackTags).slice(0, 5).join(", ") || "분석된 이미지";
+    return uniqueCompact(parts.length ? parts : fallbackTags).slice(0, 5).join(" · ") || "분석된 이미지";
   }
 
   function extractTitlePhrases(text, type) {
@@ -1110,14 +1195,21 @@
 
   function renderUpload() {
     const uploadExcludeKeys = lastUploadExcludeKeys();
+    const exifMode = isExifPromptMode();
     return `
       <div class="page-head">
         <div>
           <h2 class="page-title">업로드</h2>
-          <p class="page-copy">파일을 먼저 고른 뒤 요청사항과 제외 요소를 확인하고 저장합니다. 분석은 저장 및 분석 버튼을 누를 때만 실행됩니다.</p>
+          <p class="page-copy">${exifMode ? "EXIF / 이미지 메타데이터에 저장된 프롬프트를 읽어 5문단으로 저장합니다. 이미지 분석 API는 호출하지 않습니다." : "파일을 먼저 고른 뒤 요청사항과 제외 요소를 확인하고 저장합니다. 분석은 저장 및 분석 버튼을 누를 때만 실행됩니다."}</p>
         </div>
       </div>
       <section class="panel" style="padding: var(--space-4);">
+        <div class="optimization-summary">
+          <strong>프롬프트 입력 방식</strong>
+          <span>${exifMode ? "EXIF 프롬프트 읽기" : "API 이미지 분석"}</span>
+          ${exifMode ? `<span>${state.uploadSettings.translateExifPrompt ? "한국어 자동 번역" : "번역 안 함"}</span>` : ""}
+        </div>
+        ${exifMode ? `<p class="notice upload-mode-notice">EXIF 모드에서는 이미지 안의 prompt, parameters, description, UserComment 같은 메타데이터에서 프롬프트를 찾습니다. 5문단을 찾지 못한 파일은 빨간색으로 표시되며 제거 후 다시 저장하는 것이 좋습니다.</p>` : ""}
         <div class="optimization-summary">
           <strong>업로드 전 자동 최적화</strong>
           <span>${state.uploadSettings.autoCompress ? "켜짐" : "꺼짐"}</span>
@@ -1140,7 +1232,7 @@
           <div class="toolbar">
           <button class="ghost-btn" data-action="removeSelectedPendingUploads" type="button" ${ui.selectedPendingUploadKeys.length ? "" : "disabled"}>선택 지우기</button>
           <button class="ghost-btn" data-action="clearUploadWorkspace" type="button" ${ui.pendingUploadFiles.length || ui.uploadQueue.length ? "" : "disabled"}>비우기</button>
-          <button class="primary-btn" data-action="saveAndAnalyzeUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>저장 및 분석</button>
+          <button class="primary-btn" data-action="saveAndAnalyzeUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>${exifMode ? "EXIF 읽고 저장" : "저장 및 분석"}</button>
           </div>
           ${renderUploadProgress()}
         </div>
@@ -1159,10 +1251,11 @@
           <div class="field">
             <label for="uploadCustomInstruction">이 이미지에만 적용할 추가 요청사항</label>
             <textarea class="textarea" id="uploadCustomInstruction" placeholder="뒷 유리 그림은 프롬프트에 포함하지 말 것&#10;캐릭터 외모만 중심으로 분석할 것"></textarea>
+            <p class="field-help">업로드·이미지 분석 시에만 반영됩니다. 게시물 상세의 프롬프트 수정과는 별개입니다.</p>
           </div>
           <fieldset class="option-fieldset">
             <legend>프롬프트에서 제외할 요소</legend>
-            <p>체크된 요소는 이미지에 보여도 최종 프롬프트에 넣지 않습니다. 마지막 체크값은 다음 업로드에도 유지됩니다.</p>
+            <p>체크된 요소는 이미지 분석/EXIF 저장 시 최종 프롬프트에 넣지 않습니다. 게시물 상세의 제외 체크·프롬프트 수정과는 별개입니다. 마지막 체크값은 다음 업로드에도 유지됩니다.</p>
             <div class="option-grid">
               ${enabledExcludeOptions().map((option) => renderExcludeCheckbox(option, uploadExcludeKeys.includes(option.key), "uploadExclude")).join("")}
             </div>
@@ -1195,6 +1288,10 @@
     return keys.length ? keys : defaultExcludedKeys();
   }
 
+  function isExifPromptMode() {
+    return state.uploadSettings.promptSourceMode === "exif";
+  }
+
   function renderPendingUploadFiles() {
     if (!ui.pendingUploadFiles.length) return "";
     return `
@@ -1202,11 +1299,13 @@
         ${ui.pendingUploadFiles.map((file) => {
           const key = pendingUploadKey(file);
           const selected = ui.selectedPendingUploadKeys.includes(key);
+          const error = ui.pendingUploadErrors?.[key] || "";
           return `
-          <button class="pending-preview-card ${selected ? "selected" : ""}" data-action="togglePendingUpload" data-key="${escapeHtml(key)}" type="button" aria-pressed="${selected ? "true" : "false"}">
+          <button class="pending-preview-card ${selected ? "selected" : ""} ${error ? "invalid" : ""}" data-action="togglePendingUpload" data-key="${escapeHtml(key)}" type="button" aria-pressed="${selected ? "true" : "false"}">
             <img src="${escapeHtml(pendingUploadPreviewUrl(file))}" alt="${escapeHtml(file.name)}">
             <strong>${escapeHtml(file.name)}</strong>
             <span>${formatBytes(file.size)}</span>
+            ${error ? `<em class="pending-error">${escapeHtml(error)}</em>` : ""}
           </button>
         `; }).join("")}
       </div>
@@ -1270,15 +1369,19 @@
       return renderGallery();
     }
     const title = displayTitle(item);
+    const exifMode = isExifPromptMode();
+    const analyzeLabel = item.promptJson ? "재분석" : "수동 분석";
     return `
       <div class="page-head">
         <div>
           <h2 class="page-title">${escapeHtml(title)}</h2>
           <p class="page-copy">${escapeHtml(item.memo || "메모가 없습니다.")}</p>
+          <p class="page-copy meta-line">현재 업로드 모드: ${exifMode ? "EXIF / 메타데이터" : "API 이미지 분석"}</p>
         </div>
         <div class="toolbar">
           <button class="ghost-btn" data-view="gallery" type="button">갤러리</button>
-          <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button">${item.promptJson ? "재분석" : "수동 분석"}</button>
+          <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button" ${exifMode ? "disabled" : ""} title="${exifMode ? "EXIF 모드에서는 API 재분석을 쓰지 않습니다. EXIF 원본 불러오기를 사용하세요." : "이미지 분석 API로 프롬프트를 다시 생성합니다."}">${analyzeLabel}</button>
+          <button class="ghost-btn" data-action="reloadExif" data-id="${item.id}" type="button" ${exifMode ? "" : "disabled"} title="${exifMode ? "저장된 EXIF/메타 원본 또는 원본 이미지에서 프롬프트를 다시 읽습니다." : "API 모드에서는 EXIF 원본 불러오기를 쓰지 않습니다. 재분석을 사용하세요."}">EXIF 원본 불러오기</button>
         </div>
       </div>
       <div class="detail-grid">
@@ -1313,24 +1416,20 @@
             </div>
             <div class="field">
               <label for="detailCustomInstruction">이 이미지 전용 추가 요청사항</label>
-              <textarea class="textarea" id="detailCustomInstruction" placeholder="이 이미지 분석에만 적용할 요청을 적어주세요.">${escapeHtml(item.customInstruction || "")}</textarea>
+              <textarea class="textarea" id="detailCustomInstruction" placeholder="예: 안경 제거, 배경을 카페로, 미소 강조. 프롬프트 수정 버튼에 사용됩니다.">${escapeHtml(item.customInstruction || "")}</textarea>
+              <p class="field-help">업로드 화면의 요청사항과 별개입니다. 여기서는 이미 저장된 프롬프트를 고칠 때만 씁니다.</p>
             </div>
             <fieldset class="option-fieldset">
               <legend>프롬프트에서 제외할 요소</legend>
-              <p>체크 후 저장하고 재분석하면 새 조건으로 프롬프트를 다시 만듭니다.</p>
+              <p>체크한 요소는 <strong>프롬프트 수정</strong> 시 현재 문장에서 최소 수정으로 제거합니다. 이미지를 다시 분석하지 않습니다. (업로드 시 제외 체크와는 별개)</p>
               <div class="option-grid">
                 ${enabledExcludeOptions().map((option) => renderExcludeCheckbox(option, item.excludeOptions?.includes(option.key), "detailExclude")).join("")}
               </div>
             </fieldset>
-            ${item.analysisRequest ? `
-              <details class="request-preview">
-                <summary>최근 분석 요청 미리보기</summary>
-                <pre>${escapeHtml(item.analysisRequest)}</pre>
-              </details>
-            ` : ""}
+            ${renderPromptOriginStatus(item)}
             <div class="toolbar">
-              <span class="status-pill">${statusLabel(item.status)}</span>
               <button class="primary-btn" data-action="saveDetail" data-id="${item.id}" type="button">저장</button>
+              <button class="ghost-btn" data-action="revisePrompt" data-id="${item.id}" type="button" ${item.promptJson ? "" : "disabled"} title="현재 프롬프트 텍스트만 최소 수정합니다. 이미지 재분석이 아닙니다.">프롬프트 수정</button>
               <button class="danger-btn" data-action="deleteItem" data-id="${item.id}" type="button">삭제</button>
             </div>
             ${item.uploadMeta ? renderAssetSummary(item) : ""}
@@ -1343,6 +1442,116 @@
         </section>
       </div>
     `;
+  }
+
+  function renderPromptOriginStatus(item) {
+    ensurePromptBaseline(item);
+    syncPromptEditState(item);
+    if (!item.promptJson) {
+      return `
+        <div class="prompt-origin-status is-empty">
+          <span class="status-pill">프롬프트 없음</span>
+          <p class="field-help">아직 저장된 프롬프트가 없습니다.</p>
+        </div>
+      `;
+    }
+    const isOriginal = item.promptEditState === "original";
+    const sourceLabel = promptBaselineSourceLabel(item.promptBaselineSource || guessPromptBaselineSource(item));
+    const actionLabel = promptEditActionLabel(item.promptEditAction);
+    const mainLabel = isOriginal ? "원본 프롬프트" : "수정된 프롬프트";
+    const detail = isOriginal
+      ? `출처: ${sourceLabel}. EXIF 불러오기 또는 이미지 분석 직후 상태와 같습니다.`
+      : `원본 출처: ${sourceLabel}${actionLabel ? ` · 변경 방식: ${actionLabel}` : ""}. 수동 편집, 프롬프트 수정, 섹션 재생성 등으로 원본과 달라졌습니다.`;
+    return `
+      <div class="prompt-origin-status ${isOriginal ? "is-original" : "is-modified"}">
+        <div class="prompt-origin-head">
+          <span class="status-pill">${escapeHtml(mainLabel)}</span>
+          <span class="meta-line">${escapeHtml(sourceLabel)}${!isOriginal && actionLabel ? ` · ${escapeHtml(actionLabel)}` : ""}</span>
+        </div>
+        <p class="field-help">${escapeHtml(detail)}</p>
+      </div>
+    `;
+  }
+
+  function promptBaselineSourceLabel(source) {
+    if (source === "exif") return "EXIF / 메타데이터";
+    if (source === "analysis") return "이미지 분석";
+    return "출처 미상";
+  }
+
+  function promptEditActionLabel(action) {
+    if (action === "api_revise") return "API 프롬프트 수정";
+    if (action === "manual") return "수동 편집";
+    if (action === "section") return "섹션 재생성";
+    if (action === "translate") return "번역 반영";
+    return "";
+  }
+
+  function guessPromptBaselineSource(item) {
+    if (item.uploadMeta?.promptSourceMode === "exif" || item.uploadMeta?.exifPromptFound) return "exif";
+    if (item.analysisRequest && /EXIF/i.test(item.analysisRequest)) return "exif";
+    if (item.analysisRequest) return "analysis";
+    return "";
+  }
+
+  function promptFingerprint(promptJson) {
+    const parts = [];
+    sectionMeta.forEach((section) => {
+      const sentences = promptJson?.[section.key]?.sentences || [];
+      sentences.forEach((sentence) => {
+        parts.push([
+          sentence.id || "",
+          String(sentence.en || "").trim(),
+          String(sentence.ko || "").trim(),
+        ].join("\n"));
+      });
+    });
+    return simpleStringHash(parts.join("\n---\n"));
+  }
+
+  function simpleStringHash(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+  }
+
+  function ensurePromptBaseline(item) {
+    if (!item?.promptJson) return;
+    if (item.promptBaselineFingerprint) return;
+    item.promptBaselineSource = item.promptBaselineSource || guessPromptBaselineSource(item) || "analysis";
+    item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptEditState = "original";
+    item.promptEditAction = "";
+  }
+
+  function markPromptBaseline(item, source) {
+    if (!item?.promptJson) return;
+    item.promptBaselineSource = source || guessPromptBaselineSource(item) || "analysis";
+    item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptEditState = "original";
+    item.promptEditAction = "";
+  }
+
+  function syncPromptEditState(item, preferredAction = "") {
+    if (!item?.promptJson) {
+      item.promptEditState = "empty";
+      return item.promptEditState;
+    }
+    ensurePromptBaseline(item);
+    const current = promptFingerprint(item.promptJson);
+    if (current === item.promptBaselineFingerprint) {
+      item.promptEditState = "original";
+      item.promptEditAction = "";
+      return item.promptEditState;
+    }
+    item.promptEditState = "modified";
+    if (preferredAction) item.promptEditAction = preferredAction;
+    else if (!item.promptEditAction) item.promptEditAction = "manual";
+    return item.promptEditState;
   }
 
   function renderAssetSummary(item) {
@@ -1373,12 +1582,16 @@
   }
 
   function renderNoPrompt(item) {
+    const exifMode = isExifPromptMode();
     return `
       <div class="empty-state">
         <div>
           <h2>아직 프롬프트가 없습니다.</h2>
-          <p>분석을 실행하면 외모, 복장, 배경, 표정/자세, 디테일 5개 섹션으로 저장됩니다.</p>
-          <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button">수동 분석</button>
+          <p>${exifMode ? "EXIF 원본 불러오기로 메타데이터 프롬프트를 다시 읽거나, 업로드 모드를 API 분석으로 바꾼 뒤 수동 분석하세요." : "분석을 실행하면 외모, 복장, 배경, 표정/자세, 디테일 5개 섹션으로 저장됩니다."}</p>
+          <div class="toolbar" style="justify-content:center">
+            <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button" ${exifMode ? "disabled" : ""}>수동 분석</button>
+            <button class="ghost-btn" data-action="reloadExif" data-id="${item.id}" type="button" ${exifMode ? "" : "disabled"}>EXIF 원본 불러오기</button>
+          </div>
         </div>
       </div>
     `;
@@ -1422,7 +1635,9 @@
              spellcheck="false">${renderSentenceContent(sentence, lang)}</p>
         `).join("")}
         <div class="toolbar" style="margin-top: var(--space-2); margin-bottom: 0;">
-          <button class="tiny-btn" data-action="regenerateSection" data-section="${sectionConfig.key}" data-id="${item.id}" type="button">${escapeHtml(label)} 재생성</button>
+          ${lang === "ko"
+            ? `<button class="tiny-btn" data-action="retranslateSection" data-section="${sectionConfig.key}" data-id="${item.id}" type="button">${escapeHtml(label)} 재번역</button>`
+            : `<button class="tiny-btn" data-action="regenerateSection" data-section="${sectionConfig.key}" data-id="${item.id}" type="button">${escapeHtml(label)} 재생성</button>`}
         </div>
       </section>
     `;
@@ -1472,7 +1687,7 @@
     return `
       <div class="settings-section">
         <h3 class="card-title">AI 공급자</h3>
-        <p class="notice">정적 MVP에서는 API Key 값을 브라우저에 저장하지 않고, 입력 시 서버 보관 표시만 남깁니다. 실제 연결은 서버 API에서 처리해야 안전합니다.</p>
+        <p class="notice">역할은 2개뿐입니다. 이미지 분석(비전 프롬프트) · 번역·제목 요약(텍스트). 태그는 앱 로컬 매칭이며 API 역할이 아닙니다. API Key는 서버에만 보관합니다.</p>
         <nav class="provider-tabs" aria-label="API 공급자 전환">
           ${state.providers.map((item, index) => `
             <button class="provider-tab-btn ${index === activeIndex ? "active" : ""}" data-provider-tab="${index}" type="button">
@@ -1516,17 +1731,10 @@
           <span class="status-pill">${providerIsActive(provider) ? "사용 중" : "미사용"}</span>
         </div>
         <div class="form-grid">
-          <div class="field">
-            <label>기본 모델</label>
+          <div class="field wide-field">
+            <label>모델</label>
             <input class="input" data-provider-model="${index}" ${focusEvents} value="${escapeHtml(provider.model || "")}" placeholder="model-name">
-          </div>
-          <div class="field">
-            <label>비전 모델</label>
-            <input class="input" data-provider-vision-model="${index}" ${focusEvents} value="${escapeHtml(provider.visionModel || "")}" placeholder="vision model">
-          </div>
-          <div class="field">
-            <label>텍스트 모델</label>
-            <input class="input" data-provider-text-model="${index}" ${focusEvents} value="${escapeHtml(provider.textModel || "")}" placeholder="text model">
+            <p class="field-help">비전/텍스트 구분 없이 이 공급자가 쓰는 모델 하나만 설정합니다.</p>
           </div>
           ${usesOpenAiCompatibleUrl ? `
             <div class="field wide-field">
@@ -1556,10 +1764,9 @@
         </div>
         <div class="option-grid">
           <label class="option-item"><input data-provider-use-image="${index}" type="checkbox" ${checkboxEvents} ${provider.useForImageAnalysis ? "checked" : ""}><span>이미지 분석</span></label>
-          <label class="option-item"><input data-provider-use-translation="${index}" type="checkbox" ${checkboxEvents} ${provider.useForTranslation ? "checked" : ""}><span>번역</span></label>
-          <label class="option-item"><input data-provider-use-cleanup="${index}" type="checkbox" ${checkboxEvents} ${provider.useForPromptCleanup ? "checked" : ""}><span>프롬프트 정리</span></label>
-          <label class="option-item"><input data-provider-use-tagging="${index}" type="checkbox" ${checkboxEvents} ${provider.useForTagging ? "checked" : ""}><span>태그 분류</span></label>
+          <label class="option-item"><input data-provider-use-translation="${index}" type="checkbox" ${checkboxEvents} ${provider.useForTranslation ? "checked" : ""}><span>번역 · 제목 요약</span></label>
         </div>
+        <p class="field-help">이미지 분석: 비전으로 5문단 프롬프트 생성. 번역·제목 요약: 한국어 번역 + 앨범 한글 한줄 제목. 태그(복장/장소)는 프롬프트 로컬 매칭이며 API 역할이 아닙니다.</p>
         <div class="toolbar" style="margin: 0;">
           <button class="ghost-btn" data-action="saveProvider" data-index="${index}" type="button">설정 저장</button>
           <button class="ghost-btn" data-action="testProvider" data-index="${index}" type="button">연결 테스트</button>
@@ -1601,7 +1808,7 @@
   }
 
   function providerIsActive(provider) {
-    return Boolean(provider.useForImageAnalysis || provider.useForTranslation || provider.useForPromptCleanup || provider.useForTagging);
+    return Boolean(provider.useForImageAnalysis || provider.useForTranslation);
   }
 
   function providerUsageCheckboxEvents() {
@@ -1730,6 +1937,15 @@
 
   function renderUploadSettings() {
     return `
+      <div class="settings-section">
+        <h3 class="card-title">프롬프트 입력 방식</h3>
+        <div class="option-grid">
+          <label class="option-item"><input type="radio" name="promptSourceMode" value="ai" ${state.uploadSettings.promptSourceMode !== "exif" ? "checked" : ""}><span>API 이미지 분석 사용</span></label>
+          <label class="option-item"><input type="radio" name="promptSourceMode" value="exif" ${state.uploadSettings.promptSourceMode === "exif" ? "checked" : ""}><span>EXIF / 메타데이터 프롬프트 읽기</span></label>
+          ${checkboxOption("translateExifPrompt", state.uploadSettings.translateExifPrompt, "EXIF 프롬프트 저장 후 한국어 자동 번역")}
+        </div>
+        <p class="notice">EXIF 모드에서는 이미지 분석 API를 호출하지 않고, 업로드 파일의 EXIF / PNG / WebP 메타데이터에서 프롬프트를 읽어 5문단으로 저장합니다. 메타데이터가 없거나 5문단으로 나눌 수 없으면 저장을 막고 해당 파일을 강조 표시합니다.</p>
+      </div>
       <div class="settings-section">
         <h3 class="card-title">업로드 최적화</h3>
         <div class="option-grid">
@@ -1903,6 +2119,7 @@
           ui.modal = node.dataset.view;
           if (node.dataset.view === "settings") ui.settingsTab = "api";
         } else {
+          ui.previousView = ui.view;
           ui.view = node.dataset.view;
           ui.modal = null;
         }
@@ -1985,11 +2202,22 @@
     bindGalleryInfiniteScroll();
     document.querySelectorAll("[data-open-item]").forEach((node) => {
       node.addEventListener("click", (event) => {
-        if (event.target.closest("button")) return;
+        if (event.target.closest("button, input, label, .bulk-delete-check")) return;
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          render();
+          return;
+        }
         openItem(node.dataset.openItem);
       });
       node.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") openItem(node.dataset.openItem);
+        if (event.key !== "Enter") return;
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          render();
+          return;
+        }
+        openItem(node.dataset.openItem);
       });
     });
     document.querySelectorAll("[data-action]").forEach((node) => {
@@ -2014,6 +2242,41 @@
       render();
       return;
     }
+    if (action === "toggleBulkDeleteMode") {
+      ui.bulkDeleteMode = !ui.bulkDeleteMode;
+      ui.selectedBulkDeleteIds = [];
+      ui.view = "gallery";
+      ui.modal = null;
+      render();
+      return;
+    }
+    if (action === "cancelBulkDeleteMode") {
+      ui.bulkDeleteMode = false;
+      ui.selectedBulkDeleteIds = [];
+      render();
+      return;
+    }
+    if (action === "bulkToggleItem") {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleBulkDeleteItem(node.dataset.bulkDeleteId);
+      render();
+      return;
+    }
+    if (action === "bulkSelectVisible") {
+      toggleVisibleBulkDeleteSelection();
+      render();
+      return;
+    }
+    if (action === "clearBulkDeleteSelection") {
+      ui.selectedBulkDeleteIds = [];
+      render();
+      return;
+    }
+    if (action === "confirmBulkDelete") {
+      deleteSelectedItems();
+      return;
+    }
     if (action === "searchFocus") document.getElementById("globalSearch")?.focus();
     if (action === "toggleFilterGroup") {
       ui.filterGroup = ui.filterGroup === "all" ? "outfit" : ui.filterGroup === "outfit" ? "background" : "all";
@@ -2033,7 +2296,20 @@
     if (action === "removeSelectedPendingUploads") removeSelectedPendingUploads();
     if (action === "clearUploadWorkspace") clearUploadWorkspace();
     if (action === "saveAndAnalyzeUploads") await processPendingUploads(true);
-    if (action === "analyzeOne") await analyzeItem(node.dataset.id);
+    if (action === "analyzeOne") {
+      if (isExifPromptMode()) {
+        showToast("EXIF 모드에서는 재분석 대신 EXIF 원본 불러오기를 사용하세요.", "warning");
+        return;
+      }
+      await analyzeItem(node.dataset.id);
+    }
+    if (action === "reloadExif") {
+      if (!isExifPromptMode()) {
+        showToast("API 모드에서는 EXIF 원본 불러오기 대신 재분석을 사용하세요.", "warning");
+        return;
+      }
+      await reloadExifPrompt(node.dataset.id);
+    }
     if (action === "bulkAnalyze") {
       let analyzedCount = 0;
       for (const item of state.items.filter((entry) => entry.status === "uploaded" || entry.status === "analysis_failed")) {
@@ -2053,7 +2329,9 @@
       render();
     }
     if (action === "regenerateSection") regenerateSection(node.dataset.id, node.dataset.section);
+    if (action === "retranslateSection") await retranslateSection(node.dataset.id, node.dataset.section);
     if (action === "saveDetail") saveDetail(node.dataset.id);
+    if (action === "revisePrompt") await revisePromptFromDetail(node.dataset.id);
     if (action === "deleteItem") deleteItem(node.dataset.id);
     if (action === "addExcludeOption") addExcludeOption();
     if (action === "saveExcludeOption") saveExcludeOption(node.dataset.key);
@@ -2231,6 +2509,7 @@
     const files = [...(fileList || [])].filter((file) => file?.type?.startsWith("image/"));
     if (!files.length) return;
     const existing = new Set(ui.pendingUploadFiles.map(pendingUploadKey));
+    ui.pendingUploadErrors = ui.pendingUploadErrors || {};
     files.forEach((file) => {
       const key = pendingUploadKey(file);
       if (!existing.has(key)) {
@@ -2241,6 +2520,7 @@
     ui.pendingUploadFiles = ui.pendingUploadFiles.slice(0, state.advancedSettings.maxImagesPerBatch);
     const validKeys = new Set(ui.pendingUploadFiles.map(pendingUploadKey));
     ui.selectedPendingUploadKeys = ui.selectedPendingUploadKeys.filter((key) => validKeys.has(key));
+    ui.pendingUploadErrors = Object.fromEntries(Object.entries(ui.pendingUploadErrors || {}).filter(([key]) => validKeys.has(key)));
     render();
   }
 
@@ -2256,10 +2536,23 @@
     }
     rememberUploadExcludeOptions();
     const files = [...ui.pendingUploadFiles];
+    let exifPromptByKey = null;
+    if (isExifPromptMode()) {
+      const validation = await validatePendingExifPrompts(files);
+      if (validation.invalidKeys.length) {
+        ui.pendingUploadErrors = validation.errors;
+        ui.selectedPendingUploadKeys = validation.invalidKeys;
+        render();
+        showToast(`${validation.invalidKeys.length}개 파일에서 EXIF 프롬프트를 찾지 못했습니다. 강조된 파일을 제거한 뒤 다시 저장하세요.`, "warning", 4200);
+        return;
+      }
+      exifPromptByKey = validation.prompts;
+      ui.pendingUploadErrors = {};
+    }
     revokePendingUploadUrls(ui.pendingUploadFiles);
     ui.pendingUploadFiles = [];
     ui.selectedPendingUploadKeys = [];
-    await processFiles(files, shouldAnalyze);
+    await processFiles(files, shouldAnalyze, { exifPromptByKey });
   }
 
   function togglePendingUpload(key) {
@@ -2278,6 +2571,7 @@
     const removed = ui.pendingUploadFiles.filter((file) => selected.has(pendingUploadKey(file)));
     revokePendingUploadUrls(removed);
     ui.pendingUploadFiles = ui.pendingUploadFiles.filter((file) => !selected.has(pendingUploadKey(file)));
+    ui.pendingUploadErrors = Object.fromEntries(Object.entries(ui.pendingUploadErrors || {}).filter(([key]) => !selected.has(key)));
     ui.selectedPendingUploadKeys = [];
     render();
   }
@@ -2286,13 +2580,15 @@
     revokePendingUploadUrls(ui.pendingUploadFiles);
     ui.pendingUploadFiles = [];
     ui.selectedPendingUploadKeys = [];
+    ui.pendingUploadErrors = {};
     ui.uploadQueue = [];
     ui.uploadProgress = null;
     render();
   }
 
-  async function processFiles(fileList, shouldAnalyze = false) {
+  async function processFiles(fileList, shouldAnalyze = false, options = {}) {
     const files = [...fileList].slice(0, state.advancedSettings.maxImagesPerBatch);
+    const exifMode = isExifPromptMode();
     const title = document.getElementById("uploadTitle")?.value.trim() || "";
     const categoryId = document.getElementById("uploadCategory")?.value || state.categories[0]?.id || "";
     const tags = [];
@@ -2307,9 +2603,10 @@
           throw new Error("같은 이름과 용량의 이미지가 이미 업로드되어 있습니다.");
         }
         const optimized = await optimizeImageFile(file, state.uploadSettings);
+        const exifPrompt = exifMode ? (options.exifPromptByKey?.[pendingUploadKey(file)] || await readExifPromptFromFile(file)) : null;
         const item = {
           id: uid("img"),
-          title,
+          title: title || "",
           titleSummary: "",
           memo: "",
           imageUrl: optimized.displayImage.dataUrl,
@@ -2318,20 +2615,27 @@
           thumbnailImage: optimized.thumbnailImage,
           analysisImage: optimized.analysisImage,
           originalImage: optimized.originalImage,
-          uploadMeta: optimized.meta,
+          uploadMeta: exifMode ? {
+            ...optimized.meta,
+            promptSourceMode: "exif",
+            exifPromptFound: true,
+            exifPromptSource: exifPrompt?.source || "metadata",
+            exifPromptLength: exifPrompt?.rawText?.length || 0,
+            exifRawText: exifPrompt?.rawText || "",
+          } : optimized.meta,
           categoryId,
           tags,
           outfitTags: inferTags(file.name, "outfit"),
           backgroundTags: inferTags(file.name, "background"),
-          status: shouldAnalyze ? "analyzing" : "uploaded",
+          status: exifMode ? "analyzed" : shouldAnalyze ? "analyzing" : "uploaded",
           isFavorite: false,
-          promptJson: null,
-          finalPrompt: "",
+          promptJson: exifMode ? exifPrompt.promptJson : null,
+          finalPrompt: exifMode ? promptText({ promptJson: exifPrompt.promptJson }, "final") : "",
           errorMessage: "",
           customInstruction,
           excludeOptions,
           includeOptions: [],
-          analysisRequest: "",
+          analysisRequest: exifMode ? "EXIF / metadata prompt import" : "",
           createdAt: Date.now(),
           updatedAt: Date.now(),
           versions: [],
@@ -2342,13 +2646,50 @@
           originalSize: file.size,
           optimizedSize: optimized.displayImage.size,
           url: optimized.thumbnailImage.dataUrl,
-          status: shouldAnalyze ? "저장 및 분석 완료" : "저장 완료",
+          status: exifMode ? "EXIF 프롬프트 저장 완료" : shouldAnalyze ? "저장 및 분석 완료" : "저장 완료",
           itemId: item.id,
         });
-        if (shouldAnalyze) await analyzeItem(item.id, false, { silent: true });
+        if (exifMode) {
+          const exifTagContext = `${file.name} ${promptText(item, "final")}`;
+          item.outfitTags = inferTags(exifTagContext, "outfit");
+          item.backgroundTags = inferTags(exifTagContext, "background");
+          if (state.uploadSettings.translateExifPrompt) {
+            try {
+              item.status = "modified";
+              await translateItemPromptSections(item, { silent: true });
+              item.status = "analyzed";
+              ui.uploadQueue[0].status = "EXIF 저장 및 번역 완료";
+            } catch (translationError) {
+              item.status = "modified";
+              item.errorMessage = `EXIF 프롬프트는 저장됐지만 번역 실패: ${translationError.message || translationError}`;
+              ui.uploadQueue[0].status = "EXIF 저장 완료, 번역 실패";
+              ui.uploadQueue[0].error = item.errorMessage;
+            }
+          }
+          try {
+            await ensureKoreanTitle(item, { force: !title });
+            if (ui.uploadQueue[0] && !ui.uploadQueue[0].error) {
+              ui.uploadQueue[0].status = `${ui.uploadQueue[0].status} · 제목 요약`;
+            }
+          } catch (titleError) {
+            if (!isUsableAlbumTitle(item.title)) {
+              item.titleSummary = compactImageTitle(item);
+              item.title = item.titleSummary;
+            }
+            if (ui.uploadQueue[0]) {
+              ui.uploadQueue[0].status = `${ui.uploadQueue[0].status} · 제목 실패`;
+            }
+            console.warn("title summary failed after EXIF import", titleError);
+          }
+          markPromptBaseline(item, "exif");
+          item.status = item.errorMessage ? "modified" : "analyzed";
+        } else if (shouldAnalyze) {
+          await analyzeItem(item.id, false, { silent: true });
+        }
         saveItemState(item);
         render();
-        if (shouldAnalyze) showToast(`${item.title || file.name} 분석이 끝났습니다.`, item.status === "analyzed" ? "success" : "warning");
+        if (exifMode) showToast(`${item.title || file.name} EXIF 프롬프트 저장이 끝났습니다.`, item.errorMessage ? "warning" : "success");
+        else if (shouldAnalyze) showToast(`${item.title || file.name} 분석이 끝났습니다.`, item.status === "analyzed" ? "success" : "warning");
       } catch (error) {
         ui.uploadQueue.unshift({
           name: file.name,
@@ -2366,9 +2707,117 @@
     }
   }
 
+  async function reloadExifPrompt(id, shouldRender = true) {
+    const item = findItem(id);
+    if (!item) return;
+    item.status = "analyzing";
+    item.errorMessage = "";
+    item.updatedAt = Date.now();
+    item.analysisRequest = "EXIF / metadata prompt reload";
+    if (shouldRender) render();
+    try {
+      const exifPrompt = await loadExifPromptForItem(item);
+      applyPrompt(item, exifPrompt.promptJson);
+      item.uploadMeta = {
+        ...(item.uploadMeta || {}),
+        promptSourceMode: "exif",
+        exifPromptFound: true,
+        exifPromptSource: exifPrompt.source || item.uploadMeta?.exifPromptSource || "metadata",
+        exifPromptLength: exifPrompt.rawText?.length || 0,
+        exifRawText: exifPrompt.rawText || item.uploadMeta?.exifRawText || "",
+      };
+      applyLocalTagsFromPrompt(item);
+      if (state.uploadSettings.translateExifPrompt) {
+        try {
+          await translateItemPromptSections(item, { silent: true });
+        } catch (translationError) {
+          item.errorMessage = `EXIF는 불러왔지만 번역 실패: ${translationError.message || translationError}`;
+        }
+      }
+      try {
+        await ensureKoreanTitle(item, { force: true });
+      } catch (titleError) {
+        if (!isUsableAlbumTitle(item.title)) {
+          item.titleSummary = compactImageTitle(item);
+          item.title = item.titleSummary;
+        }
+        console.warn("title summary failed after EXIF reload", titleError);
+      }
+      markPromptBaseline(item, "exif");
+      item.status = item.errorMessage ? "modified" : "analyzed";
+      item.updatedAt = Date.now();
+      saveItemState(item);
+      if (shouldRender) render();
+      showToast(item.errorMessage ? "EXIF 원본을 불러왔지만 일부 후처리에 실패했습니다." : "EXIF 원본 프롬프트를 다시 불러왔습니다.", item.errorMessage ? "warning" : "success");
+    } catch (error) {
+      item.status = "modified";
+      item.errorMessage = error.message || "EXIF 원본 프롬프트를 불러오지 못했습니다.";
+      item.updatedAt = Date.now();
+      saveItemState(item);
+      if (shouldRender) render();
+      showToast(item.errorMessage, "warning", 2800);
+    }
+  }
+
+  async function loadExifPromptForItem(item) {
+    const rawText = String(item.uploadMeta?.exifRawText || "").trim();
+    if (rawText) {
+      const promptJson = promptJsonFromMetadataText(rawText);
+      if (promptJson) {
+        return {
+          promptJson,
+          rawText,
+          source: item.uploadMeta?.exifPromptSource || "stored-exif-raw",
+        };
+      }
+    }
+
+    const file = await itemImageAsFile(item);
+    if (!file) {
+      throw new Error("보관된 EXIF 원문과 원본 이미지가 없어 다시 읽을 수 없습니다. 업로드 시 원본 보관(preserveOriginal)을 켜거나 이미지를 다시 업로드하세요.");
+    }
+    return readExifPromptFromFile(file);
+  }
+
+  async function itemImageAsFile(item) {
+    const candidates = [
+      item.originalImage?.dataUrl,
+      item.displayImage?.dataUrl,
+      item.imageUrl,
+      item.analysisImage?.dataUrl,
+    ].filter(Boolean);
+    for (const src of candidates) {
+      try {
+        const file = await urlOrDataUrlToFile(src, item.uploadMeta?.originalName || `${item.id}.img`, item.uploadMeta?.originalType || "");
+        if (file) return file;
+      } catch (_error) {}
+    }
+    return null;
+  }
+
+  async function urlOrDataUrlToFile(src, fileName, preferredType) {
+    const value = String(src || "").trim();
+    if (!value) return null;
+    if (value.startsWith("data:")) {
+      const response = await fetch(value);
+      const blob = await response.blob();
+      const type = preferredType || blob.type || "application/octet-stream";
+      return new File([blob], fileName || "image.bin", { type });
+    }
+    const response = await fetch(value);
+    if (!response.ok) throw new Error(`image fetch failed: ${response.status}`);
+    const blob = await response.blob();
+    const type = preferredType || blob.type || "application/octet-stream";
+    return new File([blob], fileName || "image.bin", { type });
+  }
+
   async function analyzeItem(id, shouldRender = true, options = {}) {
     const item = findItem(id);
     if (!item) return;
+    if (isExifPromptMode() && !options.forceApi) {
+      showToast("EXIF 모드에서는 재분석 대신 EXIF 원본 불러오기를 사용하세요.", "warning");
+      return;
+    }
     let completedWithFallback = false;
     item.status = "analyzing";
     item.updatedAt = Date.now();
@@ -2377,6 +2826,16 @@
     try {
       const result = await requestProviderAnalysis(item);
       applyAnalysisResult(item, result);
+      try {
+        await ensureKoreanTitle(item, { force: true });
+      } catch (titleError) {
+        if (!isUsableAlbumTitle(item.title)) {
+          item.titleSummary = item.titleSummary || compactImageTitle(item);
+          item.title = item.titleSummary;
+        }
+        console.warn("title summary failed after analysis", titleError);
+      }
+      markPromptBaseline(item, "analysis");
     } catch (error) {
       item.errorMessage = error.message || "API 분석에 실패해 로컬 임시 분석으로 대체했습니다.";
       item.outfitTags = item.outfitTags?.length ? item.outfitTags : inferTags(item.title + " " + item.tags.join(" "), "outfit");
@@ -2384,6 +2843,14 @@
       applyPrompt(item, makePrompt(item.tags.includes("product") ? "product" : "upload"));
       item.status = "modified";
       completedWithFallback = true;
+      try {
+        await ensureKoreanTitle(item, { force: true });
+      } catch (_titleError) {
+        if (!isUsableAlbumTitle(item.title)) {
+          item.titleSummary = compactImageTitle(item);
+          item.title = item.titleSummary;
+        }
+      }
     }
     if (shouldRender) {
       saveItemState(item);
@@ -2419,18 +2886,104 @@
   function applyAnalysisResult(item, result) {
     const promptJson = normalizeAnalysisPrompt(result.promptJson || result.promptSections);
     applyPrompt(item, promptJson);
-    if (Array.isArray(result.outfitTags)) item.outfitTags = resolveAnalysisTagKeys(result.outfitTags, "outfit", item);
-    if (Array.isArray(result.backgroundTags)) item.backgroundTags = resolveAnalysisTagKeys(result.backgroundTags, "background", item);
-    if (Array.isArray(result.generalTags) && result.generalTags.length) item.tags = [...new Set([...item.tags, ...result.generalTags.map((tag) => String(tag).trim()).filter(Boolean)])];
-    item.titleSummary = cleanTitleSummary(result.titleSummary) || compactImageTitle(item);
-    if (!item.title || looksLikeFileTitle(item.title)) item.title = item.titleSummary;
+    // Tags are local keyword matching against prompt text (not a separate API role).
+    applyLocalTagsFromPrompt(item);
+    // Album titles are filled by the translation provider via /api/title-summary.
+    // Ignore analysis titleSummary fragments so we keep one consistent title path.
+    if (!isKoreanTitleSummary(item.titleSummary)) item.titleSummary = "";
     item.errorMessage = "";
   }
 
+  function applyLocalTagsFromPrompt(item) {
+    const sectionText = (key) => (item.promptJson?.[key]?.sentences || [])
+      .map((sentence) => [sentence.en, sentence.ko].filter(Boolean).join(" "))
+      .join(" ");
+    // Match outfit tags from outfit section, place tags from background section first.
+    const outfitContext = [
+      sectionText("outfit"),
+      item.title || "",
+    ].filter(Boolean).join(" ");
+    const placeContext = [
+      sectionText("background"),
+      item.title || "",
+    ].filter(Boolean).join(" ");
+    const fullFallback = [
+      promptText(item, "final"),
+      promptText(item, "ko"),
+      promptText(item, "en"),
+      item.finalPrompt || "",
+    ].filter(Boolean).join(" ");
+    item.outfitTags = inferTags(outfitContext || fullFallback, "outfit");
+    item.backgroundTags = inferTags(placeContext || fullFallback, "background");
+  }
+
   function cleanTitleSummary(value) {
-    const text = String(value || "").trim().replace(/\.(jpe?g|png|webp|gif|bmp|avif)\b/ig, "");
-    if (!text || looksLikeFileTitle(text)) return "";
-    return text.split(",").map((part) => part.trim()).filter(Boolean).slice(0, 5).join(", ");
+    let text = String(value || "")
+      .replace(/^["'`]+|["'`]+$/g, "")
+      .replace(/\.(jpe?g|png|webp|gif|bmp|avif)\b/ig, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text || looksLikeFileTitle(text) || looksLikeEnglishPromptSnippet(text)) return "";
+    if (text.length > 60) text = text.slice(0, 60).replace(/\s+\S*$/, "").trim();
+    return text;
+  }
+
+  async function ensureKoreanTitle(item, options = {}) {
+    if (!item?.promptJson) return false;
+    const force = options.force === true;
+    if (!force && isKoreanTitleSummary(item.titleSummary)) {
+      if (!isUsableAlbumTitle(item.title) || looksLikeEnglishPromptSnippet(item.title)) {
+        item.title = item.titleSummary;
+      }
+      return false;
+    }
+    if (!force && isUsableAlbumTitle(item.title) && isKoreanTitleSummary(item.title)) {
+      item.titleSummary = item.title;
+      return false;
+    }
+    const summary = await requestTitleSummary(item);
+    if (!summary) return false;
+    item.titleSummary = summary;
+    if (force || !isUsableAlbumTitle(item.title) || looksLikeEnglishPromptSnippet(item.title)) {
+      item.title = summary;
+    }
+    item.updatedAt = Date.now();
+    return true;
+  }
+
+  async function requestTitleSummary(item) {
+    const sections = {};
+    sectionMeta.forEach((section) => {
+      const sentences = item.promptJson?.[section.key]?.sentences || [];
+      const text = sentences
+        .map((sentence) => [sentence.ko, sentence.en].filter(Boolean).join(" / "))
+        .filter(Boolean)
+        .join(" ");
+      if (text) sections[section.key] = text;
+    });
+    const promptTextValue = [
+      promptText(item, "ko"),
+      promptText(item, "en"),
+      item.finalPrompt || "",
+    ].filter(Boolean).join("\n\n").trim();
+    // Only place/background tags are sent as title context.
+    const placeTags = tagNames(item.backgroundTags, "background").filter((name) => name && name !== "기타");
+    const response = await fetch(SERVER_TITLE_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        itemId: item.id,
+        promptText: promptTextValue.slice(0, 6000),
+        sections,
+        backgroundTags: placeTags,
+        placeTags,
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || payload.error || "제목 요약 요청에 실패했습니다.");
+    }
+    return cleanTitleSummary(payload.titleSummary) || "";
   }
 
   function normalizeAnalysisPrompt(value) {
@@ -2470,6 +3023,7 @@
     item.promptJson[key] = fresh;
     item.finalPrompt = promptText(item, "final");
     item.status = "modified";
+    syncPromptEditState(item, "section");
     item.updatedAt = Date.now();
     saveItemState(item);
     render();
@@ -2526,22 +3080,95 @@
   function saveDetail(id) {
     const item = findItem(id);
     if (!item) return;
-    collectPromptEditsFromDom(item);
-    item.title = document.getElementById("detailTitle").value.trim();
-    item.categoryId = document.getElementById("detailCategory").value;
-    item.outfitTags = namesToTagKeys(document.getElementById("detailOutfitTags")?.value || "", "outfit");
-    item.backgroundTags = namesToTagKeys(document.getElementById("detailBackgroundTags")?.value || "", "background");
-    item.memo = document.getElementById("detailMemo").value.trim();
-    item.customInstruction = document.getElementById("detailCustomInstruction")?.value.trim() || "";
-    item.excludeOptions = selectedCheckboxValues("detailExclude");
+    collectDetailFields(item);
     if (item.promptJson) {
-      item.status = "modified";
       item.finalPrompt = promptText(item, "final");
+      const editState = syncPromptEditState(item);
+      if (editState === "modified") item.status = "modified";
     }
     item.updatedAt = Date.now();
     saveItemState(item);
     showToast("저장했습니다.", "success", 1200);
     render();
+  }
+
+  function collectDetailFields(item) {
+    collectPromptEditsFromDom(item);
+    item.title = document.getElementById("detailTitle")?.value.trim() || item.title || "";
+    item.categoryId = document.getElementById("detailCategory")?.value || item.categoryId || "";
+    item.outfitTags = namesToTagKeys(document.getElementById("detailOutfitTags")?.value || "", "outfit");
+    item.backgroundTags = namesToTagKeys(document.getElementById("detailBackgroundTags")?.value || "", "background");
+    item.memo = document.getElementById("detailMemo")?.value.trim() || "";
+    item.customInstruction = document.getElementById("detailCustomInstruction")?.value.trim() || "";
+    item.excludeOptions = selectedCheckboxValues("detailExclude");
+  }
+
+  async function revisePromptFromDetail(id) {
+    const item = findItem(id);
+    if (!item) return;
+    if (!item.promptJson) {
+      showToast("수정할 프롬프트가 없습니다.", "warning");
+      return;
+    }
+    collectDetailFields(item);
+    const customInstruction = String(item.customInstruction || "").trim();
+    const excluded = excludeLabels(item.excludeOptions);
+    if (!customInstruction && !excluded.length) {
+      showToast("추가 요청사항 또는 제외 요소를 하나 이상 지정해 주세요.", "warning", 2200);
+      return;
+    }
+    const confirmed = confirm([
+      "현재 입력된 프롬프트를 요청사항과 제외 요소 기준으로 수정합니다.",
+      "",
+      "• 이미지를 다시 분석하지 않습니다.",
+      "• 기존 프롬프트 문장에서 필요한 부분만 최소로 추가/삭제합니다.",
+      "• 번역·텍스트 API(번역 · 제목 요약 역할)를 사용합니다.",
+      "• 업로드 화면의 요청사항/제외 체크와는 별개입니다.",
+      "",
+      customInstruction ? `추가 요청: ${customInstruction}` : "추가 요청: (없음)",
+      excluded.length ? `제외 요소: ${excluded.join(", ")}` : "제외 요소: (없음)",
+      "",
+      "실행할까요?",
+    ].join("\n"));
+    if (!confirmed) return;
+
+    item.status = "modified";
+    item.errorMessage = "";
+    item.updatedAt = Date.now();
+    render();
+    showToast("프롬프트 수정 중…", "info", 1600);
+    try {
+      const response = await fetch(SERVER_EDIT_PROMPT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          customInstruction,
+          excludeLabels: excluded,
+          promptJson: item.promptJson,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.message || payload.error || "프롬프트 수정 요청에 실패했습니다.");
+      }
+      const nextPrompt = normalizeAnalysisPrompt(payload.promptJson || payload.promptSections);
+      applyPrompt(item, nextPrompt);
+      applyLocalTagsFromPrompt(item);
+      item.status = "modified";
+      syncPromptEditState(item, "api_revise");
+      item.errorMessage = "";
+      item.updatedAt = Date.now();
+      saveItemState(item);
+      render();
+      showToast("프롬프트를 최소 수정으로 반영했습니다.", "success");
+    } catch (error) {
+      item.errorMessage = error.message || "프롬프트 수정에 실패했습니다.";
+      item.updatedAt = Date.now();
+      saveItemState(item);
+      render();
+      showToast(item.errorMessage, "warning", 2800);
+    }
   }
 
   function deleteItem(id) {
@@ -2552,6 +3179,45 @@
     ui.view = "gallery";
     deleteItemState(id);
     render();
+  }
+
+  function toggleBulkDeleteItem(id) {
+    if (!id) return;
+    const selected = new Set(ui.selectedBulkDeleteIds || []);
+    if (selected.has(id)) selected.delete(id);
+    else selected.add(id);
+    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => state.items.some((item) => item.id === entryId));
+  }
+
+  function toggleVisibleBulkDeleteSelection() {
+    const visibleIds = [...document.querySelectorAll("[data-bulk-delete-id]")].map((node) => node.dataset.bulkDeleteId).filter(Boolean);
+    if (!visibleIds.length) return;
+    const selected = new Set(ui.selectedBulkDeleteIds || []);
+    const allVisibleSelected = visibleIds.every((id) => selected.has(id));
+    visibleIds.forEach((id) => {
+      if (allVisibleSelected) selected.delete(id);
+      else selected.add(id);
+    });
+    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => state.items.some((item) => item.id === entryId));
+  }
+
+  function deleteSelectedItems() {
+    const selectedIds = [...new Set(ui.selectedBulkDeleteIds || [])].filter((id) => state.items.some((item) => item.id === id));
+    if (!selectedIds.length) {
+      alert("삭제할 게시물을 먼저 선택하세요.");
+      return;
+    }
+    if (!confirm(`선택한 ${selectedIds.length}개 게시물을 삭제할까요?`)) return;
+    const selected = new Set(selectedIds);
+    state.items = state.items.filter((item) => !selected.has(item.id));
+    if (selected.has(ui.selectedId)) ui.selectedId = state.items[0]?.id || null;
+    ui.bulkDeleteMode = false;
+    ui.selectedBulkDeleteIds = [];
+    ui.view = "gallery";
+    resetGalleryWindow();
+    saveItemsState();
+    render();
+    showToast(`${selectedIds.length}개 게시물을 삭제했습니다.`, "success", 1600);
   }
 
   function addExcludeOption() {
@@ -2614,6 +3280,8 @@
 
   function saveUploadSettings() {
     state.uploadSettings = normalizeUploadSettings({
+      promptSourceMode: document.querySelector('input[name="promptSourceMode"]:checked')?.value || state.uploadSettings.promptSourceMode,
+      translateExifPrompt: document.getElementById("translateExifPrompt")?.checked,
       preserveOriginal: document.getElementById("preserveOriginal")?.checked,
       autoCompress: document.getElementById("autoCompress")?.checked,
       stripExif: document.getElementById("stripExif")?.checked,
@@ -2696,6 +3364,56 @@
     state.categorySettings.allowAiSuggestedTags = Boolean(document.getElementById("allowAiSuggestedTags")?.checked);
     saveSettingsState();
     render();
+  }
+
+  async function retranslateSection(id, key) {
+    const item = findItem(id);
+    if (!item?.promptJson?.[key]) return;
+    collectPromptEditsFromDom(item);
+    const sectionConfig = state.promptSettings.sections.find((section) => section.key === key) || sectionMeta.find((section) => section.key === key);
+    const sentences = item.promptJson[key].sentences.map((sentence) => ({
+      id: sentence.id,
+      en: String(sentence.en || "").trim(),
+    })).filter((sentence) => sentence.en);
+    if (!sentences.length) {
+      showToast("재번역할 영어 문장이 없습니다.", "warning", 1600);
+      return;
+    }
+    item.versions.unshift({ id: uid("ver"), promptJson: structuredClone(item.promptJson), finalPrompt: item.finalPrompt, createdAt: Date.now() });
+    item.status = "modified";
+    saveItemState(item);
+    showToast("번역 중입니다.", "info", 1000);
+    try {
+      const response = await fetch(SERVER_TRANSLATE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          sectionKey: key,
+          sectionLabel: sectionConfig?.labelKo || key,
+          sentences,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || "번역 요청에 실패했습니다.");
+      const byId = new Map((payload.translations || []).map((entry) => [entry.id, entry.ko]));
+      item.promptJson[key].sentences.forEach((sentence) => {
+        const translated = byId.get(sentence.id);
+        if (translated) sentence.ko = translated;
+      });
+      item.finalPrompt = promptText(item, "final");
+      syncPromptEditState(item, "translate");
+      if (item.promptEditState === "modified") item.status = "modified";
+      item.updatedAt = Date.now();
+      saveItemState(item);
+      render();
+      showToast("한국어 재번역이 끝났습니다.", "success", 1400);
+    } catch (error) {
+      item.versions.shift();
+      saveItemState(item);
+      render();
+      showToast(error.message || "번역에 실패했습니다.", "warning", 2200);
+    }
   }
 
   function findCategoryInput(attribute, id) {
@@ -2853,8 +3571,6 @@
     const isActive = Boolean(
       document.querySelector("[data-provider-use-image]")?.checked
       || document.querySelector("[data-provider-use-translation]")?.checked
-      || document.querySelector("[data-provider-use-cleanup]")?.checked
-      || document.querySelector("[data-provider-use-tagging]")?.checked
     );
     if (activeButton) activeButton.textContent = isActive ? "사용" : "끔";
     const status = document.querySelector(".provider-head .status-pill");
@@ -2862,13 +3578,13 @@
   }
 
   function saveProviderCheckbox(input) {
-    const index = Number(input.dataset.providerUseImage ?? input.dataset.providerUseTranslation ?? input.dataset.providerUseCleanup ?? input.dataset.providerUseTagging);
+    const index = Number(input.dataset.providerUseImage ?? input.dataset.providerUseTranslation);
     const provider = state.providers[index];
     if (!provider) return;
     if (input.dataset.providerUseImage !== undefined) provider.useForImageAnalysis = input.checked;
     if (input.dataset.providerUseTranslation !== undefined) provider.useForTranslation = input.checked;
-    if (input.dataset.providerUseCleanup !== undefined) provider.useForPromptCleanup = input.checked;
-    if (input.dataset.providerUseTagging !== undefined) provider.useForTagging = input.checked;
+    provider.useForPromptCleanup = false;
+    provider.useForTagging = false;
     provider.enabled = providerIsActive(provider);
     updateVisibleProviderTabStatus();
   }
@@ -2889,9 +3605,10 @@
     const provider = state.providers[index];
     if (!provider) return false;
     const keyInput = document.querySelector(`[data-provider-key="${index}"]`);
-    provider.model = document.querySelector(`[data-provider-model="${index}"]`)?.value.trim() || "";
-    provider.visionModel = document.querySelector(`[data-provider-vision-model="${index}"]`)?.value.trim() || "";
-    provider.textModel = document.querySelector(`[data-provider-text-model="${index}"]`)?.value.trim() || "";
+    const unifiedModel = document.querySelector(`[data-provider-model="${index}"]`)?.value.trim() || "";
+    provider.model = unifiedModel;
+    provider.visionModel = unifiedModel;
+    provider.textModel = unifiedModel;
     provider.apiUrl = document.querySelector(`[data-provider-api-url="${index}"]`)?.value.trim() || provider.apiUrl || defaultProviderApiUrl(provider.name);
     provider.location = document.querySelector(`[data-provider-location="${index}"]`)?.value.trim() || provider.location || "";
     const pendingKey = keyInput?.value.trim() || "";
@@ -2905,8 +3622,8 @@
     provider.maxRetries = clampNumber(document.querySelector(`[data-provider-retries="${index}"]`)?.value, 0, 10, provider.maxRetries);
     provider.useForImageAnalysis = document.querySelector(`[data-provider-use-image="${index}"]`)?.checked === true;
     provider.useForTranslation = document.querySelector(`[data-provider-use-translation="${index}"]`)?.checked === true;
-    provider.useForPromptCleanup = document.querySelector(`[data-provider-use-cleanup="${index}"]`)?.checked === true;
-    provider.useForTagging = document.querySelector(`[data-provider-use-tagging="${index}"]`)?.checked === true;
+    provider.useForPromptCleanup = false;
+    provider.useForTagging = false;
     provider.enabled = providerIsActive(provider);
     saveProvidersState();
     return true;
@@ -3082,16 +3799,544 @@
 
   function inferTags(source, type) {
     const text = String(source || "").toLowerCase();
-    const matched = tagOptions(type)
+    const otherKey = fallbackTag(type);
+    const scored = tagOptions(type)
       .filter((tag) => tag.enabled !== false && tag.allowAiAssign !== false)
-      .filter((tag) => tag.name.toLowerCase().split(/\s+/).some((part) => text.includes(part)) || (tag.keywords || []).some((keyword) => text.includes(keyword.toLowerCase())))
-      .map((tag) => tag.key);
-    if (matched.length) return matched.slice(0, 3);
-    return [fallbackTag(type)];
+      .filter((tag) => tag.key !== otherKey && tag.name !== "기타")
+      .map((tag) => {
+        let score = 0;
+        const terms = [tag.name, ...(tag.keywords || [])]
+          .map((term) => String(term || "").toLowerCase().trim())
+          .filter(Boolean);
+        terms.forEach((term) => {
+          if (termMatchesPromptText(text, term)) score += Math.min(term.length, 24) + (term.includes(" ") ? 4 : 0);
+        });
+        return { key: tag.key, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || a.key.localeCompare(b.key));
+    if (!scored.length) return otherKey ? [otherKey] : [];
+    return scored.slice(0, 3).map((entry) => entry.key);
+  }
+
+  function termMatchesPromptText(text, term) {
+    const value = String(term || "").toLowerCase().trim();
+    if (!value || !text) return false;
+    // Short English tokens use word-ish boundaries so "suit" does not match "suitcase".
+    if (/^[a-z0-9][a-z0-9\s/-]{0,20}$/i.test(value) && value.length <= 12) {
+      const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+      return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`, "i").test(text);
+    }
+    return text.includes(value);
   }
 
   function fallbackTag(type) {
     return tagOptions(type).find((tag) => tag.name === "기타")?.key || tagOptions(type)[0]?.key || "";
+  }
+
+  async function validatePendingExifPrompts(files) {
+    const prompts = {};
+    const errors = {};
+    const invalidKeys = [];
+    for (const file of files) {
+      const key = pendingUploadKey(file);
+      try {
+        validateUploadFile(file);
+        const parsed = await readExifPromptFromFile(file);
+        prompts[key] = parsed;
+      } catch (error) {
+        errors[key] = error.message || "EXIF 프롬프트를 읽지 못했습니다.";
+        invalidKeys.push(key);
+      }
+    }
+    return { prompts, errors, invalidKeys };
+  }
+
+  async function readExifPromptFromFile(file) {
+    const buffer = await file.arrayBuffer();
+    const metadata = extractImageMetadataText(buffer, file.type || "");
+    const parsed = parseExifPromptMetadata(metadata);
+    if (!parsed?.promptJson) {
+      throw new Error("EXIF / 메타데이터에 5문단 프롬프트가 없습니다.");
+    }
+    return parsed;
+  }
+
+  function extractImageMetadataText(buffer, mimeType) {
+    const bytes = new Uint8Array(buffer);
+    const chunks = [];
+    const add = (source, value) => {
+      const text = cleanMetadataText(value);
+      if (text) chunks.push({ source, text });
+    };
+    if (mimeType === "image/png" || hasPngSignature(bytes)) {
+      extractPngMetadata(bytes).forEach((entry) => add(entry.source, entry.text));
+    }
+    if (mimeType === "image/jpeg" || hasJpegSignature(bytes)) {
+      extractJpegMetadata(bytes).forEach((entry) => add(entry.source, entry.text));
+    }
+    if (mimeType === "image/webp" || hasWebpSignature(bytes)) {
+      extractWebpMetadata(bytes).forEach((entry) => add(entry.source, entry.text));
+    }
+    add("raw-scan", scanBufferForPromptText(bytes));
+    return chunks;
+  }
+
+  function hasPngSignature(bytes) {
+    return bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  }
+
+  function hasJpegSignature(bytes) {
+    return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8;
+  }
+
+  function hasWebpSignature(bytes) {
+    return bytes.length > 12 && ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WEBP";
+  }
+
+  function extractPngMetadata(bytes) {
+    const entries = [];
+    if (!hasPngSignature(bytes)) return entries;
+    let offset = 8;
+    while (offset + 12 <= bytes.length) {
+      const length = readUint32BE(bytes, offset);
+      const type = ascii(bytes, offset + 4, 4);
+      const dataStart = offset + 8;
+      const dataEnd = dataStart + length;
+      if (dataEnd > bytes.length) break;
+      const data = bytes.slice(dataStart, dataEnd);
+      if (type === "tEXt") {
+        const nul = data.indexOf(0);
+        const key = nul >= 0 ? latin1(data.slice(0, nul)) : "tEXt";
+        const value = nul >= 0 ? latin1(data.slice(nul + 1)) : latin1(data);
+        entries.push({ source: key || "PNG tEXt", text: value });
+      } else if (type === "iTXt") {
+        const parsed = parsePngItxt(data);
+        if (parsed.text) entries.push(parsed);
+      } else if (type === "zTXt") {
+        const nul = data.indexOf(0);
+        const key = nul >= 0 ? latin1(data.slice(0, nul)) : "zTXt";
+        entries.push({ source: key || "PNG zTXt", text: scanBufferForPromptText(data) });
+      }
+      offset = dataEnd + 4;
+      if (type === "IEND") break;
+    }
+    return entries;
+  }
+
+  function parsePngItxt(data) {
+    let cursor = 0;
+    const readNullText = () => {
+      const end = data.indexOf(0, cursor);
+      const stop = end >= 0 ? end : data.length;
+      const value = utf8(data.slice(cursor, stop));
+      cursor = Math.min(stop + 1, data.length);
+      return value;
+    };
+    const key = readNullText() || "PNG iTXt";
+    cursor += 2;
+    readNullText();
+    readNullText();
+    return { source: key, text: utf8(data.slice(cursor)) };
+  }
+
+  function extractJpegMetadata(bytes) {
+    const entries = [];
+    if (!hasJpegSignature(bytes)) return entries;
+    let offset = 2;
+    while (offset + 4 < bytes.length) {
+      if (bytes[offset] !== 0xff) break;
+      const marker = bytes[offset + 1];
+      offset += 2;
+      if (marker === 0xda || marker === 0xd9) break;
+      const length = readUint16BE(bytes, offset);
+      const start = offset + 2;
+      const end = start + length - 2;
+      if (length < 2 || end > bytes.length) break;
+      const segment = bytes.slice(start, end);
+      if (marker === 0xe1 && ascii(segment, 0, 6) === "Exif\0\0") {
+        extractExifTiff(segment.slice(6)).forEach((entry) => entries.push(entry));
+      } else if (marker === 0xe1 && ascii(segment, 0, 29).includes("http://ns.adobe.com/xap")) {
+        entries.push({ source: "XMP", text: utf8(segment) });
+      } else if (marker === 0xfe) {
+        entries.push({ source: "JPEG Comment", text: utf8(segment) || latin1(segment) });
+      }
+      offset = end;
+    }
+    return entries;
+  }
+
+  function extractExifTiff(tiff) {
+    const entries = [];
+    if (tiff.length < 8) return entries;
+    const little = ascii(tiff, 0, 2) === "II";
+    const read16 = (offset) => little ? readUint16LE(tiff, offset) : readUint16BE(tiff, offset);
+    const read32 = (offset) => little ? readUint32LE(tiff, offset) : readUint32BE(tiff, offset);
+    const firstIfd = read32(4);
+    const visited = new Set();
+    const tagNames = {
+      0x010e: "ImageDescription",
+      0x0131: "Software",
+      0x9286: "UserComment",
+      0x9c9c: "XPComment",
+      0x9c9b: "XPTitle",
+      0x9c9e: "XPSubject",
+    };
+    const parseIfd = (offset) => {
+      if (!offset || visited.has(offset) || offset + 2 > tiff.length) return;
+      visited.add(offset);
+      const count = read16(offset);
+      for (let i = 0; i < count; i++) {
+        const entryOffset = offset + 2 + i * 12;
+        if (entryOffset + 12 > tiff.length) break;
+        const tag = read16(entryOffset);
+        const type = read16(entryOffset + 2);
+        const countValue = read32(entryOffset + 4);
+        const valueOffset = read32(entryOffset + 8);
+        if (tag === 0x8769 || tag === 0x8825) {
+          parseIfd(valueOffset);
+          continue;
+        }
+        if (!tagNames[tag]) continue;
+        const value = readExifValue(tiff, entryOffset + 8, type, countValue, valueOffset, little);
+        entries.push({ source: tagNames[tag], text: value });
+      }
+      const next = offset + 2 + count * 12;
+      if (next + 4 <= tiff.length) parseIfd(read32(next));
+    };
+    parseIfd(firstIfd);
+    return entries;
+  }
+
+  function readExifValue(tiff, inlineOffset, type, countValue, valueOffset, little) {
+    const typeSize = { 1: 1, 2: 1, 3: 2, 4: 4, 7: 1 }[type] || 1;
+    const byteLength = Math.max(0, countValue * typeSize);
+    const start = byteLength <= 4 ? inlineOffset : valueOffset;
+    if (start < 0 || start + byteLength > tiff.length) return "";
+    const data = tiff.slice(start, start + byteLength);
+    if (type === 2) return latin1(data).replace(/\0+$/g, "");
+    if (type === 7) return decodeExifUndefined(data);
+    if (type === 1 && byteLength > 4) return utf8(data) || latin1(data);
+    if (type === 3 && byteLength > 4) return decodeUtf16(data, little);
+    return utf8(data) || latin1(data);
+  }
+
+  function decodeExifUndefined(data) {
+    const prefix = ascii(data, 0, 8);
+    const body = data.slice(8);
+    if (prefix.startsWith("UNICODE")) return decodeUtf16(body, false);
+    if (prefix.startsWith("ASCII")) return latin1(body).replace(/\0+$/g, "");
+    return utf8(data) || latin1(data);
+  }
+
+  function extractWebpMetadata(bytes) {
+    const entries = [];
+    if (!hasWebpSignature(bytes)) return entries;
+    let offset = 12;
+    while (offset + 8 <= bytes.length) {
+      const type = ascii(bytes, offset, 4);
+      const size = readUint32LE(bytes, offset + 4);
+      const start = offset + 8;
+      const end = start + size;
+      if (end > bytes.length) break;
+      const data = bytes.slice(start, end);
+      if (type === "EXIF") extractExifTiff(stripExifHeader(data)).forEach((entry) => entries.push(entry));
+      if (type === "XMP ") entries.push({ source: "WebP XMP", text: utf8(data) });
+      offset = end + (size % 2);
+    }
+    return entries;
+  }
+
+  function stripExifHeader(data) {
+    return ascii(data, 0, 6) === "Exif\0\0" ? data.slice(6) : data;
+  }
+
+  function parseExifPromptMetadata(entries) {
+    const candidates = [];
+    for (const entry of entries) {
+      collectPromptCandidates(entry.text, entry.source).forEach((candidate) => candidates.push(candidate));
+    }
+    candidates.sort((a, b) => promptCandidateScore(b) - promptCandidateScore(a));
+    for (const candidate of candidates) {
+      const promptJson = promptJsonFromMetadataText(candidate.text);
+      if (promptJson) {
+        return {
+          promptJson,
+          rawText: candidate.text,
+          source: candidate.source,
+          titleSummary: titleFromPromptJson(promptJson),
+        };
+      }
+    }
+    return null;
+  }
+
+  function collectPromptCandidates(text, source = "metadata") {
+    const cleaned = cleanMetadataText(text);
+    if (!cleaned) return [];
+    const candidates = [{ source, text: cleaned }];
+    const json = tryParseJson(cleaned);
+    if (json) {
+      extractStringsFromJson(json).forEach((value, index) => candidates.push({ source: `${source}:json-${index + 1}`, text: value }));
+    }
+    const parameters = extractA1111PositivePrompt(cleaned);
+    if (parameters && parameters !== cleaned) candidates.push({ source: `${source}:parameters`, text: parameters });
+    return candidates;
+  }
+
+  function extractStringsFromJson(value, depth = 0) {
+    if (depth > 5 || value == null) return [];
+    if (typeof value === "string") return [value];
+    const out = [];
+    if (typeof value === "object") {
+      const priorityKeys = ["promptSections", "promptJson", "finalPrompt", "prompt", "parameters", "description", "Comment", "UserComment"];
+      priorityKeys.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(value, key)) out.push(...extractStringsFromJson(value[key], depth + 1));
+      });
+      Object.keys(value).forEach((key) => {
+        if (!priorityKeys.includes(key)) out.push(...extractStringsFromJson(value[key], depth + 1));
+      });
+    }
+    return out.map(cleanMetadataText).filter((text) => text.length > 20);
+  }
+
+  function promptCandidateScore(candidate) {
+    const text = candidate.text.toLowerCase();
+    let score = Math.min(candidate.text.length, 4000) / 1000;
+    if (/appearance|outfit|background|details|외모|복장|배경|디테일/.test(text)) score += 8;
+    if ((candidate.text.match(/\n\s*\n/g) || []).length >= 4) score += 7;
+    if (/negative prompt|steps:|sampler:|cfg scale:/i.test(candidate.text)) score += 2;
+    if (/workflow|class_type|last_node_id/i.test(candidate.text)) score -= 4;
+    return score;
+  }
+
+  function promptJsonFromMetadataText(text) {
+    const cleaned = cleanMetadataText(text);
+    const json = tryParseJson(cleaned);
+    if (json) {
+      if (json.promptSections || json.promptJson) return normalizeAnalysisPrompt(json.promptSections || json.promptJson);
+      if (json.prompt && typeof json.prompt === "object") return normalizeAnalysisPrompt(json.prompt);
+      const strings = extractStringsFromJson(json).sort((a, b) => b.length - a.length);
+      for (const value of strings) {
+        const parsed = promptJsonFromMetadataText(value);
+        if (parsed) return parsed;
+      }
+    }
+    return promptJsonFromPlainText(cleaned);
+  }
+
+  function promptJsonFromPlainText(text) {
+    const withoutNegative = extractA1111PositivePrompt(text) || text;
+    const labeled = splitLabeledSections(withoutNegative);
+    if (labeled) return promptJsonFromSectionTexts(labeled);
+    const paragraphs = withoutNegative
+      .split(/\n\s*\n+/)
+      .map((part) => cleanPromptParagraph(part))
+      .filter(Boolean);
+    if (paragraphs.length >= 5) return promptJsonFromSectionTexts(Object.fromEntries(sectionMeta.map((section, index) => [section.key, paragraphs[index]])));
+    return null;
+  }
+
+  function splitLabeledSections(text) {
+    const labels = [
+      ["appearance", "Appearance", "외모"],
+      ["outfit", "Outfit", "복장"],
+      ["background", "Background", "배경"],
+      ["expression_pose", "Expression / Pose", "Expression/Pose", "Expression Pose", "표정/자세", "표정", "자세"],
+      ["details", "Details", "Detail", "디테일", "품질"],
+    ];
+    const matches = [];
+    labels.forEach(([key, ...names]) => {
+      names.forEach((name) => {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const re = new RegExp(`(^|\\n)\\s*(?:#{1,6}\\s*)?${escaped}\\s*[:：-]?\\s*`, "ig");
+        let match;
+        while ((match = re.exec(text))) matches.push({ key, index: match.index, end: re.lastIndex });
+      });
+    });
+    matches.sort((a, b) => a.index - b.index);
+    const unique = [];
+    matches.forEach((match) => {
+      if (!unique.some((item) => item.key === match.key)) unique.push(match);
+    });
+    if (unique.length < 5) return null;
+    const ordered = sectionMeta.map((section) => unique.find((match) => match.key === section.key)).filter(Boolean);
+    if (ordered.length < 5) return null;
+    const out = {};
+    ordered.forEach((match, index) => {
+      const next = ordered[index + 1];
+      out[match.key] = cleanPromptParagraph(text.slice(match.end, next ? next.index : text.length));
+    });
+    return sectionMeta.every((section) => out[section.key]) ? out : null;
+  }
+
+  function promptJsonFromSectionTexts(sectionTexts) {
+    const prompt = {};
+    sectionMeta.forEach((section) => {
+      const text = cleanPromptParagraph(sectionTexts[section.key] || "");
+      prompt[section.key] = {
+        title_ko: section.labelKo,
+        sentences: splitPromptSentences(text).map((sentence, index) => ({
+          id: `${section.key}-${index + 1}`,
+          en: sentence,
+          ko: "",
+        })),
+      };
+    });
+    if (sectionMeta.some((section) => !prompt[section.key].sentences.length)) return null;
+    return prompt;
+  }
+
+  function splitPromptSentences(text) {
+    const cleaned = cleanPromptParagraph(text);
+    if (!cleaned) return [];
+    const byLine = cleaned.split(/\n+/).map(cleanPromptParagraph).filter(Boolean);
+    if (byLine.length > 1) return byLine;
+    return [cleaned];
+  }
+
+  function cleanPromptParagraph(value) {
+    return String(value || "")
+      .replace(/^[-*\d.)\s]+(?=\S)/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function extractA1111PositivePrompt(text) {
+    const value = cleanMetadataText(text);
+    if (!value) return "";
+    const negativeIndex = value.search(/\bNegative prompt\s*:/i);
+    const stepsIndex = value.search(/\bSteps\s*:/i);
+    const cut = [negativeIndex, stepsIndex].filter((index) => index > 0).sort((a, b) => a - b)[0];
+    return cut ? value.slice(0, cut).trim() : value;
+  }
+
+  function titleFromPromptJson(promptJson) {
+    // Titles are generated by /api/title-summary as Korean one-line summaries.
+    // Keep this helper empty so EXIF import no longer chops English prompt words.
+    void promptJson;
+    return "";
+  }
+
+  async function translateItemPromptSections(item, options = {}) {
+    let translatedAny = false;
+    for (const sectionConfig of enabledSections()) {
+      const section = item.promptJson?.[sectionConfig.key];
+      if (!section?.sentences?.length) continue;
+      const sentences = section.sentences
+        .filter((sentence) => String(sentence.en || "").trim() && !String(sentence.ko || "").trim())
+        .map((sentence) => ({ id: sentence.id, en: String(sentence.en || "").trim() }));
+      if (!sentences.length) continue;
+      const response = await fetch(SERVER_TRANSLATE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          sectionKey: sectionConfig.key,
+          sectionLabel: sectionConfig.labelKo || sectionConfig.key,
+          sentences,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || "번역 요청에 실패했습니다.");
+      const byId = new Map((payload.translations || []).map((entry) => [entry.id, entry.ko]));
+      section.sentences.forEach((sentence) => {
+        const translated = byId.get(sentence.id);
+        if (translated) {
+          sentence.ko = translated;
+          translatedAny = true;
+        }
+      });
+    }
+    if (translatedAny) {
+      item.finalPrompt = promptText(item, "final");
+      item.updatedAt = Date.now();
+    }
+    if (!translatedAny && !options.silent) showToast("번역할 빈 한국어 문장이 없습니다.", "info", 1400);
+    return translatedAny;
+  }
+
+  function tryParseJson(text) {
+    const cleaned = cleanMetadataText(text);
+    if (!cleaned) return null;
+    try {
+      return JSON.parse(cleaned);
+    } catch (error) {
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
+      if (start >= 0 && end > start) {
+        try {
+          return JSON.parse(cleaned.slice(start, end + 1));
+        } catch (_error) {}
+      }
+    }
+    return null;
+  }
+
+  function cleanMetadataText(value) {
+    return String(value || "")
+      .replace(/^\uFEFF/, "")
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]+/g, " ")
+      .replace(/\r\n/g, "\n")
+      .trim();
+  }
+
+  function scanBufferForPromptText(bytes) {
+    const limit = Math.min(bytes.length, 3 * 1024 * 1024);
+    const text = utf8(bytes.slice(0, limit)) || latin1(bytes.slice(0, limit));
+    const patterns = [
+      /(?:promptSections|promptJson|finalPrompt|parameters|prompt|Description|UserComment)[\s\S]{0,20000}/i,
+      /Appearance[\s\S]{0,20000}Outfit[\s\S]{0,20000}Background[\s\S]{0,20000}Details[\s\S]{0,20000}/i,
+    ];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) return match[0];
+    }
+    return "";
+  }
+
+  function ascii(bytes, offset, length) {
+    return latin1(bytes.slice(offset, offset + length));
+  }
+
+  function utf8(bytes) {
+    try {
+      return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function latin1(bytes) {
+    try {
+      return new TextDecoder("latin1").decode(bytes);
+    } catch (error) {
+      return String.fromCharCode(...bytes);
+    }
+  }
+
+  function decodeUtf16(bytes, little = true) {
+    try {
+      return new TextDecoder(little ? "utf-16le" : "utf-16be").decode(bytes).replace(/\0+$/g, "");
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function readUint16BE(bytes, offset) {
+    return (bytes[offset] << 8) | bytes[offset + 1];
+  }
+
+  function readUint16LE(bytes, offset) {
+    return bytes[offset] | (bytes[offset + 1] << 8);
+  }
+
+  function readUint32BE(bytes, offset) {
+    return ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+  }
+
+  function readUint32LE(bytes, offset) {
+    return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
   }
 
   function validateUploadFile(file) {
@@ -3252,8 +4497,6 @@
 
   function buildAnalysisRequest(item) {
     const excluded = excludeLabels(item.excludeOptions);
-    const enabledOutfits = state.outfitTagOptions.filter((tag) => tag.enabled !== false && tag.allowAiAssign !== false).map((tag) => tag.name);
-    const enabledBackgrounds = state.backgroundTagOptions.filter((tag) => tag.enabled !== false && tag.allowAiAssign !== false).map((tag) => tag.name);
     const instruction = state.promptInstruction.includes("Section boundary rules:")
       ? state.promptInstruction
       : `${state.promptInstruction.trim()}\n\n${sectionBoundaryRules}`;
@@ -3266,26 +4509,49 @@
       "Elements to exclude from the generated prompt:",
       excluded.length ? excluded.map((label) => `- ${label}`).join("\n") : "(none)",
       "",
-      "Enabled outfit tags:",
-      enabledOutfits.map((label) => `- ${label}`).join("\n"),
-      "",
-      "Enabled background tags:",
-      enabledBackgrounds.map((label) => `- ${label}`).join("\n"),
-      "",
-      "Tag selection priority:",
-      "- Choose the closest specific enabled tag when there is any reasonable visual evidence.",
-      "- Do not choose 기타 just because the match is imperfect or broad.",
-      "- Use 기타 only when no enabled tag has meaningful visual support.",
-      "",
-      "Even if excluded elements appear in the image, do not describe them in the final prompt unless the user specifically asks to include them.",
+      "Focus rules for this app:",
+      "- Generate high-density promptSections only (appearance, outfit, background, expression_pose, details).",
+      "- Tags and album titles are handled outside this vision call. Do not spend tokens on tag lists or titleSummary.",
+      "- Even if excluded elements appear in the image, do not describe them in the final prompt unless the user specifically asks to include them.",
     ].join("\n");
   }
 
   function openItem(id) {
+    ui.previousView = ui.view;
     ui.selectedId = id;
     ui.view = "detail";
     ui.editMode = false;
     render();
+  }
+
+  function bindBackspaceNavigation() {
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Backspace") return;
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (isTextEditingTarget(event.target)) return;
+      if (!goBackInApp()) return;
+      event.preventDefault();
+    });
+  }
+
+  function isTextEditingTarget(target) {
+    if (!target?.closest) return false;
+    return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+  }
+
+  function goBackInApp() {
+    if (ui.modal) {
+      ui.modal = null;
+      render();
+      return true;
+    }
+    if (ui.view === "detail") {
+      ui.view = ui.previousView || "gallery";
+      ui.editMode = false;
+      render();
+      return true;
+    }
+    return false;
   }
 
   function selectedItem() {
@@ -3348,5 +4614,6 @@
     };
   }
 
+  bindBackspaceNavigation();
   render();
 })();
