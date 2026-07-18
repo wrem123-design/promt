@@ -1,3 +1,7 @@
 data/
 uploads/
 *.log
+
+server.js_backup
+backup/
+*.zip

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>프롬프트 아카이브</title>
     <meta name="description" content="이미지를 업로드하고 AI 이미지 생성용 프롬프트를 저장, 편집, 복사하는 앨범형 프롬프트 저장소">
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
@@ -12,6 +13,11 @@
     <template id="icon-sprite">
       <svg aria-hidden="true" focusable="false" class="icon"><use href="#icon-placeholder"></use></svg>
     </template>
+    <script src="image-converter.js"></script>
+    <script src="lora-sorter.js"></script>
+    <script src="lora-sorter-storage.js"></script>
+    <script src="exif-prompt-resolver.js"></script>
+    <script src="prompt-similarity.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

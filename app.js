@@ -1,13 +1,19 @@
 (function () {
   const STORAGE_KEY = "promptArchiveState.v2";
   const LEGACY_STORAGE_KEY = "promptArchiveState.v1";
-  const SESSION_KEY = "promptArchiveAdminSession";
   const SERVER_STATE_ENDPOINT = "/api/state";
   const SERVER_SETTINGS_ENDPOINT = "/api/settings";
   const SERVER_PROVIDERS_ENDPOINT = "/api/providers";
   const SERVER_TAGS_ENDPOINT = "/api/tags";
   const SERVER_ITEMS_ENDPOINT = "/api/items";
   const SERVER_ANALYZE_ENDPOINT = "/api/analyze";
+  const SERVER_TRANSLATE_ENDPOINT = "/api/translate-section";
+  const SERVER_TITLE_ENDPOINT = "/api/title-summary";
+  const SERVER_EDIT_PROMPT_ENDPOINT = "/api/edit-prompt";
+  const SERVER_BACKUP_ENDPOINT = "/api/backup";
+  const SERVER_IMPORT_ENDPOINT = "/api/import";
+  const SERVER_WILDCARD_SYNC_ENDPOINT = "/api/wildcards/sync";
+  const CONVERTER_HISTORY_KEY = "promptArchiveConverterHistory.v1";
   let serverAvailable = false;
   let saveTimer = null;
   let settingsSaveTimer = null;
@@ -17,6 +23,53 @@
   let toastTimer = null;
   let serverBootComplete = false;
   let changedBeforeServerBoot = false;
+  let restoredFallbackAt = 0;
+  let initialLoadBlocked = false;
+  let modalBackdropPointerDown = false;
+  let searchImeComposing = false;
+  let searchRefreshTimer = null;
+  let galleryLoadTimer = null;
+  let persistenceStatus = "connecting";
+  let persistenceMessage = "서버 연결 확인 중";
+  let fallbackNoticeShown = false;
+  let modalReturnAction = "";
+  let postRenderFocusSelector = "";
+  let gallerySimilarityById = new Map();
+  let gallerySimilarityCache = { key: "", rankedItems: [], matches: new Map() };
+  let duplicateIndexCache = { revision: "", groups: new Map(), duplicateIds: new Set() };
+  const converterState = {
+    sourceMode: "folder",
+    sourceHandle: null,
+    destinationHandle: null,
+    sourceFiles: [],
+    selectedFiles: [],
+    destinationMode: "source",
+    includeSubfolders: false,
+    deleteOriginals: false,
+    collisionMode: "rename",
+    quality: 100,
+    running: false,
+    progress: null,
+    result: null,
+    history: loadConverterHistory(),
+    wildcardSyncing: false,
+    wildcardSyncMode: "",
+    wildcardSyncResult: null,
+  };
+  const loraSorterState = {
+    sourceHandle: null,
+    includeSubfolders: false,
+    scannedFiles: [],
+    groups: [],
+    baseDestinationHandle: null,
+    destinationHandles: new Map(),
+    excludedGroupKeys: new Set(),
+    collisionMode: "rename",
+    scanning: false,
+    moving: false,
+    progress: null,
+    result: null,
+  };
 
   const sectionBoundaryRules = `Section boundary rules:
 - Appearance must not include expression, gaze, camera angle, pose, composition, background, accessories, outfit mood, or clothing atmosphere.
@@ -59,6 +112,8 @@
   ];
 
   const defaultUploadSettings = {
+    promptSourceMode: "ai",
+    translateExifPrompt: true,
     preserveOriginal: false,
     autoCompress: true,
     stripExif: true,
@@ -81,6 +136,7 @@
   const defaultAlbumSettings = {
     columns: 5,
     rows: 5,
+    loadMode: "infinite",
     paginationPosition: "bottom",
     cardAspectRatio: "square",
     showTitle: true,
@@ -166,6 +222,12 @@
     maxImagesPerBatch: 30,
     maxRegenerationsPerImage: 20,
     logs: [],
+    shortcuts: {
+      nextItem: "",
+      prevItem: "",
+      copyFinal: "",
+      goBack: "",
+    },
   };
 
   const defaultOutfitTags = [
@@ -220,7 +282,13 @@
     activeProviderIndex: 0,
     pendingUploadFiles: [],
     selectedPendingUploadKeys: [],
+    pendingUploadErrors: {},
     uploadProgress: null,
+    uploadDraft: {
+      title: "",
+      categoryId: state.categories[0]?.id || "",
+      customInstruction: "",
+    },
     selectedFragmentId: null,
     filterGroup: "all",
     selectedOutfitTags: [],
@@ -228,20 +296,41 @@
     page: 1,
     galleryLoadedPages: 1,
     galleryLoading: false,
+    previousView: null,
     uploadQueue: [],
+    bulkDeleteMode: false,
+    selectedBulkDeleteIds: [],
+    bulkCategoryMode: false,
+    selectedBulkCategoryIds: [],
+    promptCompareMode: false,
+    reviseAlsoRetag: true,
+    reviseAlsoRetitle: false,
+    originFilter: "all",
+    favoriteOnly: false,
+    showDuplicatesOnly: false,
   };
 
   document.documentElement.dataset.theme = state.theme;
   applyThemeOptions();
-  bootServerState();
+  migrateAllPromptBaselines();
+  bootServerState().then(() => {
+    migrateAllPromptBaselines();
+  });
+  const loraSorterRestorePromise = restoreLoraSorterSettings();
 
   function loadState() {
     const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
     if (saved) {
       try {
-        return normalizeState(JSON.parse(saved));
+        const parsed = JSON.parse(saved);
+        const restored = normalizeState(parsed);
+        changedBeforeServerBoot = true;
+        restoredFallbackAt = Number(parsed.__fallbackSavedAt || 0);
+        return restored;
       } catch (error) {
         console.warn("State restore failed", error);
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
       }
     }
     const catPortrait = uid("cat");
@@ -289,12 +378,14 @@
   }
 
   function defaultProvider(name, index) {
+    const model = defaultProviderModel(name, index);
     return {
       name,
       enabled: index === 0,
-      model: defaultProviderModel(name, index),
-      visionModel: defaultProviderVisionModel(name, index),
-      textModel: "",
+      model,
+      // Legacy mirrors kept in sync for older server/state compatibility.
+      visionModel: model,
+      textModel: model,
       hasServerKey: false,
       keyCount: 0,
       currentKeyIndex: 0,
@@ -306,8 +397,9 @@
       maxRetries: 2,
       useForImageAnalysis: index === 0,
       useForTranslation: index === 0,
-      useForPromptCleanup: index === 0,
-      useForTagging: index === 0,
+      // Retired roles kept false for older saved state compatibility.
+      useForPromptCleanup: false,
+      useForTagging: false,
       lastTestStatus: "",
     };
   }
@@ -315,12 +407,7 @@
   function defaultProviderModel(name, index) {
     if (name === "Google Gemini API") return "gemini-2.5-flash";
     if (name === "Google Vertex AI") return "gemini-2.5-flash";
-    return index === 0 ? "gpt-4.1" : "";
-  }
-
-  function defaultProviderVisionModel(name, index) {
-    if (name === "Google Gemini API") return "gemini-2.5-flash";
-    if (name === "Google Vertex AI") return "gemini-2.5-flash";
+    if (name === "Cerebras Cloud") return "gemma-4-31b";
     return index === 0 ? "gpt-4.1" : "";
   }
 
@@ -330,7 +417,7 @@
 
   function normalizeVertexLocation(provider) {
     const location = String(provider.location || "").trim();
-    const model = String(provider.visionModel || provider.model || provider.textModel || "").trim();
+    const model = String(provider.model || provider.visionModel || provider.textModel || "").trim();
     if (provider.name === "Google Vertex AI" && model === "gemini-3.5-flash" && location === "us-central1") {
       return "global";
     }
@@ -349,11 +436,26 @@
     return providerNames.map((name, index) => {
       const provider = { ...defaultProvider(name, index), ...(byName.get(name) || {}) };
       provider.name = name;
-      provider.model = normalizeGeminiModelName(name, provider.model || defaultProviderModel(name, index));
-      provider.visionModel = normalizeGeminiModelName(name, provider.visionModel || defaultProviderVisionModel(name, index));
-      provider.textModel = normalizeGeminiModelName(name, provider.textModel || "");
+      const unifiedModel = normalizeGeminiModelName(
+        name,
+        provider.model || provider.visionModel || provider.textModel || defaultProviderModel(name, index)
+      );
+      provider.model = unifiedModel;
+      provider.visionModel = unifiedModel;
+      provider.textModel = unifiedModel;
       provider.location = normalizeVertexLocation(provider);
       provider.lastTestStatus = repairText(provider.lastTestStatus, "");
+      provider.useForImageAnalysis = Boolean(provider.useForImageAnalysis);
+      provider.useForTranslation = Boolean(provider.useForTranslation);
+      provider.priority = clampNumber(provider.priority, 1, 20, index + 1);
+      provider.timeoutSeconds = clampNumber(provider.timeoutSeconds, 5, 300, 60);
+      provider.maxRetries = clampNumber(provider.maxRetries, 0, 10, 2);
+      // Retired roles: cleanup/tagging are no longer separate API duties.
+      provider.useForPromptCleanup = false;
+      provider.useForTagging = false;
+      provider.enabled = providerIsActive(provider);
+      delete provider._pendingKey;
+      delete provider._pendingKeys;
       if (provider.name === "Google Vertex AI" && provider.lastTestStatus.includes("us-central1") && provider.lastTestStatus.includes("gemini-3.5-flash")) provider.lastTestStatus = "";
       if (provider.name === "Google Gemini API" && provider.lastTestStatus.includes("Vertex JSON")) provider.lastTestStatus = "";
       return provider;
@@ -364,7 +466,7 @@
     const source = Array.isArray(options) && options.length ? options : defaultExcludeOptions;
     const defaultsByKey = new Map(defaultExcludeOptions.map((option) => [option.key, option]));
     return source.map((option, index) => ({
-      key: option.key || uid("exclude"),
+      key: normalizeIdentifier(option.key, "exclude"),
       label: repairText(option.label, defaultsByKey.get(option.key)?.label || "새 제외 요소"),
       defaultChecked: Boolean(option.defaultChecked),
       enabled: option.enabled !== false,
@@ -376,7 +478,7 @@
     const source = Array.isArray(options) && options.length ? options : defaults;
     const defaultsByKey = new Map(defaults.map((tag) => [tag.key, tag]));
     return source.map((tag, index) => ({
-      key: tag.key || uid("tag"),
+      key: normalizeIdentifier(tag.key, "tag"),
       name: repairText(tag.name, defaultsByKey.get(tag.key)?.name || "기타"),
       keywords: Array.isArray(tag.keywords) ? tag.keywords : [],
       enabled: tag.enabled !== false,
@@ -386,9 +488,12 @@
   }
 
   function normalizeUploadSettings(settings = {}) {
+    const promptSourceMode = settings.promptSourceMode === "exif" ? "exif" : "ai";
     return {
       ...defaultUploadSettings,
       ...settings,
+      promptSourceMode,
+      translateExifPrompt: settings.translateExifPrompt !== false,
       displayMaxSize: clampNumber(settings.displayMaxSize, 512, 4096, defaultUploadSettings.displayMaxSize),
       analysisMaxSize: clampNumber(settings.analysisMaxSize, 512, 4096, defaultUploadSettings.analysisMaxSize),
       thumbnailSize: clampNumber(settings.thumbnailSize, 120, 1024, defaultUploadSettings.thumbnailSize),
@@ -406,6 +511,7 @@
       ...settings,
       columns: clampNumber(settings.columns, 2, 8, defaultAlbumSettings.columns),
       rows: clampNumber(settings.rows, 2, 8, defaultAlbumSettings.rows),
+      loadMode: ["infinite", "pages"].includes(settings.loadMode) ? settings.loadMode : defaultAlbumSettings.loadMode,
       paginationPosition: ["top", "bottom", "both"].includes(settings.paginationPosition) ? settings.paginationPosition : defaultAlbumSettings.paginationPosition,
       cardAspectRatio: ["square", "original", "3:4", "4:3", "16:9"].includes(settings.cardAspectRatio) ? settings.cardAspectRatio : defaultAlbumSettings.cardAspectRatio,
     };
@@ -430,7 +536,7 @@
       tagRules: repairText(settings.tagRules, defaultPromptSettings.tagRules),
       excludeRules: repairText(settings.excludeRules, defaultPromptSettings.excludeRules),
       sections: Array.isArray(settings.sections) && settings.sections.length ? settings.sections.map((section, index) => ({
-        key: section.key || sectionMeta[index]?.key || uid("section"),
+        key: normalizeIdentifier(section.key || sectionMeta[index]?.key, "section"),
         labelKo: repairText(section.labelKo, sectionMeta.find((item) => item.key === section.key)?.labelKo || sectionMeta[index]?.labelKo || "섹션"),
         labelEn: section.labelEn || sectionMeta[index]?.labelEn || "Section",
         enabled: section.enabled !== false,
@@ -440,6 +546,7 @@
   }
 
   function normalizeAdvancedSettings(settings = {}) {
+    const shortcuts = settings.shortcuts && typeof settings.shortcuts === "object" ? settings.shortcuts : {};
     return {
       ...defaultAdvancedSettings,
       ...settings,
@@ -448,7 +555,18 @@
       maxImagesPerBatch: clampNumber(settings.maxImagesPerBatch, 1, 200, defaultAdvancedSettings.maxImagesPerBatch),
       maxRegenerationsPerImage: clampNumber(settings.maxRegenerationsPerImage, 1, 200, defaultAdvancedSettings.maxRegenerationsPerImage),
       logs: Array.isArray(settings.logs) ? settings.logs : [],
+      shortcuts: {
+        nextItem: normalizeShortcutValue(shortcuts.nextItem, defaultAdvancedSettings.shortcuts.nextItem),
+        prevItem: normalizeShortcutValue(shortcuts.prevItem, defaultAdvancedSettings.shortcuts.prevItem),
+        copyFinal: normalizeShortcutValue(shortcuts.copyFinal, defaultAdvancedSettings.shortcuts.copyFinal),
+        goBack: normalizeShortcutValue(shortcuts.goBack, defaultAdvancedSettings.shortcuts.goBack),
+      },
     };
+  }
+
+  function normalizeShortcutValue(value, fallback = "") {
+    if (value == null) return fallback;
+    return String(value).trim();
   }
 
   function clampNumber(value, min, max, fallback) {
@@ -457,17 +575,45 @@
     return Math.min(max, Math.max(min, Math.round(number)));
   }
 
+  function normalizeIdentifier(value, prefix) {
+    const text = String(value || "").trim();
+    return /^[a-zA-Z0-9_-]{1,128}$/.test(text) ? text : uid(prefix);
+  }
+
+  function normalizeReferenceIdentifier(value) {
+    const text = String(value || "").trim();
+    return /^[a-zA-Z0-9_-]{1,128}$/.test(text) ? text : "";
+  }
+
+  function safeImageSource(value) {
+    const source = String(value || "").trim();
+    if (/^\/uploads\/[a-zA-Z0-9._-]+$/.test(source)) return source;
+    if (/^blob:/i.test(source)) return source;
+    if (/^data:image\/(?:png|jpe?g|webp|gif|svg\+xml)(?:;charset=[^;,]+)?(?:;base64)?,/i.test(source)) return source;
+    return "";
+  }
+
+  function normalizeImageAsset(asset) {
+    if (!asset || typeof asset !== "object") return null;
+    return { ...asset, dataUrl: safeImageSource(asset.dataUrl) };
+  }
+
   function normalizeItem(item) {
     return {
       ...item,
+      id: normalizeIdentifier(item?.id, "img"),
+      categoryId: normalizeReferenceIdentifier(item?.categoryId),
+      imageUrl: safeImageSource(item?.imageUrl),
+      thumbnailUrl: safeImageSource(item?.thumbnailUrl),
+      promptJson: item?.promptJson ? normalizeAnalysisPrompt(item.promptJson) : null,
       customInstruction: item.customInstruction || "",
       excludeOptions: Array.isArray(item.excludeOptions) ? item.excludeOptions : defaultExcludedKeys(),
       includeOptions: Array.isArray(item.includeOptions) ? item.includeOptions : [],
       analysisRequest: item.analysisRequest || "",
-      displayImage: item.displayImage || null,
-      thumbnailImage: item.thumbnailImage || null,
-      analysisImage: item.analysisImage || null,
-      originalImage: item.originalImage || null,
+      displayImage: normalizeImageAsset(item.displayImage),
+      thumbnailImage: normalizeImageAsset(item.thumbnailImage),
+      analysisImage: normalizeImageAsset(item.analysisImage),
+      originalImage: normalizeImageAsset(item.originalImage),
       uploadMeta: item.uploadMeta || null,
       titleSummary: item.titleSummary || "",
       outfitTags: Array.isArray(item.outfitTags) ? item.outfitTags : [],
@@ -476,6 +622,11 @@
       createdAt: item.createdAt || Date.now(),
       updatedAt: item.updatedAt || Date.now(),
       versions: Array.isArray(item.versions) ? item.versions : [],
+      promptBaselineSource: item.promptBaselineSource || "",
+      promptBaselineFingerprint: item.promptBaselineFingerprint || "",
+      promptBaselineJson: item.promptBaselineJson || null,
+      promptEditAction: item.promptEditAction || "",
+      promptEditState: item.promptEditState || "",
     };
   }
 
@@ -528,12 +679,109 @@
     ];
   }
 
+  function persistenceLabel(status = persistenceStatus) {
+    const labels = {
+      connecting: "연결 확인 중",
+      saving: "저장 중",
+      server: "서버 저장",
+      fallback: "브라우저 임시 저장",
+      error: "저장 실패",
+    };
+    return labels[status] || labels.connecting;
+  }
+
+  function setPersistenceStatus(status, message = "") {
+    persistenceStatus = status;
+    persistenceMessage = message || persistenceLabel(status);
+    const node = document.querySelector("[data-persistence-status]");
+    if (!node) return;
+    node.dataset.status = status;
+    node.className = `persistence-status persistence-${status}`;
+    node.disabled = !["fallback", "error"].includes(status);
+    node.setAttribute("aria-label", `${persistenceLabel(status)}. ${persistenceMessage}${node.disabled ? "" : ". 눌러서 서버 연결 재시도"}`);
+    node.setAttribute("data-tooltip", persistenceMessage);
+    const label = node.querySelector("[data-persistence-label]");
+    if (label) label.textContent = persistenceLabel(status);
+  }
+
+  function markSaving() {
+    setPersistenceStatus("saving", "변경 사항을 서버에 저장하는 중입니다.");
+  }
+
+  function markServerSaved() {
+    fallbackNoticeShown = false;
+    setPersistenceStatus("server", "변경 사항이 서버 파일에 저장되었습니다.");
+  }
+
+  function persistBrowserFallback(error) {
+    serverAvailable = false;
+    try {
+      restoredFallbackAt = Date.now();
+      changedBeforeServerBoot = true;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...serializableState(), __fallbackSavedAt: restoredFallbackAt }));
+      setPersistenceStatus("fallback", "서버 연결이 끊겨 이 브라우저에 임시 저장했습니다. 눌러서 다시 연결할 수 있습니다.");
+      if (!fallbackNoticeShown) {
+        fallbackNoticeShown = true;
+        showToast("서버 연결이 끊겨 브라우저에 임시 저장했습니다. 상단 저장 상태에서 다시 연결할 수 있습니다.", "warning", 3600);
+      }
+      return true;
+    } catch (storageError) {
+      console.error("Browser fallback save failed", storageError, error);
+      setPersistenceStatus("error", "서버와 브라우저 임시 저장이 모두 실패했습니다. 페이지를 닫지 말고 서버를 확인하세요.");
+      showToast("저장에 실패했습니다. 페이지를 닫지 말고 서버 연결과 브라우저 저장 공간을 확인하세요.", "warning", 4800);
+      return false;
+    }
+  }
+
+  async function retryServerConnection() {
+    setPersistenceStatus("connecting", "서버에 다시 연결하는 중입니다.");
+    try {
+      const response = await fetch(SERVER_STATE_ENDPOINT, { cache: "no-store" });
+      if (!response.ok) throw new Error("Server reconnect failed");
+      serverAvailable = true;
+      const payload = await response.json();
+      if (initialLoadBlocked) {
+        initialLoadBlocked = false;
+        serverBootComplete = true;
+        if (payload?.state) applyServerPayload(payload);
+        else if (!await syncStateToServer()) {
+          render();
+          return;
+        }
+        markServerSaved();
+        render();
+        showToast("서버 연결을 복구하고 데이터를 불러왔습니다.", "success");
+        return;
+      }
+      if (payload?.state && changedBeforeServerBoot) {
+        const serverUpdatedAt = Number(payload.updatedAt || 0);
+        const localIsNewer = restoredFallbackAt > serverUpdatedAt;
+        if (!localIsNewer) {
+          const keepLocal = restoredFallbackAt > 0 && confirm("서버 데이터가 브라우저 임시본보다 새롭습니다.\n\n확인: 브라우저 임시본으로 서버를 덮어쓰기\n취소: 최신 서버 데이터 불러오기");
+          if (!keepLocal) {
+            applyServerPayload(payload);
+            markServerSaved();
+            render();
+            showToast("더 최신인 서버 데이터를 불러왔습니다.", "success");
+            return;
+          }
+        }
+      }
+      const saved = await syncStateToServer();
+      if (!saved) return;
+      showToast("서버 연결과 저장을 복구했습니다.", "success");
+    } catch (error) {
+      persistBrowserFallback(error);
+    }
+  }
+
   function saveState() {
     if (!serverBootComplete) changedBeforeServerBoot = true;
     if (!serverAvailable) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      return;
+      persistBrowserFallback();
+      return false;
     }
+    markSaving();
     clearTimeout(saveTimer);
     saveTimer = setTimeout(syncStateToServer, 180);
   }
@@ -541,24 +789,44 @@
   async function bootServerState() {
     try {
       const response = await fetch(SERVER_STATE_ENDPOINT, { cache: "no-store" });
-      if (!response.ok) return;
+      if (!response.ok) throw new Error("Server boot failed");
       serverAvailable = true;
       const payload = await response.json();
-      if (payload?.state && !changedBeforeServerBoot) {
-        Object.assign(state, normalizeState(payload.state));
-        localStorage.removeItem(STORAGE_KEY);
-        localStorage.removeItem(LEGACY_STORAGE_KEY);
+      const serverUpdatedAt = Number(payload.updatedAt || 0);
+      const localFallbackIsNewer = changedBeforeServerBoot && restoredFallbackAt > serverUpdatedAt;
+      if (payload?.state && !localFallbackIsNewer) {
+        applyServerPayload(payload);
       } else {
-        await syncStateToServer();
+        const saved = await syncStateToServer();
+        if (!saved) {
+          serverBootComplete = true;
+          render();
+          return;
+        }
       }
       serverBootComplete = true;
-      const activeElement = document.activeElement;
-      const userIsEditing = activeElement?.matches?.("input, textarea, select, button");
-      if (!changedBeforeServerBoot && !userIsEditing && !ui.modal) render();
+      markServerSaved();
+      render();
     } catch (error) {
-      serverAvailable = false;
       serverBootComplete = true;
+      serverAvailable = false;
+      if (changedBeforeServerBoot) {
+        setPersistenceStatus("fallback", "서버에 연결할 수 없어 기존 브라우저 임시본을 열었습니다.");
+        render();
+      } else {
+        initialLoadBlocked = true;
+        setPersistenceStatus("error", "서버 데이터를 불러오지 못했습니다. 연결을 복구하기 전에는 편집을 시작하지 않습니다.");
+        render();
+      }
     }
+  }
+
+  function applyServerPayload(payload) {
+    Object.assign(state, normalizeState(payload.state));
+    changedBeforeServerBoot = false;
+    restoredFallbackAt = 0;
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
   }
 
   function normalizeCategories(categories) {
@@ -569,7 +837,7 @@
     const source = Array.isArray(categories) && categories.length ? categories : defaults.map((category) => ({ id: uid("cat"), ...category }));
     return source.map((category, index) => ({
       ...category,
-      id: category.id || uid("cat"),
+      id: normalizeIdentifier(category.id, "cat"),
       name: repairText(category.name, defaults[index]?.name || "미분류"),
       color: category.color || defaults[index]?.color || "blue",
     }));
@@ -596,15 +864,19 @@
       const response = await fetch(SERVER_STATE_ENDPOINT, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ state }),
+        body: JSON.stringify({ state: serializableState() }),
       });
       if (!response.ok) throw new Error("Server state save failed");
       await response.json();
       localStorage.removeItem(STORAGE_KEY);
       localStorage.removeItem(LEGACY_STORAGE_KEY);
+      changedBeforeServerBoot = false;
+      restoredFallbackAt = 0;
+      markServerSaved();
+      return true;
     } catch (error) {
-      serverAvailable = false;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback(error);
+      return false;
     }
   }
 
@@ -634,9 +906,10 @@
   function saveSettingsState() {
     if (!serverBootComplete) changedBeforeServerBoot = true;
     if (!serverAvailable) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      return;
+      persistBrowserFallback();
+      return false;
     }
+    markSaving();
     clearTimeout(settingsSaveTimer);
     settingsSaveTimer = setTimeout(syncSettingsToServer, 180);
   }
@@ -650,11 +923,10 @@
       });
       if (!response.ok) throw new Error("Settings save failed");
       await response.json();
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return await syncStateToServer();
     } catch (error) {
-      serverAvailable = false;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback(error);
+      return false;
     }
   }
 
@@ -664,14 +936,18 @@
       provider.enabled = providerIsActive(provider);
     });
     if (!serverAvailable) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      clearPendingProviderDrafts();
+      persistBrowserFallback();
+      showToast("API 비밀키는 브라우저에 저장하지 않습니다. 서버 연결 후 다시 입력해 주세요.", "warning", 4200);
       return;
     }
+    markSaving();
     clearTimeout(providerSaveTimer);
     providerSaveTimer = setTimeout(syncProvidersToServer, 180);
   }
 
   async function syncProvidersToServer() {
+    clearTimeout(providerSaveTimer);
     try {
       const response = await fetch(SERVER_PROVIDERS_ENDPOINT, {
         method: "PUT",
@@ -679,21 +955,34 @@
         body: JSON.stringify({ providers: state.providers }),
       });
       if (!response.ok) throw new Error("Provider save failed");
-      await response.json();
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      const payload = await response.json();
+      const serverProviders = new Map((payload.providers || []).map((provider) => [provider.name, provider]));
+      state.providers.forEach((provider) => {
+        const saved = serverProviders.get(provider.name);
+        if (saved) {
+          provider.hasServerKey = Boolean(saved.hasServerKey);
+          provider.keyCount = Number(saved.keyCount || 0);
+          provider.currentKeyIndex = Number(saved.currentKeyIndex || 0);
+        }
+        delete provider._pendingKey;
+        delete provider._pendingKeys;
+      });
+      return await syncStateToServer();
     } catch (error) {
-      serverAvailable = false;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      clearPendingProviderDrafts();
+      persistBrowserFallback(error);
+      showToast("API 비밀키는 브라우저에 저장하지 않았습니다. 서버 연결 후 다시 입력해 주세요.", "warning", 4200);
+      return false;
     }
   }
 
   function saveTagsState() {
     if (!serverBootComplete) changedBeforeServerBoot = true;
     if (!serverAvailable) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback();
       return;
     }
+    markSaving();
     clearTimeout(tagsSaveTimer);
     tagsSaveTimer = setTimeout(syncTagsToServer, 180);
   }
@@ -707,20 +996,20 @@
       });
       if (!response.ok) throw new Error("Tags save failed");
       await response.json();
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return await syncStateToServer();
     } catch (error) {
-      serverAvailable = false;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback(error);
+      return false;
     }
   }
 
   function saveItemsState() {
     if (!serverBootComplete) changedBeforeServerBoot = true;
     if (!serverAvailable) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback();
       return;
     }
+    markSaving();
     clearTimeout(itemsSaveTimer);
     itemsSaveTimer = setTimeout(syncItemsToServer, 180);
   }
@@ -734,21 +1023,21 @@
       });
       if (!response.ok) throw new Error("Items save failed");
       await response.json();
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return await syncStateToServer();
     } catch (error) {
-      serverAvailable = false;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback(error);
+      return false;
     }
   }
 
   async function saveItemState(item) {
-    if (!item) return;
+    if (!item) return false;
     if (!serverBootComplete) changedBeforeServerBoot = true;
     if (!serverAvailable) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      return;
+      persistBrowserFallback();
+      return false;
     }
+    markSaving();
     try {
       const response = await fetch(`${SERVER_ITEMS_ENDPOINT}/${encodeURIComponent(item.id)}`, {
         method: "PUT",
@@ -757,30 +1046,47 @@
       });
       if (!response.ok) throw new Error("Item save failed");
       await response.json();
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return await syncStateToServer();
     } catch (error) {
-      serverAvailable = false;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback(error);
+      return false;
     }
   }
 
   async function deleteItemState(id) {
     if (!serverBootComplete) changedBeforeServerBoot = true;
     if (!serverAvailable) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      return;
+      persistBrowserFallback();
+      return false;
     }
+    markSaving();
     try {
       const response = await fetch(`${SERVER_ITEMS_ENDPOINT}/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!response.ok) throw new Error("Item delete failed");
       await response.json();
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      return await syncStateToServer();
     } catch (error) {
-      serverAvailable = false;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      persistBrowserFallback(error);
+      return false;
     }
+  }
+
+  function sanitizedProviders() {
+    return state.providers.map((provider) => {
+      const { _pendingKey, _pendingKeys, ...publicProvider } = provider;
+      return publicProvider;
+    });
+  }
+
+  function clearPendingProviderDrafts() {
+    state.providers.forEach((provider) => {
+      delete provider._pendingKey;
+      delete provider._pendingKeys;
+    });
+  }
+
+  function serializableState() {
+    return { ...state, providers: sanitizedProviders() };
   }
 
   function uid(prefix) {
@@ -793,22 +1099,18 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
+      .replace(/'/g, "&#39;");
   }
 
   function app() {
     return document.getElementById("app");
   }
 
-  function isLoggedIn() {
-    return true;
-  }
-
   function render() {
     document.documentElement.dataset.theme = state.theme;
     applyThemeOptions();
-    if (!isLoggedIn()) {
-      renderLogin();
+    if (!serverBootComplete || initialLoadBlocked) {
+      renderConnectionGate();
       return;
     }
     app().innerHTML = `
@@ -818,75 +1120,117 @@
           <section class="content">${renderView()}</section>
         </main>
         ${renderModal()}
+        ${renderConverterMiniProgress()}
+        ${renderLoraSorterMiniProgress()}
       </div>
     `;
     bindCommonEvents();
     bindViewEvents();
+    applyPostRenderFocus();
   }
 
-  function renderLogin() {
+  function renderConnectionGate() {
+    const blocked = initialLoadBlocked;
     app().innerHTML = `
-      <main class="login-screen">
-        <form class="panel login-card" id="loginForm">
-          <div class="brand">
-            <div>
-              <h1>프롬프트 아카이브</h1>
-              <p>관리자 작업 화면으로 들어갑니다.</p>
-            </div>
-          </div>
-          <div class="field">
-            <label for="adminPassword">관리자 비밀번호</label>
-            <input type="text" autocomplete="username" value="local-admin" hidden>
-            <input class="input" id="adminPassword" type="password" autocomplete="current-password" placeholder="archive-admin">
-          </div>
-          <p class="notice">로컬 MVP 비밀번호는 <strong>archive-admin</strong>입니다. 실제 배포에서는 서버 인증으로 교체해야 합니다.</p>
-          <button class="primary-btn" type="submit">로그인</button>
-        </form>
+      <main class="connection-gate" aria-live="polite">
+        <section class="panel connection-card">
+          <span class="brand-mark connection-mark" aria-hidden="true">${brandMarkSvg()}</span>
+          <div class="connection-spinner" aria-hidden="true"></div>
+          <h1>${blocked ? "서버 연결이 필요합니다" : "아카이브를 안전하게 불러오는 중입니다"}</h1>
+          <p>${blocked ? "기존 데이터를 보호하기 위해 연결이 복구될 때까지 편집을 잠시 멈췄습니다." : "서버와 브라우저 임시본의 수정 시각을 확인하고 있습니다."}</p>
+          ${blocked ? '<button class="primary-btn" data-retry-initial-load type="button">다시 연결</button>' : ""}
+        </section>
       </main>
     `;
-    document.getElementById("loginForm").addEventListener("submit", (event) => {
-      event.preventDefault();
-      if (document.getElementById("adminPassword").value === "archive-admin") {
-        sessionStorage.setItem(SESSION_KEY, "true");
-        render();
-      } else {
-        alert("비밀번호가 맞지 않습니다.");
-      }
-    });
+    document.querySelector("[data-retry-initial-load]")?.addEventListener("click", retryServerConnection);
   }
 
   function renderTopbar() {
+    const modeLabel = isExifPromptMode() ? "EXIF 모드" : "API 분석 모드";
     return `
-      <header class="topbar album-topbar">
-        <button class="brand-inline" data-view="gallery" type="button" aria-label="갤러리로 이동">
-          <span>프롬프트 아카이브</span>
-        </button>
+      <header class="topbar album-topbar" aria-label="앱 도구 모음">
+        <div class="topbar-left">
+          <button class="brand-inline" data-view="gallery" type="button" aria-label="갤러리로 이동">
+            <span class="brand-mark" aria-hidden="true">${brandMarkSvg()}</span>
+            <span class="brand-copy">
+              <strong>프롬프트 아카이브</strong>
+              <small>이미지와 프롬프트</small>
+            </span>
+          </button>
+          <span class="mode-chip ${isExifPromptMode() ? "mode-exif" : "mode-api"}" title="현재 업로드 처리 방식">
+            ${modeLabel}
+          </span>
+        </div>
         <div class="topbar-center">
-          <div class="search-wrap compact-search">
-            <label class="sr-only" for="globalSearch">검색</label>
-            <input class="input" id="globalSearch" value="${escapeHtml(ui.query)}" placeholder="제목, 프롬프트 내용 검색">
+          <div class="topbar-center-cluster" role="search" aria-label="아카이브 검색">
+            <div class="search-wrap compact-search">
+              <span class="search-icon" aria-hidden="true">${navIcon("search")}</span>
+              <label class="sr-only" for="globalSearch">제목, 태그, 프롬프트 검색</label>
+              <input class="input search-input" id="globalSearch" type="search" value="${escapeHtml(ui.query)}" placeholder="제목, 태그, 프롬프트 검색" autocomplete="off">
+              <button class="search-clear-btn" data-action="clearSearch" type="button" aria-label="검색어 지우기" ${ui.query ? "" : "hidden disabled"}>×</button>
+            </div>
           </div>
-          <select class="select compact-select" id="sortSelect">
-            <option value="latest" ${ui.sort === "latest" ? "selected" : ""}>최신순</option>
-            <option value="oldest" ${ui.sort === "oldest" ? "selected" : ""}>오래된순</option>
-            <option value="favorite" ${ui.sort === "favorite" ? "selected" : ""}>즐겨찾기순</option>
-            <option value="failed" ${ui.sort === "failed" ? "selected" : ""}>분석 실패순</option>
-            <option value="modified" ${ui.sort === "modified" ? "selected" : ""}>수정일순</option>
-          </select>
         </div>
         <div class="topbar-actions">
-          ${iconButton("upload", "업로드", "+")}
-          ${iconButton("searchFocus", "검색", "⌕")}
-          ${iconButton("toggleFilterGroup", "필터", "⌘")}
-          ${iconButton("cycleTheme", "테마", "◐")}
-          ${iconButton("settings", "설정", "⚙")}
+          ${renderPersistenceStatus()}
+          ${iconButton("upload", "업로드", "upload", "primary-icon")}
+          ${iconButton("cycleTheme", "테마", "theme")}
+          <button class="converter-launch-btn" data-action="converter" type="button" aria-label="PNG를 WebP로 변환">
+            <span aria-hidden="true">${navIcon("convert")}</span>
+            <span>변환</span>
+          </button>
+          <button class="converter-launch-btn lora-sorter-launch-btn" data-action="loraSorter" type="button" aria-label="활성 LoRA별 이미지 분류">
+            <span aria-hidden="true">${navIcon("layers")}</span>
+            <span>LoRA 분류</span>
+          </button>
+          ${iconButton("settings", "설정", "settings")}
         </div>
       </header>
     `;
   }
 
-  function iconButton(action, label, icon) {
-    return `<button class="icon-btn" data-action="${action}" type="button" aria-label="${label}" data-tooltip="${label}">${icon}</button>`;
+  function brandMarkSvg() {
+    return `<svg viewBox="0 0 32 32" width="28" height="28" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="2" y="2" width="28" height="28" rx="9" fill="url(#brandGrad)"/><path d="M9 11.5h6.2v9H9V11.5zm8.3 0H23v4.1h-5.7V11.5zm0 6.2H23V20.5h-5.7v-2.8z" fill="#fff" fill-opacity=".95"/><defs><linearGradient id="brandGrad" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop stop-color="#2563eb"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs></svg>`;
+  }
+
+  function navIcon(name) {
+    const icons = {
+      gallery: `<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><rect x="2.5" y="2.5" width="6.5" height="6.5" rx="1.5" fill="currentColor"/><rect x="11" y="2.5" width="6.5" height="6.5" rx="1.5" fill="currentColor" opacity=".7"/><rect x="2.5" y="11" width="6.5" height="6.5" rx="1.5" fill="currentColor" opacity=".7"/><rect x="11" y="11" width="6.5" height="6.5" rx="1.5" fill="currentColor" opacity=".45"/></svg>`,
+      search: `<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="9" cy="9" r="5.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M13.2 13.2L17 17" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>`,
+      upload: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 13.5V4.8M10 4.8L6.8 8M10 4.8L13.2 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 14.5v1.2A1.8 1.8 0 0 0 5.8 17.5h8.4a1.8 1.8 0 0 0 1.8-1.8v-1.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>`,
+      trash: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M4.5 6h11M8 6V4.8A1.3 1.3 0 0 1 9.3 3.5h1.4A1.3 1.3 0 0 1 12 4.8V6m2.2 0v9.2a1.3 1.3 0 0 1-1.3 1.3H7.1a1.3 1.3 0 0 1-1.3-1.3V6h8.4z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+      tag: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M3.5 10.8V4.8A1.3 1.3 0 0 1 4.8 3.5h6l5.7 5.7a1.3 1.3 0 0 1 0 1.8l-4.5 4.5a1.3 1.3 0 0 1-1.8 0L3.5 10.8z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/><circle cx="7.2" cy="7.2" r="1.1" fill="currentColor"/></svg>`,
+      theme: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 3a7 7 0 1 0 7 7 5.2 5.2 0 0 1-7-7z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/></svg>`,
+      convert: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M5.2 6.3A6.2 6.2 0 0 1 15.8 8M14.8 13.7A6.2 6.2 0 0 1 4.2 12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M15.8 4.8V8h-3.2M4.2 15.2V12h3.2" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+      layers: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 3 17 6.8 10 10.5 3 6.8 10 3Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="m4.1 10.2 5.9 3.1 5.9-3.1M4.1 13.5l5.9 3.1 5.9-3.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+      settings: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="10" cy="10" r="2.4" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M10 3.2v1.6M10 15.2v1.6M3.2 10h1.6M15.2 10h1.6M5.2 5.2l1.1 1.1M13.7 13.7l1.1 1.1M14.8 5.2l-1.1 1.1M6.3 13.7l-1.1 1.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`,
+    };
+    return icons[name] || "";
+  }
+
+  function iconButton(action, label, icon, extraClass = "") {
+    const glyph = navIcon(icon) || escapeHtml(String(icon || ""));
+    return `<button class="icon-btn ${extraClass}" data-action="${action}" type="button" aria-label="${label}" data-tooltip="${label}"><span class="icon-btn-glyph">${glyph}</span></button>`;
+  }
+
+  function renderPersistenceStatus() {
+    const retryable = ["fallback", "error"].includes(persistenceStatus);
+    const label = persistenceLabel();
+    const icon = persistenceStatus === "saving" || persistenceStatus === "connecting" ? "↻" : persistenceStatus === "server" ? "✓" : "!";
+    return `
+      <button class="persistence-status persistence-${persistenceStatus}"
+              data-action="retryServer"
+              data-persistence-status
+              data-status="${persistenceStatus}"
+              type="button"
+              aria-live="polite"
+              aria-label="${escapeHtml(`${label}. ${persistenceMessage}${retryable ? ". 눌러서 서버 연결 재시도" : ""}`)}"
+              data-tooltip="${escapeHtml(persistenceMessage)}"
+              ${retryable ? "" : "disabled"}>
+        <span class="persistence-icon" aria-hidden="true">${icon}</span>
+        <span data-persistence-label>${label}</span>
+      </button>
+    `;
   }
 
   function renderView() {
@@ -894,15 +1238,191 @@
     return renderGallery();
   }
 
+  function scheduleSearchRefresh(options = {}) {
+    clearTimeout(searchRefreshTimer);
+    const run = () => {
+      searchRefreshTimer = null;
+      refreshGalleryWithoutTopbar();
+    };
+    if (options.immediate) run();
+    else searchRefreshTimer = setTimeout(run, 80);
+  }
+
+  function refreshGalleryWithoutTopbar(options = {}) {
+    // Update only main content so the search input keeps IME composition state.
+    if (ui.modal) return;
+    if (ui.view !== "gallery") ui.view = "gallery";
+    if (options.reset !== false) resetGalleryWindow();
+    const content = document.querySelector("main > .content");
+    if (!content) {
+      render();
+      return;
+    }
+    content.innerHTML = renderGallery();
+    bindGalleryContentEvents();
+  }
+
+  function bindGalleryContentEvents() {
+    bindImageErrorEvents(document.querySelector("main > .content"));
+    bindGallerySelectEvents();
+    document.querySelectorAll("[data-filter-group]").forEach((node) => {
+      node.addEventListener("click", () => {
+        ui.filterGroup = node.dataset.filterGroup;
+        resetGalleryWindow();
+        refreshGalleryWithoutTopbar();
+      });
+    });
+    document.querySelectorAll("[data-category-filter]").forEach((node) => {
+      node.addEventListener("click", () => {
+        ui.category = node.dataset.categoryFilter;
+        resetGalleryWindow();
+        refreshGalleryWithoutTopbar();
+      });
+    });
+    document.querySelectorAll("[data-tag-filter]").forEach((node) => {
+      node.addEventListener("click", () => {
+        const target = node.dataset.tagFilter === "outfit" ? ui.selectedOutfitTags : ui.selectedBackgroundTags;
+        const key = node.dataset.key;
+        const index = target.indexOf(key);
+        if (index >= 0) target.splice(index, 1);
+        else target.push(key);
+        resetGalleryWindow();
+        refreshGalleryWithoutTopbar();
+      });
+    });
+    document.querySelectorAll("[data-page]").forEach((node) => {
+      node.addEventListener("click", () => {
+        const pageCount = Math.max(1, Math.ceil(getFilteredItems().length / (state.albumSettings.columns * state.albumSettings.rows)));
+        const command = node.dataset.page;
+        if (command === "first") ui.page = 1;
+        else if (command === "prev") ui.page = Math.max(1, ui.page - 1);
+        else if (command === "next") ui.page = Math.min(pageCount, ui.page + 1);
+        else if (command === "last") ui.page = pageCount;
+        else ui.page = Number(command);
+        refreshGalleryWithoutTopbar({ reset: false });
+      });
+    });
+    document.querySelectorAll("[data-open-item]").forEach((node) => {
+      node.addEventListener("click", (event) => {
+        if (event.target.closest("button, input, label, .bulk-delete-check")) return;
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
+        if (ui.bulkCategoryMode) {
+          toggleBulkCategoryItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
+        openItem(node.dataset.openItem);
+      });
+      node.addEventListener("keydown", (event) => {
+        if (event.target !== node) return;
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
+        if (ui.bulkCategoryMode) {
+          toggleBulkCategoryItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
+        openItem(node.dataset.openItem);
+      });
+    });
+    document.querySelectorAll("[data-action]").forEach((node) => {
+      // Only bind actions inside content to avoid double-binding topbar actions.
+      if (node.closest("header.topbar")) return;
+      node.addEventListener("click", (event) => handleAction(event, node));
+    });
+    bindGalleryInfiniteScroll();
+  }
+
+  function bindGallerySelectEvents() {
+    const controls = [
+      ["sortSelect", "sort"],
+      ["statusFilterSelect", "status"],
+      ["originFilterSelect", "originFilter"],
+    ];
+    controls.forEach(([id, key]) => {
+      const control = document.getElementById(id);
+      if (!control) return;
+      control.addEventListener("change", (event) => {
+        ui[key] = event.target.value;
+        resetGalleryWindow();
+        refreshGalleryWithoutTopbar();
+      });
+    });
+  }
+
+  function openModal(action) {
+    modalReturnAction = action;
+    ui.modal = action;
+    if (action === "settings") ui.settingsTab = "api";
+    postRenderFocusSelector = "[data-modal-panel]";
+    render();
+  }
+
+  function closeModal() {
+    const returnAction = modalReturnAction;
+    modalBackdropPointerDown = false;
+    ui.modal = null;
+    postRenderFocusSelector = returnAction ? `[data-action="${returnAction}"]` : "";
+    modalReturnAction = "";
+    render();
+  }
+
+  function applyPostRenderFocus() {
+    let target = postRenderFocusSelector ? document.querySelector(postRenderFocusSelector) : null;
+    postRenderFocusSelector = "";
+    if (!target && ui.modal) target = document.querySelector("[data-modal-panel]");
+    if (target?.focus) target.focus({ preventScroll: true });
+  }
+
+  function trapModalFocus(event) {
+    const panel = document.querySelector("[data-modal-panel]");
+    if (!panel) return;
+    const focusable = [...panel.querySelectorAll('button:not([disabled]), input:not([disabled]):not([type="hidden"]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')]
+      .filter((node) => !node.hidden && node.getClientRects().length > 0);
+    if (!focusable.length) {
+      event.preventDefault();
+      panel.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const activeInsidePanel = panel.contains(document.activeElement);
+    if (event.shiftKey && (!activeInsidePanel || document.activeElement === panel || document.activeElement === first)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (!activeInsidePanel || document.activeElement === last)) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   function renderModal() {
     if (!ui.modal) return "";
-    const title = ui.modal === "upload" ? "업로드" : "설정";
-    const body = ui.modal === "upload" ? renderUpload() : renderSettings();
+    const title = ui.modal === "upload"
+      ? "업로드"
+      : ui.modal === "converter"
+        ? "PNG → WebP 변환"
+        : ui.modal === "loraSorter" ? "LoRA별 이미지 분류" : "설정";
+    const body = ui.modal === "upload"
+      ? renderUpload()
+      : ui.modal === "converter"
+        ? renderImageConverter()
+        : ui.modal === "loraSorter" ? renderLoraSorter() : renderSettings();
+    const titleId = `modal-title-${ui.modal}`;
     return `
       <div class="modal-backdrop" data-action="closeModal">
-        <section class="modal-panel" role="dialog" aria-modal="true" aria-label="${title}" data-modal-panel>
+        <section class="modal-panel ${ui.modal === "converter" ? "converter-modal-panel" : ui.modal === "loraSorter" ? "lora-sorter-modal-panel" : ""}" role="dialog" aria-modal="true" aria-labelledby="${titleId}" tabindex="-1" data-modal-panel>
           <div class="modal-head">
-            <strong>${title}</strong>
+            <strong id="${titleId}">${title}</strong>
             <button class="icon-btn" data-action="closeModal" type="button" aria-label="닫기" data-tooltip="닫기">×</button>
           </div>
           <div class="modal-body">${body}</div>
@@ -911,45 +1431,584 @@
     `;
   }
 
-  function getFilteredItems() {
-    const query = ui.query.trim().toLowerCase();
+  function normalizeSearchText(value) {
+    return String(value || "")
+      .normalize("NFC")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function itemSearchBlob(item) {
+    return normalizeSearchText([
+      displayTitle(item),
+      item.title,
+      item.titleSummary,
+      item.memo,
+      item.customInstruction,
+      item.tags?.join(" "),
+      tagNames(item.outfitTags, "outfit").join(" "),
+      tagNames(item.backgroundTags, "background").join(" "),
+      promptText(item, "both"),
+      promptText(item, "final"),
+    ].filter(Boolean).join(" "));
+  }
+
+  function getFilteredItems(options = {}) {
+    const query = normalizeSearchText(ui.query);
     let items = [...state.items];
     if (ui.status !== "all") items = items.filter((item) => item.status === ui.status);
     if (ui.category !== "all") items = items.filter((item) => item.categoryId === ui.category);
     if (ui.selectedOutfitTags.length) items = items.filter((item) => ui.selectedOutfitTags.every((tag) => (item.outfitTags || []).includes(tag)));
     if (ui.selectedBackgroundTags.length) items = items.filter((item) => ui.selectedBackgroundTags.every((tag) => (item.backgroundTags || []).includes(tag)));
     if (query) {
-      items = items.filter((item) => {
-        const prompt = promptText(item, "both").toLowerCase();
-        return [displayTitle(item), item.memo, item.customInstruction, item.tags.join(" "), tagNames(item.outfitTags, "outfit").join(" "), tagNames(item.backgroundTags, "background").join(" "), prompt].join(" ").toLowerCase().includes(query);
-      });
+      items = items.filter((item) => itemSearchBlob(item).includes(query));
     }
+    if (ui.favoriteOnly) items = items.filter((item) => item.isFavorite);
+    if (ui.originFilter === "original") items = items.filter((item) => {
+      ensurePromptBaseline(item);
+      syncPromptEditState(item);
+      return item.promptEditState === "original";
+    });
+    if (ui.originFilter === "modified") items = items.filter((item) => {
+      ensurePromptBaseline(item);
+      syncPromptEditState(item);
+      return item.promptEditState === "modified";
+    });
+    if (ui.showDuplicatesOnly) {
+      const dupIds = options.duplicateIds || duplicateIndexForItems().duplicateIds;
+      items = items.filter((item) => dupIds.has(item.id));
+    }
+    if (ui.sort === "similarity") {
+      const rankByPromptSimilarity = window.PromptArchiveSimilarity?.rankByPromptSimilarity;
+      const corePromptSignature = window.PromptArchiveSimilarity?.corePromptSignature;
+      if (typeof rankByPromptSimilarity === "function" && typeof corePromptSignature === "function") {
+        const cacheKey = items.map((item) => `${item.id}:${corePromptSignature(item)}`).join("|");
+        if (gallerySimilarityCache.key === cacheKey) {
+          gallerySimilarityById = gallerySimilarityCache.matches;
+          return gallerySimilarityCache.rankedItems;
+        }
+        const ranked = rankByPromptSimilarity(
+          items,
+          (item) => item,
+          (item) => item.id,
+        );
+        gallerySimilarityById = new Map(ranked.map((entry) => [entry.item.id, {
+          score: entry.score,
+          matchId: entry.matchId,
+        }]));
+        const rankedItems = ranked.map((entry) => entry.item);
+        gallerySimilarityCache = { key: cacheKey, rankedItems, matches: gallerySimilarityById };
+        return rankedItems;
+      }
+    }
+    gallerySimilarityById = new Map();
     const sorters = {
       latest: (a, b) => b.createdAt - a.createdAt,
       oldest: (a, b) => a.createdAt - b.createdAt,
-      favorite: (a, b) => b.createdAt - a.createdAt,
+      favorite: (a, b) => Number(b.isFavorite) - Number(a.isFavorite) || b.updatedAt - a.updatedAt || b.createdAt - a.createdAt,
       failed: (a, b) => Number(b.status === "analysis_failed") - Number(a.status === "analysis_failed") || b.createdAt - a.createdAt,
       modified: (a, b) => b.updatedAt - a.updatedAt,
     };
     const sorter = sorters[ui.sort] || sorters.latest;
-    return items.sort((a, b) => Number(b.isFavorite) - Number(a.isFavorite) || sorter(a, b));
+    return items.sort(sorter);
+  }
+
+  function activeGalleryFilterCount() {
+    return [
+      Boolean(normalizeSearchText(ui.query)),
+      ui.category !== "all",
+      ui.status !== "all",
+      ui.originFilter !== "all",
+      ui.favoriteOnly,
+      ui.showDuplicatesOnly,
+      ...ui.selectedOutfitTags.map(() => true),
+      ...ui.selectedBackgroundTags.map(() => true),
+    ].filter(Boolean).length;
+  }
+
+  function resetGalleryFilters() {
+    ui.query = "";
+    ui.category = "all";
+    ui.status = "all";
+    ui.originFilter = "all";
+    ui.favoriteOnly = false;
+    ui.showDuplicatesOnly = false;
+    ui.selectedOutfitTags = [];
+    ui.selectedBackgroundTags = [];
+    ui.filterGroup = "all";
+    resetGalleryWindow();
   }
 
   function renderGallery() {
-    const items = getFilteredItems();
+    const duplicateIndex = duplicateIndexForItems();
+    const items = getFilteredItems({ duplicateIds: duplicateIndex.duplicateIds });
     const perPage = state.albumSettings.columns * state.albumSettings.rows;
+    const pageMode = state.albumSettings.loadMode === "pages";
+    const pageCount = Math.max(1, Math.ceil(items.length / perPage));
+    ui.page = Math.max(1, Math.min(pageCount, ui.page || 1));
     ui.galleryLoadedPages = Math.max(1, ui.galleryLoadedPages || 1);
     const visibleCount = ui.galleryLoadedPages * perPage;
-    const pageItems = items.slice(0, visibleCount);
-    const hasMore = visibleCount < items.length;
+    const pageItems = pageMode
+      ? items.slice((ui.page - 1) * perPage, ui.page * perPage)
+      : items.slice(0, visibleCount);
+    const hasMore = !pageMode && visibleCount < items.length;
+    const waitingCount = state.items.filter((item) => item.status === "uploaded" || item.status === "analysis_failed").length;
+    const paginationTop = pageMode && ["top", "both"].includes(state.albumSettings.paginationPosition) ? renderPagination(pageCount) : "";
+    const paginationBottom = pageMode && ["bottom", "both"].includes(state.albumSettings.paginationPosition) ? renderPagination(pageCount) : "";
     return `
-      ${renderAlbumFilters()}
-      <div class="album-action-row">
-        <button class="ghost-btn" data-action="bulkAnalyze" type="button">대기 항목 분석</button>
-        <button class="ghost-btn" data-action="exportJson" type="button">JSON 내보내기</button>
+      ${renderAlbumFilters(items.length)}
+      ${paginationTop}
+      <div class="album-action-row ${ui.bulkDeleteMode || ui.bulkCategoryMode ? "delete-mode" : ""}">
+        ${ui.bulkDeleteMode || ui.bulkCategoryMode ? renderBulkDeleteControls(pageItems) : ""}
+        <div class="album-action-buttons">
+          <button class="ghost-btn ${ui.bulkCategoryMode ? "active" : ""}" data-action="toggleBulkCategoryMode" type="button" aria-pressed="${ui.bulkCategoryMode}">${ui.bulkCategoryMode ? "분류 선택 닫기" : "일괄 분류"}</button>
+          <button class="ghost-btn ${ui.bulkDeleteMode ? "active-danger" : ""}" data-action="toggleBulkDeleteMode" type="button" aria-pressed="${ui.bulkDeleteMode}">${ui.bulkDeleteMode ? "삭제 선택 닫기" : "일괄 삭제"}</button>
+          <button class="ghost-btn" data-action="bulkAnalyze" type="button" ${isExifPromptMode() || !waitingCount ? "disabled" : ""}>대기 항목 분석${waitingCount ? ` ${waitingCount}` : ""}</button>
+          <button class="ghost-btn" data-action="exportJson" type="button">JSON 복사</button>
+        </div>
       </div>
-      ${pageItems.length ? `<div class="gallery-grid album-grid" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map(renderImageCard).join("")}</div>` : renderEmptyGallery()}
-      ${renderGalleryLoadMore(hasMore, pageItems.length, items.length)}
+      ${pageItems.length ? `<div class="gallery-grid album-grid ${ui.bulkDeleteMode || ui.bulkCategoryMode ? "bulk-delete-gallery" : ""}" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map((item) => renderImageCard(item, duplicateIndex.duplicateIds)).join("")}</div>` : renderEmptyGallery()}
+      ${pageMode ? paginationBottom : renderGalleryLoadMore(hasMore, pageItems.length, items.length)}
+    `;
+  }
+
+  function normalizeConverterHistory(value) {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((entry) => entry && typeof entry === "object")
+      .map((entry) => ({
+        id: String(entry.id || entry.finishedAt || Date.now()),
+        finishedAt: Number(entry.finishedAt || Date.now()),
+        destination: String(entry.destination || "저장 위치 정보 없음").slice(0, 120),
+        total: Math.max(0, Number(entry.total) || 0),
+        converted: Math.max(0, Number(entry.converted) || 0),
+        skipped: Math.max(0, Number(entry.skipped) || 0),
+        deleted: Math.max(0, Number(entry.deleted) || 0),
+        errors: Math.max(0, Number(entry.errors) || 0),
+      }))
+      .sort((left, right) => right.finishedAt - left.finishedAt)
+      .slice(0, 2);
+  }
+
+  function loadConverterHistory() {
+    try {
+      return normalizeConverterHistory(JSON.parse(localStorage.getItem(CONVERTER_HISTORY_KEY) || "[]"));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function saveConverterHistory() {
+    try {
+      localStorage.setItem(CONVERTER_HISTORY_KEY, JSON.stringify(converterState.history));
+    } catch (_) {
+      // Conversion remains usable even when browser storage is unavailable.
+    }
+  }
+
+  function addConverterHistory(result) {
+    const destination = converterState.destinationMode === "custom"
+      ? `지정 폴더 · ${converterState.destinationHandle?.name || "이름 없음"}`
+      : `원본 폴더 · ${converterState.sourceHandle?.name || "이름 없음"}`;
+    const finishedAt = Date.now();
+    converterState.history = normalizeConverterHistory([
+      {
+        id: String(finishedAt),
+        finishedAt,
+        destination,
+        total: result.total,
+        converted: result.converted,
+        skipped: result.skipped,
+        deleted: result.deleted,
+        errors: result.errors.length,
+      },
+      ...converterState.history,
+    ]);
+    saveConverterHistory();
+  }
+
+  function converterHistoryTime(value) {
+    return new Intl.DateTimeFormat("ko-KR", {
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(value));
+  }
+
+  function renderConverterHistory() {
+    const entries = converterState.history;
+    if (!entries.length) return `<p class="converter-history-empty">아직 완료된 변환 기록이 없습니다.</p>`;
+    return `
+      <div class="converter-history-list">
+        ${entries.map((entry) => {
+          const extras = [entry.deleted ? `원본 삭제 ${entry.deleted}` : "", entry.skipped ? `건너뜀 ${entry.skipped}` : "", entry.errors ? `오류 ${entry.errors}` : ""].filter(Boolean).join(" · ");
+          return `
+            <div class="converter-history-entry">
+              <span title="${escapeHtml(entry.destination)}">${escapeHtml(converterHistoryTime(entry.finishedAt))} · ${escapeHtml(entry.destination)}</span>
+              <strong>${entry.total}개 중 ${entry.converted}개 완료${extras ? ` · ${extras}` : ""}</strong>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  function renderWildcardSyncStatus() {
+    const result = converterState.wildcardSyncResult;
+    if (!result) {
+      return `<small class="converter-wildcard-status">처리 기록 이후 추가된 새 ID만 반영하며, 기존 줄과 같은 문장은 제외합니다.</small>`;
+    }
+    if (result.error) {
+      return `<small class="converter-wildcard-status error" role="status">${escapeHtml(result.error)}</small>`;
+    }
+    if (result.rebuilt) {
+      const notes = [
+        `외모 ${result.appearanceWritten}줄`,
+        `시나리오 ${result.scenarioWritten}줄`,
+        result.duplicatesSkipped ? `중복 ${result.duplicatesSkipped}줄 제외` : "",
+        result.invalidItems ? `확인 필요 ${result.invalidItems}개` : "",
+        result.refreshed ? "ComfyUI 새로고침 완료" : result.refreshMessage,
+      ].filter(Boolean).join(" · ");
+      return `<div class="converter-wildcard-status success" role="status"><strong>전체 갱신 완료 · 현재 ${result.validItems}개 항목</strong><small>${escapeHtml(notes)}</small></div>`;
+    }
+    const summary = result.initialized
+      ? `기준 등록 완료 · 현재 ${result.totalItems}개`
+      : `새 항목 ${result.newItems}개 · 외모 +${result.appearanceAdded} · 시나리오 +${result.scenarioAdded}`;
+    const notes = [
+      result.duplicatesSkipped ? `중복 ${result.duplicatesSkipped}줄 제외` : "",
+      result.invalidItems ? `확인 필요 ${result.invalidItems}개` : "",
+      result.refreshed ? "ComfyUI 새로고침 완료" : result.refreshMessage,
+    ].filter(Boolean).join(" · ");
+    return `<div class="converter-wildcard-status success" role="status"><strong>${escapeHtml(summary)}</strong>${notes ? `<small>${escapeHtml(notes)}</small>` : ""}</div>`;
+  }
+
+  function renderImageConverter() {
+    const supported = typeof window.showDirectoryPicker === "function"
+      && Boolean(window.PromptArchiveImageConverter?.preservePngMetadataInWebp)
+      && supportsWebP();
+    const fileCount = converterState.sourceFiles.length;
+    const disabled = converterState.running ? "disabled" : "";
+    const folderMode = converterState.sourceMode === "folder";
+    const selectedPreview = converterState.sourceFiles.slice(0, 3).map((entry) => entry.name);
+    return `
+      <div class="converter-shell">
+        <section class="converter-hero">
+          <div class="converter-hero-mark" aria-hidden="true">${navIcon("convert")}</div>
+          <div>
+            <p class="converter-kicker">LOCAL BATCH CONVERTER</p>
+            <h2>PNG → WebP · 메타데이터 유지</h2>
+            <p>ComfyUI <code>prompt</code>·<code>workflow</code>를 EXIF/XMP에 보존합니다.</p>
+          </div>
+          <span class="converter-secure-badge">로컬 처리</span>
+        </section>
+
+        ${supported ? "" : `<div class="converter-browser-warning" role="alert"><strong>현재 브라우저에서는 폴더 저장을 사용할 수 없습니다.</strong><span>Chrome 또는 Edge에서 이 앱을 열어주세요.</span></div>`}
+
+        <div class="converter-grid">
+          <section class="converter-card converter-source-card">
+            <div class="converter-source-heading">
+              <div class="converter-step-head"><span>01</span><div><strong>PNG 선택</strong><small>폴더 전체 또는 필요한 파일만 고르세요.</small></div></div>
+              <div class="converter-source-mode" role="radiogroup" aria-label="PNG 선택 방식">
+                <label class="converter-source-mode-btn ${folderMode ? "selected" : ""}"><input type="radio" name="converterSourceMode" value="folder" ${folderMode ? "checked" : ""} ${disabled}><span>폴더 선택</span></label>
+                <label class="converter-source-mode-btn ${!folderMode ? "selected" : ""}"><input type="radio" name="converterSourceMode" value="files" ${!folderMode ? "checked" : ""} ${disabled}><span>개별 파일</span></label>
+              </div>
+            </div>
+            <div class="converter-dropzone ${folderMode ? "folder-mode" : "file-mode"}" data-converter-dropzone>
+              <span class="converter-dropzone-icon" aria-hidden="true">${folderMode ? "▰" : "＋"}</span>
+              <div class="converter-dropzone-copy">
+                <strong>${folderMode
+                  ? converterState.sourceHandle ? escapeHtml(converterState.sourceHandle.name) : "PNG 폴더를 선택하세요"
+                  : fileCount ? `${fileCount}개 PNG 선택됨` : "PNG를 여기에 놓으세요"}</strong>
+                <small>${folderMode
+                  ? converterState.sourceHandle ? `PNG ${fileCount}개 발견` : "선택한 폴더는 브라우저에서만 처리됩니다."
+                  : fileCount ? escapeHtml(`${selectedPreview.join(" · ")}${fileCount > 3 ? ` 외 ${fileCount - 3}개` : ""}`) : "드래그하거나 파일 선택을 눌러 여러 장을 고를 수 있습니다."}</small>
+              </div>
+              ${folderMode
+                ? `<button class="ghost-btn" data-action="selectConverterSource" type="button" ${disabled || (!supported ? "disabled" : "")}>폴더 선택</button>`
+                : `<label class="ghost-btn converter-file-picker ${converterState.running ? "disabled" : ""}">파일 선택<input class="converter-file-input" id="converterFileInput" type="file" accept="image/png,.png" multiple ${disabled}></label>`}
+            </div>
+            <div class="converter-selection-footer">
+              ${folderMode ? `<label class="converter-check"><input id="converterIncludeSubfolders" type="checkbox" ${converterState.includeSubfolders ? "checked" : ""} ${disabled}><span>하위 폴더 검색 · 구조 유지</span></label>` : `<small>개별 파일은 지정 폴더에 저장됩니다.</small>`}
+              <div class="converter-selection-actions">
+                <label class="converter-delete-check ${converterState.deleteOriginals ? "active" : ""}" title="변환과 저장에 성공한 PNG만 복구할 수 없도록 영구 삭제합니다."><input id="converterDeleteOriginals" type="checkbox" ${converterState.deleteOriginals ? "checked" : ""} ${disabled || (!folderMode ? "disabled" : "")}><span>변환 후 원본 영구 삭제</span></label>
+                <button class="ghost-btn converter-reset-btn" data-action="resetConverterSelection" type="button" ${disabled || (!fileCount && !converterState.sourceHandle ? "disabled" : "")}>선택 비우기</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="converter-card converter-destination-card">
+            <div class="converter-step-head"><span>02</span><div><strong>저장 위치</strong><small>원본 옆 또는 별도 폴더에 저장합니다.</small></div></div>
+            <div class="converter-choice-grid" role="radiogroup" aria-label="저장 위치">
+              <label class="converter-choice ${converterState.destinationMode === "source" ? "selected" : ""}">
+                <input type="radio" name="converterDestinationMode" value="source" ${converterState.destinationMode === "source" ? "checked" : ""} ${disabled || (!folderMode ? "disabled" : "")}>
+                <span><strong>원본 폴더</strong><small>각 PNG와 같은 위치</small></span>
+              </label>
+              <label class="converter-choice ${converterState.destinationMode === "custom" ? "selected" : ""}">
+                <input type="radio" name="converterDestinationMode" value="custom" ${converterState.destinationMode === "custom" ? "checked" : ""} ${disabled}>
+                <span><strong>지정 폴더</strong><small>폴더를 직접 선택</small></span>
+              </label>
+            </div>
+            <div class="converter-destination ${converterState.destinationMode === "custom" ? "visible" : ""}" data-converter-destination>
+              <span>${converterState.destinationHandle ? escapeHtml(converterState.destinationHandle.name) : "저장 폴더 미선택"}</span>
+              <button class="ghost-btn" data-action="selectConverterDestination" type="button" ${disabled || (!supported ? "disabled" : "")}>저장 폴더 선택</button>
+            </div>
+          </section>
+
+          <section class="converter-card converter-options-card">
+            <div class="converter-step-head"><span>03</span><div><strong>변환 설정</strong><small>화질과 중복 파일 처리를 정합니다.</small></div></div>
+            <label class="converter-quality-row" for="converterQuality">
+              <span><strong>WebP 화질</strong><small>100에서도 손실 압축이지만 육안 차이는 매우 작습니다.</small></span>
+              <output id="converterQualityOutput">${converterState.quality}</output>
+            </label>
+            <input class="converter-range" id="converterQuality" type="range" min="70" max="100" step="1" value="${converterState.quality}" ${disabled}>
+            <label class="field converter-collision-field">
+              <span>같은 이름의 WebP가 있을 때</span>
+              <select class="select" id="converterCollisionMode" ${disabled}>
+                <option value="rename" ${converterState.collisionMode === "rename" ? "selected" : ""}>새 이름으로 저장 (_webp)</option>
+                <option value="skip" ${converterState.collisionMode === "skip" ? "selected" : ""}>기존 파일 건너뛰기</option>
+                <option value="overwrite" ${converterState.collisionMode === "overwrite" ? "selected" : ""}>기존 파일 덮어쓰기</option>
+              </select>
+            </label>
+            <div class="converter-metadata-note">
+              <div class="converter-metadata-status">
+                <span aria-hidden="true">✓</span>
+                <div><strong>메타데이터 유지 활성화</strong><small>PNG 텍스트·EXIF 정보를 WebP에 삽입하고 저장 전에 청크를 검증합니다.</small></div>
+              </div>
+              <div class="converter-history-panel">
+                <div class="converter-history-head"><strong>최근 변환</strong><small>최근 2회</small></div>
+                ${renderConverterHistory()}
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <section class="converter-wildcard-card">
+          <div class="converter-wildcard-copy">
+            <span class="converter-wildcard-mark" aria-hidden="true">WC</span>
+            <div>
+              <strong>와일드카드 라이브러리</strong>
+              <small>새 항목만 추가하거나 <code>items.json</code>의 현재 항목으로 전체를 다시 작성합니다.</small>
+              ${renderWildcardSyncStatus()}
+            </div>
+          </div>
+          <div class="converter-wildcard-actions">
+            <button class="ghost-btn converter-wildcard-btn" data-action="syncWildcards" type="button" ${converterState.wildcardSyncing ? "disabled" : ""}>${converterState.wildcardSyncMode === "incremental" ? "업데이트 확인 중…" : "와일드카드 업데이트"}</button>
+            <button class="ghost-btn converter-wildcard-btn converter-wildcard-rebuild-btn" data-action="rebuildWildcards" type="button" ${converterState.wildcardSyncing ? "disabled" : ""}>${converterState.wildcardSyncMode === "rebuild" ? "전체 갱신 중…" : "전체 갱신"}</button>
+          </div>
+        </section>
+
+        <section class="converter-run-card">
+          <div class="converter-run-summary">
+            <strong>${converterState.running ? converterProgressTitle(converterState.progress) : fileCount ? `${fileCount}개 PNG 변환 준비 완료` : "PNG를 먼저 선택하세요"}</strong>
+            <small class="${converterState.deleteOriginals ? "converter-destructive-copy" : ""}">${converterState.deleteOriginals ? "변환 성공 PNG는 작업 완료 후 영구 삭제됩니다." : "원본 PNG는 삭제하거나 변경하지 않습니다."}</small>
+          </div>
+          <button class="primary-btn converter-start-btn" data-action="startConverter" type="button" ${disabled || !supported || !fileCount ? "disabled" : ""}>${converterState.running ? "변환 중…" : "WebP 변환 시작"}</button>
+        </section>
+        ${renderConverterProgress()}
+      </div>
+    `;
+  }
+
+  function renderConverterProgress() {
+    const progress = converterState.progress;
+    const result = converterState.result;
+    if (!progress && !result) return "";
+    const active = progress && converterState.running;
+    const current = progress?.current || result?.converted || 0;
+    const total = progress?.total || result?.total || 0;
+    const percent = total ? Math.round((current / total) * 100) : 0;
+    const failures = (result?.errors || progress?.errors || []).slice(-5);
+    return `
+      <section class="converter-progress-card" aria-live="polite">
+        <div class="converter-progress-head">
+          <div><strong data-converter-progress-title>${active ? converterProgressTitle(progress) : `변환 완료 · ${result?.converted || 0}개 저장`}</strong><small data-converter-progress-file>${escapeHtml(progress?.fileName || result?.summary || "")}</small></div>
+          <span data-converter-progress-percent>${active ? `${percent}%` : result ? `${formatBytes(result.outputBytes)} 저장` : ""}</span>
+        </div>
+        <div class="converter-progress-track"><span data-converter-progress-bar style="width:${percent}%"></span></div>
+        <div class="converter-result-stats" data-converter-result-stats>
+          ${result ? `<span>변환 <strong>${result.converted}</strong></span><span>원본 삭제 <strong>${result.deleted}</strong></span><span>건너뜀 <strong>${result.skipped}</strong></span><span>오류 <strong>${result.errors.length}</strong></span><span>메타데이터 <strong>${result.metadataFiles}</strong></span>` : ""}
+        </div>
+        <ul class="converter-error-list" data-converter-errors>${failures.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}</ul>
+      </section>
+    `;
+  }
+
+  function renderConverterMiniProgress() {
+    if (!converterState.running || ui.modal === "converter" || !converterState.progress) return "";
+    const progress = converterState.progress;
+    const percent = progress.total ? Math.round((progress.current / progress.total) * 100) : 0;
+    return `
+      <button class="converter-mini-progress" data-action="converter" type="button" aria-label="변환 진행 창 열기">
+        <span class="converter-mini-head"><strong data-converter-mini-title>${converterProgressTitle(progress)}</strong><em data-converter-mini-percent>${percent}%</em></span>
+        <small data-converter-mini-file>${escapeHtml(progress.fileName || "변환 준비 중")}</small>
+        <span class="converter-mini-track"><i data-converter-mini-bar style="width:${percent}%"></i></span>
+      </button>
+    `;
+  }
+
+  function converterProgressTitle(progress) {
+    if (!progress) return "변환 준비 중";
+    return progress.phase === "delete"
+      ? `원본 삭제 ${progress.current} / ${progress.total}`
+      : `${progress.current} / ${progress.total} 변환 중`;
+  }
+
+  function renderLoraSorter() {
+    const supported = typeof window.showDirectoryPicker === "function" && Boolean(window.PromptArchiveLoraSorter);
+    const busy = loraSorterState.scanning || loraSorterState.moving;
+    const movableGroups = loraSorterState.groups.filter((group) => group.movable);
+    const movableFiles = movableGroups.reduce((total, group) => total + group.count, 0);
+    const readyFiles = movableGroups.reduce((total, group) => {
+      if (loraSorterState.excludedGroupKeys.has(group.key)) return total;
+      const destination = loraSorterState.destinationHandles.get(group.key) || loraSorterState.baseDestinationHandle;
+      return total + (destination ? group.count : 0);
+    }, 0);
+    const unreadable = loraSorterState.groups.filter((group) => !group.movable).reduce((total, group) => total + group.count, 0);
+    return `
+      <div class="lora-sorter-shell">
+        <section class="lora-sorter-hero">
+          <div class="lora-sorter-hero-mark" aria-hidden="true">${navIcon("layers")}</div>
+          <div>
+            <p class="converter-kicker">COMFYUI METADATA ROUTER</p>
+            <h2>켜진 LoRA대로 사진을 정리합니다.</h2>
+            <p>Power Lora Loader의 <code>on: true</code>만 판독하며, 복사가 검증된 뒤 원본을 삭제해 실제 이동합니다. 폴더 설정은 자동 저장됩니다.</p>
+          </div>
+          <span class="converter-secure-badge">로컬 처리</span>
+        </section>
+
+        ${supported ? "" : `<div class="converter-browser-warning" role="alert"><strong>폴더 이동 기능을 사용할 수 없습니다.</strong><span>Chrome 또는 Edge에서 로컬 앱을 열어주세요.</span></div>`}
+
+        <div class="lora-sorter-setup-grid">
+          <section class="converter-card lora-sorter-source-card">
+            <div class="converter-step-head"><span>01</span><div><strong>생성 이미지 폴더</strong><small>WebP · PNG · JPG의 ComfyUI 메타데이터를 검사합니다.</small></div></div>
+            <button class="lora-folder-picker" data-action="selectLoraSorterSource" type="button" ${busy || !supported ? "disabled" : ""}>
+              <span class="converter-folder-icon" aria-hidden="true">▰</span>
+              <span><strong>${escapeHtml(loraSorterState.sourceHandle?.name || "이미지 폴더 선택")}</strong><small>${loraSorterState.sourceHandle ? `${loraSorterState.scannedFiles.length}개 검사됨` : "폴더를 고르면 바로 스캔합니다."}</small></span>
+              <em>${loraSorterState.scanning ? "검사 중" : "선택"}</em>
+            </button>
+            <label class="converter-check lora-recursive-check"><input id="loraSorterIncludeSubfolders" type="checkbox" ${loraSorterState.includeSubfolders ? "checked" : ""} ${busy ? "disabled" : ""}><span>하위 폴더 포함</span></label>
+          </section>
+
+          <section class="converter-card lora-sorter-destination-card">
+            <div class="converter-step-head"><span>02</span><div><strong>자동 분류 기준 폴더</strong><small>이 폴더 안에 LoRA 이름별 하위 폴더를 만듭니다.</small></div></div>
+            <button class="lora-folder-picker" data-action="selectLoraSorterBaseDestination" type="button" ${busy || !supported ? "disabled" : ""}>
+              <span class="converter-folder-icon" aria-hidden="true">⌂</span>
+              <span><strong>${escapeHtml(loraSorterState.baseDestinationHandle?.name || "목적지 기준 폴더 선택")}</strong><small>${loraSorterState.baseDestinationHandle ? "LoRA별 하위 폴더 자동 생성" : "항목별 폴더만 지정해도 됩니다."}</small></span>
+              <em>선택</em>
+            </button>
+            <label class="field lora-collision-field"><span>같은 파일명이 있을 때</span><select class="select" id="loraSorterCollisionMode" ${busy ? "disabled" : ""}><option value="rename" ${loraSorterState.collisionMode === "rename" ? "selected" : ""}>새 이름으로 이동 (_2)</option><option value="skip" ${loraSorterState.collisionMode === "skip" ? "selected" : ""}>기존 파일 건너뛰기</option></select></label>
+          </section>
+        </div>
+
+        <section class="lora-groups-card">
+          <div class="lora-groups-head">
+            <div><strong>감지된 LoRA</strong><small>${loraSorterState.groups.length ? `${movableGroups.length}개 분류 · 이동 가능 ${movableFiles}장${unreadable ? ` · 제외 ${unreadable}장` : ""}` : "원본 폴더를 선택하면 여기에 표시됩니다."}</small></div>
+            ${loraSorterState.sourceHandle ? `<button class="ghost-btn" data-action="rescanLoraSorter" type="button" ${busy ? "disabled" : ""}>다시 검사</button>` : ""}
+          </div>
+          <div class="lora-group-list">
+            ${loraSorterState.groups.length ? loraSorterState.groups.map((group) => renderLoraSorterGroup(group, busy)).join("") : `<div class="lora-group-empty"><span aria-hidden="true">◎</span><strong>아직 검사한 이미지가 없습니다.</strong><small>ComfyUI가 저장한 prompt 메타데이터에서 활성 LoRA를 찾습니다.</small></div>`}
+          </div>
+        </section>
+
+        <section class="converter-run-card lora-sorter-run-card">
+          <div class="converter-run-summary">
+            <strong>${busy ? loraSorterProgressTitle(loraSorterState.progress) : readyFiles ? `${readyFiles}장 이동 준비 완료` : movableFiles ? "목적지 폴더를 지정하세요" : "분류할 폴더를 먼저 검사하세요"}</strong>
+            <small class="converter-destructive-copy">목적지 저장과 파일 크기 검증이 끝난 원본만 영구 삭제됩니다.</small>
+          </div>
+          <button class="primary-btn converter-start-btn" data-action="startLoraSorterMove" type="button" ${busy || !supported || !readyFiles ? "disabled" : ""}>${loraSorterState.moving ? "이동 중…" : "LoRA별 폴더로 이동"}</button>
+        </section>
+        ${renderLoraSorterProgress()}
+      </div>
+    `;
+  }
+
+  function renderLoraSorterGroup(group, busy) {
+    const custom = loraSorterState.destinationHandles.get(group.key);
+    const excluded = group.movable && loraSorterState.excludedGroupKeys.has(group.key);
+    const autoFolder = window.PromptArchiveLoraSorter.safeFolderName(group.label);
+    const destination = excluded
+      ? "이동 안 함"
+      : custom
+      ? `개별 · ${custom.name}`
+      : loraSorterState.baseDestinationHandle && group.movable
+        ? `${loraSorterState.baseDestinationHandle.name} / ${autoFolder}`
+        : group.movable ? "목적지 미지정" : "자동 이동 제외";
+    const badge = excluded ? "제외" : group.kind === "multiple" ? "복수 LoRA" : group.kind === "unreadable" ? "판독 불가" : group.kind === "none" ? "비활성" : "활성";
+    return `
+      <article class="lora-group-row ${group.movable ? "" : "unreadable"} ${excluded ? "excluded" : ""}">
+        <span class="lora-group-count"><strong>${group.count}</strong><small>장</small></span>
+        <div class="lora-group-copy"><strong title="${escapeHtml(group.label)}">${escapeHtml(group.label)}</strong><small>${escapeHtml(destination)}</small></div>
+        <span class="lora-group-badge ${excluded ? "excluded" : group.kind}">${badge}</span>
+        ${group.movable ? `<div class="lora-group-actions"><button class="ghost-btn lora-group-destination-btn" data-action="selectLoraGroupDestination" data-lora-key="${escapeHtml(group.key)}" type="button" ${busy ? "disabled" : ""}>${custom ? "폴더 변경" : "개별 지정"}</button><button class="ghost-btn lora-group-exclude-btn ${excluded ? "active" : ""}" data-action="toggleLoraGroupExcluded" data-lora-key="${escapeHtml(group.key)}" type="button" aria-pressed="${excluded}" ${busy ? "disabled" : ""}>${excluded ? "이동 포함" : "이동 안 함"}</button></div>` : ""}
+      </article>
+    `;
+  }
+
+  function renderLoraSorterProgress() {
+    const progress = loraSorterState.progress;
+    const result = loraSorterState.result;
+    if (!progress && !result) return "";
+    const total = progress?.total || result?.total || 0;
+    const current = progress?.current || (result ? result.moved + result.skipped + result.failed : 0);
+    const percent = total ? Math.round((current / total) * 100) : 0;
+    const errors = (result?.errors || progress?.errors || []).slice(-5);
+    return `
+      <section class="converter-progress-card lora-sorter-progress-card" aria-live="polite">
+        <div class="converter-progress-head"><div><strong data-lora-progress-title>${loraSorterProgressTitle(progress, result)}</strong><small data-lora-progress-file>${escapeHtml(progress?.fileName || result?.summary || "")}</small></div><span data-lora-progress-percent>${percent}%</span></div>
+        <div class="converter-progress-track"><span data-lora-progress-bar style="width:${percent}%"></span></div>
+        ${result ? `<div class="converter-result-stats"><span>이동 <strong>${result.moved}</strong></span><span>건너뜀 <strong>${result.skipped}</strong></span><span>제외 <strong>${result.excluded}</strong></span><span>오류 <strong>${result.failed}</strong></span></div>` : ""}
+        <ul class="converter-error-list" data-lora-progress-errors>${errors.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}</ul>
+      </section>
+    `;
+  }
+
+  function renderLoraSorterMiniProgress() {
+    if ((!loraSorterState.scanning && !loraSorterState.moving) || ui.modal === "loraSorter" || !loraSorterState.progress) return "";
+    const progress = loraSorterState.progress;
+    const percent = progress.total ? Math.round((progress.current / progress.total) * 100) : 0;
+    return `<button class="converter-mini-progress lora-sorter-mini-progress" data-action="loraSorter" type="button" aria-label="LoRA 분류 진행 창 열기"><span class="converter-mini-head"><strong data-lora-mini-title>${loraSorterProgressTitle(progress)}</strong><em data-lora-mini-percent>${percent}%</em></span><small data-lora-mini-file>${escapeHtml(progress.fileName || "준비 중")}</small><span class="converter-mini-track"><i data-lora-mini-bar style="width:${percent}%"></i></span></button>`;
+  }
+
+  function loraSorterProgressTitle(progress, result = null) {
+    if (result && !loraSorterState.scanning && !loraSorterState.moving) return `분류 완료 · ${result.moved}장 이동`;
+    if (!progress) return "LoRA 분류 준비 중";
+    return progress.phase === "scan"
+      ? `${progress.current} / ${progress.total} 메타데이터 검사`
+      : `${progress.current} / ${progress.total} 파일 이동`;
+  }
+
+  function renderBulkDeleteControls(pageItems) {
+    if (ui.bulkCategoryMode) {
+      const selectedCount = (ui.selectedBulkCategoryIds || []).filter((id) => state.items.some((item) => item.id === id)).length;
+      return `
+        <div class="bulk-delete-controls bulk-category-controls" aria-live="polite">
+          <strong>일괄 분류</strong>
+          <span class="bulk-category-count">${selectedCount}개 선택</span>
+          <select class="select" id="bulkCategorySelect">
+            ${state.categories.map((cat) => `<option value="${cat.id}">${escapeHtml(cat.name)}</option>`).join("")}
+          </select>
+          <button class="primary-btn" data-action="applyBulkCategory" type="button" ${selectedCount ? "" : "disabled"}>선택 항목 분류 적용</button>
+          <button class="ghost-btn" data-action="cancelBulkCategoryMode" type="button">닫기</button>
+        </div>
+      `;
+    }
+
+    const selectedIds = new Set(ui.selectedBulkDeleteIds || []);
+    const visibleIds = pageItems.map((item) => item.id);
+    const visibleSelectedCount = visibleIds.filter((id) => selectedIds.has(id)).length;
+    const allVisibleSelected = visibleIds.length > 0 && visibleSelectedCount === visibleIds.length;
+    const selectedCount = selectedIds.size;
+    return `
+      <div class="bulk-delete-controls" aria-live="polite">
+        <strong class="bulk-delete-title">삭제 선택 모드</strong>
+        <span class="bulk-delete-count">선택 ${selectedCount}개</span>
+        <button class="ghost-btn" data-action="bulkSelectVisible" type="button" ${visibleIds.length ? "" : "disabled"}>${allVisibleSelected ? "표시 항목 선택 해제" : "표시 항목 전체 선택"}</button>
+        <button class="ghost-btn" data-action="clearBulkDeleteSelection" type="button" ${selectedCount ? "" : "disabled"}>선택 해제</button>
+        <button class="danger-btn" data-action="confirmBulkDelete" type="button" ${selectedCount ? "" : "disabled"}>삭제 확인</button>
+        <button class="ghost-btn" data-action="cancelBulkDeleteMode" type="button">취소</button>
+      </div>
     `;
   }
 
@@ -969,19 +2028,63 @@
     return `<div class="infinite-loader subtle" aria-live="polite">전체 ${totalCount}개를 모두 표시했습니다.</div>`;
   }
 
-  function renderAlbumFilters() {
+  function renderAlbumFilters(resultCount) {
+    const filterCount = activeGalleryFilterCount();
     return `
-      <div class="album-filter-bar">
-        <div class="album-filter-summary">
-          <div class="category-tabs">
-            ${filterGroupButton("all", "전체")}
-            ${filterGroupButton("outfit", "복장")}
-            ${filterGroupButton("background", "배경")}
+      <div class="album-filter-bar surface-card">
+        <div class="gallery-control-primary">
+          <div class="gallery-result-summary" aria-live="polite">
+            <strong>${resultCount}개</strong>
+            <span>전체 ${state.items.length}개${filterCount ? ` 중 필터 ${filterCount}개 적용` : ""}</span>
           </div>
-          <div class="category-tabs album-category-tabs">
-            ${categoryFilterButton("all", "전체", "slate")}
-            ${state.categories.map((category) => categoryFilterButton(category.id, category.name, category.color)).join("")}
-            <button class="chip-btn subcategory-anchor" data-filter-group="${ui.filterGroup === "background" ? "outfit" : "background"}" type="button">하위 카테고리</button>
+          <div class="gallery-control-actions">
+            <label class="compact-field"><span>정렬</span><select class="select compact-select" id="sortSelect">
+              <option value="latest" ${ui.sort === "latest" ? "selected" : ""}>최신순</option>
+              <option value="oldest" ${ui.sort === "oldest" ? "selected" : ""}>오래된순</option>
+              <option value="favorite" ${ui.sort === "favorite" ? "selected" : ""}>즐겨찾기순</option>
+              <option value="similarity" ${ui.sort === "similarity" ? "selected" : ""}>유사순</option>
+              <option value="failed" ${ui.sort === "failed" ? "selected" : ""}>분석 실패순</option>
+              <option value="modified" ${ui.sort === "modified" ? "selected" : ""}>수정일순</option>
+            </select></label>
+            <label class="compact-field"><span>분석</span><select class="select compact-select" id="statusFilterSelect">
+              <option value="all" ${ui.status === "all" ? "selected" : ""}>전체 상태</option>
+              <option value="analyzed" ${ui.status === "analyzed" ? "selected" : ""}>분석 완료</option>
+              <option value="uploaded" ${ui.status === "uploaded" ? "selected" : ""}>분석 대기</option>
+              <option value="analyzing" ${ui.status === "analyzing" ? "selected" : ""}>분석 중</option>
+              <option value="analysis_failed" ${ui.status === "analysis_failed" ? "selected" : ""}>분석 실패</option>
+              <option value="modified" ${ui.status === "modified" ? "selected" : ""}>수정됨</option>
+            </select></label>
+            <label class="compact-field"><span>프롬프트</span><select class="select compact-select" id="originFilterSelect">
+              <option value="all" ${ui.originFilter === "all" ? "selected" : ""}>전체</option>
+              <option value="original" ${ui.originFilter === "original" ? "selected" : ""}>원본</option>
+              <option value="modified" ${ui.originFilter === "modified" ? "selected" : ""}>수정됨</option>
+            </select></label>
+            <button class="pill-toggle ${ui.favoriteOnly ? "active" : ""}" data-action="toggleFavoriteFilter" type="button" aria-pressed="${ui.favoriteOnly}">★ 즐겨찾기</button>
+            <button class="pill-toggle ${ui.showDuplicatesOnly ? "active" : ""}" data-action="toggleDuplicatesFilter" type="button" aria-pressed="${ui.showDuplicatesOnly}" data-tooltip="의상·배경 프롬프트가 같은 항목만 보기">중복</button>
+            <button class="ghost-btn reset-filter-btn" data-action="resetGalleryFilters" type="button" ${filterCount ? "" : "disabled"}>필터 초기화</button>
+          </div>
+        </div>
+        ${ui.sort === "similarity" ? `
+          <div class="similarity-sort-note" role="status">
+            <span aria-hidden="true">≈</span>
+            <p><strong>의상·배경이 닮은 짝 기준</strong> 제목·태그·외모·포즈·디테일은 제외하고 의상 50% + 배경 50%로 비교합니다. 100%는 두 문단이 모두 같은 항목이며 서로 붙여서 표시합니다.</p>
+          </div>
+        ` : ""}
+        <div class="album-filter-summary">
+          <div class="filter-section">
+            <span class="filter-section-label">보기</span>
+            <div class="category-tabs segmented-tabs">
+              ${filterGroupButton("all", "전체")}
+              ${filterGroupButton("outfit", "복장")}
+              ${filterGroupButton("background", "배경")}
+            </div>
+          </div>
+          <div class="filter-section filter-section-grow">
+            <span class="filter-section-label">카테고리</span>
+            <div class="category-tabs album-category-tabs">
+              ${categoryFilterButton("all", "전체", "slate")}
+              ${state.categories.map((category) => categoryFilterButton(category.id, category.name, category.color)).join("")}
+            </div>
           </div>
         </div>
         <div class="subcategory-filter-stack">
@@ -993,21 +2096,22 @@
   }
 
   function filterGroupButton(group, label) {
-    return `<button class="chip-btn ${ui.filterGroup === group ? "active" : ""}" data-filter-group="${group}" type="button">${label}</button>`;
+    return `<button class="chip-btn ${ui.filterGroup === group ? "active" : ""}" data-filter-group="${group}" type="button" aria-pressed="${ui.filterGroup === group}">${label}</button>`;
   }
 
   function categoryFilterButton(id, label, color) {
     const active = ui.category === id;
-    return `<button class="chip-btn category-filter-chip category-${escapeHtml(color || "blue")} ${active ? "active" : ""}" data-category-filter="${escapeHtml(id)}" type="button">${escapeHtml(label)}</button>`;
+    return `<button class="chip-btn category-filter-chip category-${escapeHtml(color || "blue")} ${active ? "active" : ""}" data-category-filter="${escapeHtml(id)}" type="button" aria-pressed="${active}">${escapeHtml(label)}</button>`;
   }
 
   function renderTagFilter(type, options, selected) {
+    if (ui.filterGroup !== "all" && ui.filterGroup !== type) return "";
     const label = type === "outfit" ? "복장" : "배경";
     return `
       <div class="subcategory-filter-row ${type === "outfit" ? "outfit-row" : "background-row"}">
         <button class="chip-btn filter-row-label ${ui.filterGroup === type ? "active" : ""}" data-filter-group="${type}" type="button">${label}</button>
         <div class="tag-filter-row">
-        ${options.filter((tag) => tag.enabled !== false).map((tag) => `<button class="chip-btn ${selected.includes(tag.key) ? "active" : ""}" data-tag-filter="${type}" data-key="${tag.key}" type="button">${escapeHtml(tag.name)}</button>`).join("")}
+        ${options.filter((tag) => tag.enabled !== false).map((tag) => `<button class="chip-btn ${selected.includes(tag.key) ? "active" : ""}" data-tag-filter="${type}" data-key="${tag.key}" type="button" aria-pressed="${selected.includes(tag.key)}">${escapeHtml(tag.name)}</button>`).join("")}
         </div>
       </div>
     `;
@@ -1019,23 +2123,64 @@
       <nav class="pagination" aria-label="페이지 이동">
         <button class="tiny-btn" data-page="first" type="button" ${ui.page === 1 ? "disabled" : ""}>처음</button>
         <button class="tiny-btn" data-page="prev" type="button" ${ui.page === 1 ? "disabled" : ""}>이전</button>
-        ${pages.map((page) => `<button class="tiny-btn ${ui.page === page ? "active-page" : ""}" data-page="${page}" type="button">${page}</button>`).join("")}
+        ${pages.map((page) => `<button class="tiny-btn ${ui.page === page ? "active-page" : ""}" data-page="${page}" type="button" aria-label="${page}페이지" ${ui.page === page ? 'aria-current="page"' : ""}>${page}</button>`).join("")}
         <button class="tiny-btn" data-page="next" type="button" ${ui.page === pageCount ? "disabled" : ""}>다음</button>
         <button class="tiny-btn" data-page="last" type="button" ${ui.page === pageCount ? "disabled" : ""}>마지막</button>
       </nav>
     `;
   }
 
-  function renderImageCard(item) {
+  function renderImageCard(item, duplicateIds) {
     const title = displayTitle(item);
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    const imageSource = escapeHtml(safeImageSource(item.thumbnailUrl || item.imageUrl));
+    const selectedForDelete = (ui.selectedBulkDeleteIds || []).includes(item.id);
+    const selectedForCategory = (ui.selectedBulkCategoryIds || []).includes(item.id);
+    ensurePromptBaseline(item);
+    syncPromptEditState(item);
+    const placeTags = tagNames(item.backgroundTags, "background").filter((name) => name && name !== "기타").slice(0, 2);
+    const outfitTagsShown = tagNames(item.outfitTags, "outfit").filter((name) => name && name !== "기타").slice(0, 1);
+    const isDup = duplicateIds.has(item.id);
+    const similarity = ui.sort === "similarity" ? gallerySimilarityById.get(item.id) : null;
+    const similarItem = similarity?.matchId ? findItem(similarity.matchId) : null;
+    const similarTitle = similarItem ? displayTitle(similarItem) : "";
+    const originClass = item.promptEditState === "modified" ? "is-modified" : item.promptEditState === "original" ? "is-original" : "";
+    const showMeta = state.albumSettings.showTags !== false || state.albumSettings.showStatus !== false;
+    const cardStateLabel = item.status === "analysis_failed"
+      ? statusLabel(item.status)
+      : item.promptJson ? (item.promptEditState === "modified" ? "수정됨" : "원본") : statusLabel(item.status);
     return `
-      <article class="panel image-card" data-open-item="${item.id}" tabindex="0">
+      <article class="panel image-card ${ui.bulkDeleteMode ? "bulk-delete-mode" : ""} ${ui.bulkCategoryMode ? "bulk-category-mode" : ""} ${selectedForDelete || selectedForCategory ? "selected-for-delete" : ""} ${isDup ? "is-duplicate" : ""} ${originClass}" data-open-item="${itemId}" tabindex="0" role="button" aria-label="${escapeHtml(`${title} 열기`)}">
         <div class="thumb">
-          <img src="${item.thumbnailUrl || item.imageUrl}" alt="${escapeHtml(title)}">
-          <button class="favorite-toggle ${item.isFavorite ? "active" : ""}" data-action="favorite" data-id="${item.id}" type="button" aria-label="${item.isFavorite ? "즐겨찾기 해제" : "즐겨찾기"}">${item.isFavorite ? "★" : "☆"}</button>
+          <img src="${imageSource}" alt="${escapeHtml(title)}" loading="lazy">
+          ${ui.bulkDeleteMode ? `
+            <label class="bulk-delete-check" aria-label="삭제할 게시물 선택">
+              <input class="bulk-delete-checkbox" data-action="bulkToggleItem" data-bulk-delete-id="${itemId}" type="checkbox" ${selectedForDelete ? "checked" : ""}>
+              <span>삭제 선택</span>
+            </label>
+          ` : ui.bulkCategoryMode ? `
+            <label class="bulk-delete-check" aria-label="분류할 게시물 선택">
+              <input class="bulk-delete-checkbox" data-action="bulkCategoryToggleItem" data-bulk-category-id="${itemId}" type="checkbox" ${selectedForCategory ? "checked" : ""}>
+              <span>분류 선택</span>
+            </label>
+          ` : (state.albumSettings.showFavorite !== false ? `<button class="favorite-toggle ${item.isFavorite ? "active" : ""}" data-action="favorite" data-id="${itemId}" type="button" aria-label="${item.isFavorite ? "즐겨찾기 해제" : "즐겨찾기"}" aria-pressed="${item.isFavorite}">${item.isFavorite ? "★" : "☆"}</button>` : "")}
+          ${isDup ? `<span class="card-badge dup-badge">중복</span>` : ""}
+          ${state.albumSettings.showStatus !== false && item.promptEditState === "modified" ? `<span class="card-badge edit-badge">수정</span>` : ""}
         </div>
         <div class="card-body">
-          <h3 class="card-title">${escapeHtml(title)}</h3>
+          ${state.albumSettings.showTitle !== false ? `<h3 class="card-title">${escapeHtml(title)}</h3>` : ""}
+          ${similarity ? `
+            <div class="card-similarity" title="${escapeHtml(similarTitle ? `가장 유사: ${similarTitle}` : "비교할 다른 프롬프트가 없습니다.")}">
+              <strong>${similarItem ? `유사 ${similarity.score}%` : "비교 대상 없음"}</strong>
+              ${similarItem ? `<span>${escapeHtml(similarTitle)}</span>` : ""}
+            </div>
+          ` : ""}
+          ${showMeta ? `
+            <div class="card-meta">
+              ${state.albumSettings.showTags !== false ? [...placeTags, ...outfitTagsShown].map((name) => `<span class="card-chip">${escapeHtml(name)}</span>`).join("") : ""}
+              ${state.albumSettings.showStatus !== false ? `<span class="card-chip subtle">${escapeHtml(cardStateLabel)}</span>` : ""}
+            </div>
+          ` : ""}
         </div>
       </article>
     `;
@@ -1043,9 +2188,9 @@
 
   function displayTitle(item) {
     const title = String(item?.title || "").trim();
-    if (title && !looksLikeFileTitle(title)) return title;
+    if (isUsableAlbumTitle(title)) return title;
     const summary = String(item?.titleSummary || "").trim();
-    if (summary && !looksLikeFileTitle(summary)) return summary;
+    if (isUsableAlbumTitle(summary)) return summary;
     return compactImageTitle(item);
   }
 
@@ -1055,37 +2200,113 @@
     return /^[a-f0-9]{16,}$/i.test(base) || /^[a-z0-9_-]{24,}$/i.test(base);
   }
 
+  function looksLikeEnglishPromptSnippet(value) {
+    const text = String(value || "").trim();
+    if (!text) return false;
+    const hangul = (text.match(/[가-힣]/g) || []).length;
+    const latin = (text.match(/[a-zA-Z]/g) || []).length;
+    if (hangul >= 4 && hangul >= latin) return false;
+    if (latin < 8) return false;
+    return /^(adult|beautiful|young|korean|woman|girl|wearing|standing|sitting|close-?up|portrait)\b/i.test(text)
+      || (latin > hangul * 2 && text.split(/\s+/).length >= 4);
+  }
+
+  function isUsableAlbumTitle(value) {
+    const text = String(value || "").trim();
+    if (!text || looksLikeFileTitle(text)) return false;
+    if (looksLikeEnglishPromptSnippet(text)) return false;
+    return true;
+  }
+
+  function isKoreanTitleSummary(value) {
+    const text = String(value || "").trim();
+    if (!text || looksLikeFileTitle(text) || looksLikeEnglishPromptSnippet(text)) return false;
+    const hangul = (text.match(/[가-힣]/g) || []).length;
+    const latin = (text.match(/[a-zA-Z]/g) || []).length;
+    return hangul >= 4 && hangul >= latin;
+  }
+
   function compactImageTitle(item) {
     if (!item?.promptJson) return "분석 대기 이미지";
-    const parts = [
-      ...tagNames(item.backgroundTags, "background").filter((name) => name !== "기타").slice(0, 1),
-      ...extractTitlePhrases(item.promptJson.outfit?.sentences?.map((sentence) => sentence.ko || sentence.en).join(" "), "outfit").slice(0, 1),
-      ...extractTitlePhrases(item.promptJson.expression_pose?.sentences?.map((sentence) => sentence.ko || sentence.en).join(" "), "expression").slice(0, 2),
-    ].filter(Boolean);
-    const fallbackTags = [
-      ...tagNames(item.outfitTags, "outfit").filter((name) => name !== "기타").slice(0, 1),
-      ...(item.tags || []).slice(0, 2),
-    ];
-    return uniqueCompact(parts.length ? parts : fallbackTags).slice(0, 5).join(", ") || "분석된 이미지";
+    // Local fallback mirrors title-summary priority: hair · outfit · accessory/bag · background.
+    // Never lead with skin/tone/snap/lighting/woman wording.
+    const appearanceText = sectionJoin(item, "appearance");
+    const outfitText = sectionJoin(item, "outfit");
+    const backgroundText = sectionJoin(item, "background");
+    const detailsText = sectionJoin(item, "details");
+    const poseText = sectionJoin(item, "expression_pose");
+    const parts = uniqueCompact([
+      ...extractTitlePhrases(appearanceText, "hair").slice(0, 1),
+      ...extractTitlePhrases(outfitText, "outfit").slice(0, 2),
+      ...extractTitlePhrases(`${detailsText} ${outfitText} ${poseText}`, "accessory").slice(0, 2),
+      ...tagNames(item.backgroundTags, "background").filter((name) => name && name !== "기타").slice(0, 1),
+      ...extractTitlePhrases(backgroundText, "background").slice(0, 1),
+      ...tagNames(item.outfitTags, "outfit").filter((name) => name && name !== "기타").slice(0, 1),
+    ]).slice(0, 6);
+    return parts.join(" ") || "분석된 이미지";
+  }
+
+  function sectionJoin(item, key) {
+    return (item.promptJson?.[key]?.sentences || [])
+      .map((sentence) => [sentence.ko, sentence.en].filter(Boolean).join(" "))
+      .filter(Boolean)
+      .join(" ");
   }
 
   function extractTitlePhrases(text, type) {
     const source = String(text || "").toLowerCase();
     const phrases = [];
     const rules = type === "outfit" ? [
-      [/민소매|sleeveless/, "민소매 탑"],
+      [/민소매|sleeveless/, "민소매"],
+      [/크롭|crop\s*top/, "크롭탑"],
       [/원피스|dress/, "원피스"],
       [/교복|uniform/, "교복"],
       [/니트|knit/, "니트"],
       [/스커트|skirt/, "스커트"],
+      [/청치마|denim\s*skirt/, "청치마"],
+      [/청바지|jeans?/, "청바지"],
+      [/자켓|jacket|blazer/, "자켓"],
+      [/코트|coat/, "코트"],
       [/부츠|boots?/, "부츠"],
-    ] : [
-      [/윙크|wink/, "윙크"],
-      [/셀카|selfie/, "셀카"],
-      [/미소|smile/, "미소"],
-      [/정면|straight-on|front/, "정면 구도"],
-      [/앉|seated|sitting/, "앉은 포즈"],
-    ];
+      [/힐|heels?/, "힐"],
+      [/화이트|white/, "화이트"],
+      [/블랙|black/, "블랙"],
+      [/핑크|pink/, "핑크"],
+    ] : type === "hair" ? [
+      [/포니테일|pony\s*tail|ponytail/, "포니테일"],
+      [/단발|bob\b|short hair/, "단발"],
+      [/장발|long hair|long straight/, "장발"],
+      [/웨이브|wavy|wave/, "웨이브"],
+      [/업스타일|updo|bun\b/, "업스타일"],
+      [/뱅|bangs|fringe/, "뱅"],
+      [/땋|braid/, "브레이드"],
+    ] : type === "accessory" ? [
+      [/캐리어|suitcase|luggage|carry-?on/, "캐리어"],
+      [/숄더백|shoulder\s*bag/, "숄더백"],
+      [/토트백|tote/, "토트백"],
+      [/클러치|clutch/, "클러치"],
+      [/백팩|backpack/, "백팩"],
+      [/가방|handbag|purse|bag\b/, "가방"],
+      [/선글라스|sunglasses/, "선글라스"],
+      [/목걸이|necklace/, "목걸이"],
+      [/귀걸이|earring/, "귀걸이"],
+      [/이어폰|earphone|earbuds?|airpods?/, "이어폰"],
+      [/폰|smartphone|phone\b|핸드폰/, "폰"],
+      [/모자|hat\b|cap\b|beanie/, "모자"],
+      [/시계|watch\b/, "시계"],
+    ] : type === "background" ? [
+      [/호텔|hotel/, "호텔"],
+      [/복도|hallway|corridor/, "복도"],
+      [/카페|cafe|café/, "카페"],
+      [/거리|street|city street/, "거리"],
+      [/침실|bedroom/, "침실"],
+      [/엘리베이터|elevator|lift\b/, "엘리베이터"],
+      [/공항|airport/, "공항"],
+      [/실내|indoor|interior/, "실내"],
+      [/야외|outdoor/, "야외"],
+      [/창가|window/, "창가"],
+      [/스튜디오|studio/, "스튜디오"],
+    ] : [];
     rules.forEach(([pattern, label]) => {
       if (pattern.test(source)) phrases.push(label);
     });
@@ -1097,12 +2318,16 @@
   }
 
   function renderEmptyGallery() {
+    const libraryIsEmpty = state.items.length === 0;
     return `
       <div class="panel empty-state">
         <div>
-          <h2>조건에 맞는 이미지가 없습니다.</h2>
-          <p>검색어나 필터를 바꾸거나 새 이미지를 업로드해보세요.</p>
-          <button class="primary-btn" data-action="upload" type="button">업로드 열기</button>
+          <h2>${libraryIsEmpty ? "첫 이미지를 추가해 보세요." : "조건에 맞는 결과가 없습니다."}</h2>
+          <p>${libraryIsEmpty ? "이미지를 업로드하면 썸네일, 프롬프트, 태그를 한곳에서 관리할 수 있습니다." : "검색어나 적용된 필터를 초기화하면 전체 아카이브로 돌아갑니다."}</p>
+          <div class="empty-state-actions">
+            ${libraryIsEmpty ? "" : `<button class="ghost-btn" data-action="resetGalleryFilters" type="button">검색과 필터 초기화</button>`}
+            <button class="primary-btn" data-action="upload" type="button">이미지 업로드</button>
+          </div>
         </div>
       </div>
     `;
@@ -1110,14 +2335,21 @@
 
   function renderUpload() {
     const uploadExcludeKeys = lastUploadExcludeKeys();
+    const exifMode = isExifPromptMode();
     return `
       <div class="page-head">
         <div>
           <h2 class="page-title">업로드</h2>
-          <p class="page-copy">파일을 먼저 고른 뒤 요청사항과 제외 요소를 확인하고 저장합니다. 분석은 저장 및 분석 버튼을 누를 때만 실행됩니다.</p>
+          <p class="page-copy">${exifMode ? "EXIF / 메타데이터 프롬프트를 읽어 저장합니다." : "파일 선택 후 요청·제외를 확인하고 저장 및 분석합니다."}</p>
         </div>
       </div>
       <section class="panel" style="padding: var(--space-4);">
+        <div class="optimization-summary">
+          <strong>프롬프트 입력 방식</strong>
+          <span>${exifMode ? "EXIF 프롬프트 읽기" : "API 이미지 분석"}</span>
+          ${exifMode ? `<span>${state.uploadSettings.translateExifPrompt ? "한국어 자동 번역" : "번역 안 함"}</span>` : ""}
+        </div>
+        ${exifMode ? `<p class="notice upload-mode-notice">메타데이터에서 5문단을 찾지 못한 파일은 빨간색으로 표시됩니다.</p>` : ""}
         <div class="optimization-summary">
           <strong>업로드 전 자동 최적화</strong>
           <span>${state.uploadSettings.autoCompress ? "켜짐" : "꺼짐"}</span>
@@ -1130,44 +2362,43 @@
         <div class="upload-zone" id="dropZone">
           <div>
             <h2>이미지를 놓거나 선택하세요</h2>
-            <p>jpg, jpeg, png, webp 파일을 지원합니다. ${state.uploadSettings.allowClipboardPaste ? "클립보드 붙여넣기도 가능합니다." : "클립보드 붙여넣기는 설정에서 꺼져 있습니다."}</p>
+            <p>jpg, jpeg, png, webp${state.uploadSettings.allowClipboardPaste ? " · 클립보드 붙여넣기" : ""}</p>
             <input class="sr-only" id="fileInput" type="file" accept="image/jpeg,image/png,image/webp" multiple>
             <button class="primary-btn" id="pickFiles" type="button">파일 선택</button>
           </div>
         </div>
         ${renderPendingUploadFiles()}
-        <div class="upload-action-row">
-          <div class="toolbar">
-          <button class="ghost-btn" data-action="removeSelectedPendingUploads" type="button" ${ui.selectedPendingUploadKeys.length ? "" : "disabled"}>선택 지우기</button>
-          <button class="ghost-btn" data-action="clearUploadWorkspace" type="button" ${ui.pendingUploadFiles.length || ui.uploadQueue.length ? "" : "disabled"}>비우기</button>
-          <button class="primary-btn" data-action="saveAndAnalyzeUploads" type="button" ${ui.pendingUploadFiles.length ? "" : "disabled"}>저장 및 분석</button>
-          </div>
-          ${renderUploadProgress()}
-        </div>
-        <div id="queueList" class="queue-list">${renderQueue()}</div>
         <div class="form-grid" style="margin-top: var(--space-4);">
           <div class="field">
             <label for="uploadTitle">공통 제목</label>
-            <input class="input" id="uploadTitle" placeholder="예: 푸른 교복 캐릭터">
+            <input class="input" id="uploadTitle" value="${escapeHtml(ui.uploadDraft.title)}" placeholder="예: 푸른 교복 캐릭터">
           </div>
           <div class="field">
             <label for="uploadCategory">카테고리</label>
-            <select class="select" id="uploadCategory">${state.categories.map((cat) => `<option value="${cat.id}">${escapeHtml(cat.name)}</option>`).join("")}</select>
+            <select class="select" id="uploadCategory">${state.categories.map((cat) => `<option value="${escapeHtml(normalizeReferenceIdentifier(cat.id))}" ${ui.uploadDraft.categoryId === cat.id ? "selected" : ""}>${escapeHtml(cat.name)}</option>`).join("")}</select>
           </div>
         </div>
         <div class="analysis-options">
           <div class="field">
             <label for="uploadCustomInstruction">이 이미지에만 적용할 추가 요청사항</label>
-            <textarea class="textarea" id="uploadCustomInstruction" placeholder="뒷 유리 그림은 프롬프트에 포함하지 말 것&#10;캐릭터 외모만 중심으로 분석할 것"></textarea>
+            <textarea class="textarea" id="uploadCustomInstruction" placeholder="뒷 유리 그림은 프롬프트에 포함하지 말 것">${escapeHtml(ui.uploadDraft.customInstruction)}</textarea>
           </div>
           <fieldset class="option-fieldset">
             <legend>프롬프트에서 제외할 요소</legend>
-            <p>체크된 요소는 이미지에 보여도 최종 프롬프트에 넣지 않습니다. 마지막 체크값은 다음 업로드에도 유지됩니다.</p>
             <div class="option-grid">
               ${enabledExcludeOptions().map((option) => renderExcludeCheckbox(option, uploadExcludeKeys.includes(option.key), "uploadExclude")).join("")}
             </div>
           </fieldset>
         </div>
+        <div class="upload-action-row">
+          <div class="toolbar">
+          <button class="ghost-btn" data-action="removeSelectedPendingUploads" type="button" ${ui.selectedPendingUploadKeys.length && !ui.uploadProgress ? "" : "disabled"}>선택 지우기</button>
+          <button class="ghost-btn" data-action="clearUploadWorkspace" type="button" ${(ui.pendingUploadFiles.length || ui.uploadQueue.length) && !ui.uploadProgress ? "" : "disabled"}>비우기</button>
+          <button class="primary-btn" data-action="saveAndAnalyzeUploads" type="button" ${ui.pendingUploadFiles.length && !ui.uploadProgress ? "" : "disabled"}>${ui.uploadProgress ? "처리 중" : exifMode ? "EXIF 읽고 저장" : "저장 및 분석"}</button>
+          </div>
+          ${renderUploadProgress()}
+        </div>
+        <div id="queueList" class="queue-list">${renderQueue()}</div>
       </section>
     `;
   }
@@ -1195,6 +2426,10 @@
     return keys.length ? keys : defaultExcludedKeys();
   }
 
+  function isExifPromptMode() {
+    return state.uploadSettings.promptSourceMode === "exif";
+  }
+
   function renderPendingUploadFiles() {
     if (!ui.pendingUploadFiles.length) return "";
     return `
@@ -1202,11 +2437,13 @@
         ${ui.pendingUploadFiles.map((file) => {
           const key = pendingUploadKey(file);
           const selected = ui.selectedPendingUploadKeys.includes(key);
+          const error = ui.pendingUploadErrors?.[key] || "";
           return `
-          <button class="pending-preview-card ${selected ? "selected" : ""}" data-action="togglePendingUpload" data-key="${escapeHtml(key)}" type="button" aria-pressed="${selected ? "true" : "false"}">
+          <button class="pending-preview-card ${selected ? "selected" : ""} ${error ? "invalid" : ""}" data-action="togglePendingUpload" data-key="${escapeHtml(key)}" type="button" aria-pressed="${selected ? "true" : "false"}">
             <img src="${escapeHtml(pendingUploadPreviewUrl(file))}" alt="${escapeHtml(file.name)}">
             <strong>${escapeHtml(file.name)}</strong>
             <span>${formatBytes(file.size)}</span>
+            ${error ? `<em class="pending-error">${escapeHtml(error)}</em>` : ""}
           </button>
         `; }).join("")}
       </div>
@@ -1248,7 +2485,7 @@
     if (!ui.uploadQueue.length) return "";
     return ui.uploadQueue.map((entry) => `
       <article class="panel queue-item">
-        ${entry.url ? `<img src="${entry.url}" alt="${escapeHtml(entry.name)}">` : `<div class="queue-fallback" aria-hidden="true">!</div>`}
+        ${entry.url ? `<img src="${escapeHtml(safeImageSource(entry.url))}" alt="${escapeHtml(entry.name)}">` : `<div class="queue-fallback" aria-hidden="true">!</div>`}
         <div>
           <strong>${escapeHtml(entry.name)}</strong>
           <div class="meta-line">
@@ -1258,7 +2495,7 @@
           </div>
           ${entry.error ? `<p class="queue-error">${escapeHtml(entry.error)}</p>` : ""}
         </div>
-        ${entry.itemId ? `<button class="tiny-btn" data-action="openUploaded" data-id="${entry.itemId}" type="button">열기</button>` : ""}
+        ${entry.itemId ? `<button class="tiny-btn" data-action="openUploaded" data-id="${escapeHtml(normalizeReferenceIdentifier(entry.itemId))}" type="button">열기</button>` : ""}
       </article>
     `).join("");
   }
@@ -1270,79 +2507,328 @@
       return renderGallery();
     }
     const title = displayTitle(item);
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    const imageSource = escapeHtml(safeImageSource(item.imageUrl));
+    const exifMode = isExifPromptMode();
+    const analyzeLabel = item.promptJson ? "재분석" : "수동 분석";
+    const canRestore = Boolean(item.promptBaselineJson && item.promptEditState === "modified");
     return `
       <div class="page-head">
         <div>
           <h2 class="page-title">${escapeHtml(title)}</h2>
-          <p class="page-copy">${escapeHtml(item.memo || "메모가 없습니다.")}</p>
+          <p class="page-copy">${escapeHtml(item.memo || "")}</p>
         </div>
-        <div class="toolbar">
+        <div class="toolbar detail-primary-actions">
           <button class="ghost-btn" data-view="gallery" type="button">갤러리</button>
-          <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button">${item.promptJson ? "재분석" : "수동 분석"}</button>
+          <button class="primary-btn" data-action="analyzeOne" data-id="${itemId}" type="button" ${exifMode ? "disabled" : ""}>${analyzeLabel}</button>
+          <button class="ghost-btn" data-action="reloadExif" data-id="${itemId}" type="button" ${exifMode ? "" : "disabled"}>EXIF 원본 불러오기</button>
         </div>
       </div>
       <div class="detail-grid">
         <section class="panel detail-media">
-          <img src="${item.imageUrl}" alt="${escapeHtml(title)}">
+          <img src="${imageSource}" alt="${escapeHtml(title)}">
           <div class="detail-meta">
             <div class="form-grid">
               <div class="field">
                 <label for="detailTitle">제목</label>
-                <input class="input" id="detailTitle" value="${escapeHtml(title)}">
+                <div class="inline-field-row">
+                  <input class="input" id="detailTitle" value="${escapeHtml(title)}">
+                  <button class="tiny-btn" data-action="retitleOne" data-id="${itemId}" type="button" ${item.promptJson ? "" : "disabled"}>제목 요약</button>
+                </div>
               </div>
               <div class="field">
                 <label for="detailCategory">카테고리</label>
                 <select class="select" id="detailCategory">
-                  ${state.categories.map((cat) => `<option value="${cat.id}" ${item.categoryId === cat.id ? "selected" : ""}>${escapeHtml(cat.name)}</option>`).join("")}
+                  ${state.categories.map((cat) => `<option value="${escapeHtml(normalizeReferenceIdentifier(cat.id))}" ${item.categoryId === cat.id ? "selected" : ""}>${escapeHtml(cat.name)}</option>`).join("")}
                 </select>
               </div>
             </div>
-            <div class="form-grid">
-              <div class="field">
-                <label for="detailOutfitTags">복장 태그</label>
-                <input class="input" id="detailOutfitTags" value="${escapeHtml(tagNames(item.outfitTags, "outfit").join(", "))}" placeholder="교복, 캐주얼">
-              </div>
-              <div class="field">
-                <label for="detailBackgroundTags">배경 태그</label>
-                <input class="input" id="detailBackgroundTags" value="${escapeHtml(tagNames(item.backgroundTags, "background").join(", "))}" placeholder="학교, 스튜디오">
-              </div>
+            <div class="field">
+              <label>복장 태그</label>
+              ${renderDetailTagChips(item, "outfit")}
             </div>
             <div class="field">
-              <label for="detailMemo">메모/글 내용</label>
-              <textarea class="textarea" id="detailMemo">${escapeHtml(item.memo)}</textarea>
+              <label>장소 태그</label>
+              ${renderDetailTagChips(item, "background")}
+            </div>
+            <div class="toolbar" style="margin:0 0 var(--space-2)">
+              <button class="tiny-btn" data-action="retagOne" data-id="${itemId}" type="button" ${item.promptJson ? "" : "disabled"}>태그 재추론</button>
             </div>
             <div class="field">
-              <label for="detailCustomInstruction">이 이미지 전용 추가 요청사항</label>
-              <textarea class="textarea" id="detailCustomInstruction" placeholder="이 이미지 분석에만 적용할 요청을 적어주세요.">${escapeHtml(item.customInstruction || "")}</textarea>
+              <label for="detailMemo">메모</label>
+              <textarea class="textarea" id="detailMemo">${escapeHtml(item.memo || "")}</textarea>
+            </div>
+            <div class="field">
+              <label for="detailCustomInstruction">추가 요청사항</label>
+              <textarea class="textarea" id="detailCustomInstruction" placeholder="예: 안경 제거, 배경을 카페로">${escapeHtml(item.customInstruction || "")}</textarea>
             </div>
             <fieldset class="option-fieldset">
-              <legend>프롬프트에서 제외할 요소</legend>
-              <p>체크 후 저장하고 재분석하면 새 조건으로 프롬프트를 다시 만듭니다.</p>
+              <legend>제외할 요소</legend>
               <div class="option-grid">
                 ${enabledExcludeOptions().map((option) => renderExcludeCheckbox(option, item.excludeOptions?.includes(option.key), "detailExclude")).join("")}
               </div>
             </fieldset>
-            ${item.analysisRequest ? `
-              <details class="request-preview">
-                <summary>최근 분석 요청 미리보기</summary>
-                <pre>${escapeHtml(item.analysisRequest)}</pre>
-              </details>
-            ` : ""}
-            <div class="toolbar">
-              <span class="status-pill">${statusLabel(item.status)}</span>
-              <button class="primary-btn" data-action="saveDetail" data-id="${item.id}" type="button">저장</button>
-              <button class="danger-btn" data-action="deleteItem" data-id="${item.id}" type="button">삭제</button>
+            <div class="option-grid revise-options">
+              <label class="option-item"><input id="reviseAlsoRetag" type="checkbox" ${ui.reviseAlsoRetag ? "checked" : ""}><span>수정 후 태그 재추론</span></label>
+              <label class="option-item"><input id="reviseAlsoRetitle" type="checkbox" ${ui.reviseAlsoRetitle ? "checked" : ""}><span>수정 후 제목 재요약</span></label>
             </div>
+            ${renderPromptOriginStatus(item)}
+            <div class="toolbar detail-action-group">
+              <button class="primary-btn" data-action="saveDetail" data-id="${itemId}" type="button">저장</button>
+              <button class="ghost-btn" data-action="revisePrompt" data-id="${itemId}" type="button" ${item.promptJson ? "" : "disabled"}>프롬프트 수정</button>
+              <button class="ghost-btn" data-action="restoreBaseline" data-id="${itemId}" type="button" ${canRestore ? "" : "disabled"}>원본 되돌리기</button>
+              <button class="danger-btn" data-action="deleteItem" data-id="${itemId}" type="button">삭제</button>
+            </div>
+            ${renderVersionHistory(item)}
             ${item.uploadMeta ? renderAssetSummary(item) : ""}
             ${item.errorMessage ? `<p class="notice">${escapeHtml(item.errorMessage)}</p>` : ""}
           </div>
         </section>
         <section class="panel prompt-panel">
           ${renderPromptTools(item)}
+          ${ui.promptCompareMode && item.promptBaselineJson ? renderPromptCompare(item) : ""}
           ${item.promptJson ? renderPromptColumns(item) : renderNoPrompt(item)}
         </section>
       </div>
     `;
+  }
+
+  function renderDetailTagChips(item, type) {
+    const selected = new Set(type === "outfit" ? (item.outfitTags || []) : (item.backgroundTags || []));
+    const options = tagOptions(type).filter((tag) => tag.enabled !== false);
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    return `
+      <div class="detail-tag-chips" data-tag-type="${type}">
+        ${options.map((tag) => `
+          <button class="chip-btn ${selected.has(tag.key) ? "active" : ""}" data-action="toggleDetailTag" data-type="${type}" data-key="${escapeHtml(normalizeReferenceIdentifier(tag.key))}" data-id="${itemId}" type="button" aria-pressed="${selected.has(tag.key)}">${escapeHtml(tag.name)}</button>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderVersionHistory(item) {
+    const versions = Array.isArray(item.versions) ? item.versions.slice(0, 8) : [];
+    if (!versions.length) return "";
+    return `
+      <details class="version-history">
+        <summary>이전 버전 ${versions.length}개</summary>
+        <div class="version-list">
+          ${versions.map((version, index) => `
+            <div class="version-row">
+              <span>${new Date(version.createdAt || Date.now()).toLocaleString()}</span>
+              <button class="tiny-btn" data-action="restoreVersion" data-id="${escapeHtml(normalizeReferenceIdentifier(item.id))}" data-index="${index}" type="button">복원</button>
+            </div>
+          `).join("")}
+        </div>
+      </details>
+    `;
+  }
+
+  function renderPromptCompare(item) {
+    const baseline = item.promptBaselineJson || {};
+    const current = item.promptJson || {};
+    const rows = sectionMeta.map((section) => {
+      const baseText = (baseline[section.key]?.sentences || []).map((s) => s.en || "").join("\n");
+      const curText = (current[section.key]?.sentences || []).map((s) => s.en || "").join("\n");
+      const changed = baseText.trim() !== curText.trim();
+      return `
+        <div class="compare-section ${changed ? "changed" : ""}">
+          <h4>${escapeHtml(section.labelEn)} ${changed ? "· 변경" : ""}</h4>
+          <div class="compare-grid">
+            <pre class="compare-col">${escapeHtml(baseText || "(없음)")}</pre>
+            <pre class="compare-col">${escapeHtml(curText || "(없음)")}</pre>
+          </div>
+        </div>
+      `;
+    }).join("");
+    return `
+      <div class="prompt-compare-panel">
+        <div class="prompt-compare-head">
+          <strong>원본 vs 현재 (English)</strong>
+          <button class="tiny-btn" data-action="togglePromptCompare" type="button">비교 닫기</button>
+        </div>
+        ${rows}
+      </div>
+    `;
+  }
+
+  function renderPromptOriginStatus(item) {
+    ensurePromptBaseline(item);
+    syncPromptEditState(item);
+    if (!item.promptJson) {
+      return `
+        <div class="prompt-origin-status is-empty">
+          <span class="status-pill">프롬프트 없음</span>
+          <p class="field-help">아직 저장된 프롬프트가 없습니다.</p>
+        </div>
+      `;
+    }
+    const isOriginal = item.promptEditState === "original";
+    const sourceLabel = promptBaselineSourceLabel(item.promptBaselineSource || guessPromptBaselineSource(item));
+    const actionLabel = promptEditActionLabel(item.promptEditAction);
+    const mainLabel = isOriginal ? "원본 프롬프트" : "수정된 프롬프트";
+    const detail = isOriginal
+      ? `출처: ${sourceLabel}. EXIF 불러오기 또는 이미지 분석 직후 상태와 같습니다.`
+      : `원본 출처: ${sourceLabel}${actionLabel ? ` · 변경 방식: ${actionLabel}` : ""}. 수동 편집, 프롬프트 수정, 섹션 재생성 등으로 원본과 달라졌습니다.`;
+    return `
+      <div class="prompt-origin-status ${isOriginal ? "is-original" : "is-modified"}">
+        <div class="prompt-origin-head">
+          <span class="status-pill">${escapeHtml(mainLabel)}</span>
+          <span class="meta-line">${escapeHtml(sourceLabel)}${!isOriginal && actionLabel ? ` · ${escapeHtml(actionLabel)}` : ""}</span>
+        </div>
+        <p class="field-help">${escapeHtml(detail)}</p>
+      </div>
+    `;
+  }
+
+  function promptBaselineSourceLabel(source) {
+    if (source === "exif") return "EXIF / 메타데이터";
+    if (source === "analysis") return "이미지 분석";
+    return "출처 미상";
+  }
+
+  function promptEditActionLabel(action) {
+    if (action === "api_revise") return "API 프롬프트 수정";
+    if (action === "manual") return "수동 편집";
+    if (action === "section") return "섹션 재생성";
+    if (action === "translate") return "번역 반영";
+    return "";
+  }
+
+  function guessPromptBaselineSource(item) {
+    if (item.uploadMeta?.promptSourceMode === "exif" || item.uploadMeta?.exifPromptFound) return "exif";
+    if (item.analysisRequest && /EXIF/i.test(item.analysisRequest)) return "exif";
+    if (item.analysisRequest) return "analysis";
+    return "";
+  }
+
+  function promptFingerprint(promptJson) {
+    const parts = [];
+    sectionMeta.forEach((section) => {
+      const sentences = promptJson?.[section.key]?.sentences || [];
+      sentences.forEach((sentence) => {
+        parts.push([
+          sentence.id || "",
+          String(sentence.en || "").trim(),
+          String(sentence.ko || "").trim(),
+        ].join("\n"));
+      });
+    });
+    return simpleStringHash(parts.join("\n---\n"));
+  }
+
+  function simpleStringHash(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+  }
+
+  function clonePromptJson(promptJson) {
+    try {
+      return structuredClone(promptJson);
+    } catch (_error) {
+      return JSON.parse(JSON.stringify(promptJson || null));
+    }
+  }
+
+  function ensurePromptBaseline(item) {
+    if (!item?.promptJson) return;
+    if (item.promptBaselineFingerprint) {
+      if (!item.promptBaselineJson && item.promptEditState !== "modified") {
+        item.promptBaselineJson = clonePromptJson(item.promptJson);
+      }
+      return;
+    }
+    item.promptBaselineSource = item.promptBaselineSource || guessPromptBaselineSource(item) || "analysis";
+    item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptBaselineJson = clonePromptJson(item.promptJson);
+    item.promptEditState = "original";
+    item.promptEditAction = "";
+  }
+
+  function markPromptBaseline(item, source) {
+    if (!item?.promptJson) return;
+    item.promptBaselineSource = source || guessPromptBaselineSource(item) || "analysis";
+    item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptBaselineJson = clonePromptJson(item.promptJson);
+    item.promptEditState = "original";
+    item.promptEditAction = "";
+  }
+
+  function migrateAllPromptBaselines() {
+    let changed = false;
+    (state.items || []).forEach((item) => {
+      if (!item?.promptJson) return;
+      const before = item.promptBaselineFingerprint || "";
+      const hadSnapshot = Boolean(item.promptBaselineJson);
+      ensurePromptBaseline(item);
+      syncPromptEditState(item);
+      if ((item.promptBaselineFingerprint || "") !== before || (!hadSnapshot && item.promptBaselineJson)) changed = true;
+    });
+    if (changed && serverBootComplete) saveItemsState();
+  }
+
+  function restorePromptBaseline(item) {
+    if (!item?.promptBaselineJson) {
+      throw new Error("저장된 원본 프롬프트 스냅샷이 없습니다.");
+    }
+    applyPrompt(item, clonePromptJson(item.promptBaselineJson));
+    item.promptBaselineFingerprint = promptFingerprint(item.promptJson);
+    item.promptEditState = "original";
+    item.promptEditAction = "";
+    applyLocalTagsFromPrompt(item);
+  }
+
+  function duplicateIndexForItems() {
+    const revision = state.items
+      .map((item) => `${item.id}:${item.updatedAt || item.createdAt || 0}`)
+      .join("|");
+    if (duplicateIndexCache.revision === revision) return duplicateIndexCache;
+    const buildDuplicateIndex = window.PromptArchiveSimilarity?.buildDuplicateIndex;
+    if (typeof buildDuplicateIndex !== "function") {
+      duplicateIndexCache = { revision, groups: new Map(), duplicateIds: new Set() };
+      return duplicateIndexCache;
+    }
+    const indexed = buildDuplicateIndex(state.items, duplicateGroupKey, (item) => item.id);
+    duplicateIndexCache = { revision, ...indexed };
+    return duplicateIndexCache;
+  }
+
+  function duplicateGroupKey(item) {
+    const corePromptSignature = window.PromptArchiveSimilarity?.corePromptSignature;
+    const signature = typeof corePromptSignature === "function" ? corePromptSignature(item) : "";
+    if (signature) return `prompt::${signature}`;
+    const name = item.uploadMeta?.originalName || "";
+    const size = item.uploadMeta?.originalSize || 0;
+    return name && size ? `file::${name}::${size}` : "";
+  }
+
+  function findCorePromptDuplicate(candidate, excludeId = "") {
+    const findDuplicate = window.PromptArchiveSimilarity?.findCorePromptDuplicate;
+    if (typeof findDuplicate !== "function") return null;
+    return findDuplicate(state.items, candidate, { excludeId });
+  }
+
+  function syncPromptEditState(item, preferredAction = "") {
+    if (!item?.promptJson) {
+      item.promptEditState = "empty";
+      return item.promptEditState;
+    }
+    ensurePromptBaseline(item);
+    const current = promptFingerprint(item.promptJson);
+    if (current === item.promptBaselineFingerprint) {
+      item.promptEditState = "original";
+      item.promptEditAction = "";
+      return item.promptEditState;
+    }
+    item.promptEditState = "modified";
+    if (preferredAction) item.promptEditAction = preferredAction;
+    else if (!item.promptEditAction) item.promptEditAction = "manual";
+    return item.promptEditState;
   }
 
   function renderAssetSummary(item) {
@@ -1359,26 +2845,35 @@
   }
 
   function renderPromptTools(item) {
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
     return `
-      <div class="prompt-actions">
+      <div class="prompt-actions prompt-actions-sticky">
         <div class="toolbar" style="margin: 0;">
-          <button class="ghost-btn" data-action="copyPrompt" data-mode="ko" data-id="${item.id}" type="button">번역 전체 복사</button>
-          <button class="ghost-btn" data-action="copyPrompt" data-mode="both" data-id="${item.id}" type="button">영어+번역 복사</button>
-          <button class="ghost-btn" data-action="copyPrompt" data-mode="withoutAppearance" data-id="${item.id}" type="button">외모빼고 복사</button>
-          <button class="primary-btn" data-action="copyPrompt" data-mode="final" data-id="${item.id}" type="button">최종 프롬프트 복사</button>
+          <button class="primary-btn" data-action="copyPrompt" data-mode="final" data-id="${itemId}" type="button">최종 복사</button>
+          <button class="ghost-btn" data-action="copyPrompt" data-mode="ko" data-id="${itemId}" type="button">번역 복사</button>
+          <button class="ghost-btn" data-action="copyPrompt" data-mode="both" data-id="${itemId}" type="button">영+한 복사</button>
+          <button class="ghost-btn" data-action="copyPrompt" data-mode="withoutAppearance" data-id="${itemId}" type="button">외모제외</button>
         </div>
-        <button class="ghost-btn" data-action="toggleEdit" type="button">${ui.editMode ? "보기 모드" : "수정 모드"}</button>
+        <div class="toolbar" style="margin: 0;">
+          <button class="ghost-btn" data-action="toggleEdit" type="button">${ui.editMode ? "보기 모드" : "수정 모드"}</button>
+          <button class="ghost-btn ${ui.promptCompareMode ? "active" : ""}" data-action="togglePromptCompare" type="button" ${item.promptBaselineJson ? "" : "disabled"}>원본 비교</button>
+        </div>
       </div>
     `;
   }
 
   function renderNoPrompt(item) {
+    const exifMode = isExifPromptMode();
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
     return `
       <div class="empty-state">
         <div>
           <h2>아직 프롬프트가 없습니다.</h2>
-          <p>분석을 실행하면 외모, 복장, 배경, 표정/자세, 디테일 5개 섹션으로 저장됩니다.</p>
-          <button class="primary-btn" data-action="analyzeOne" data-id="${item.id}" type="button">수동 분석</button>
+          <p>${exifMode ? "EXIF 원본 불러오기로 메타데이터 프롬프트를 다시 읽거나, 업로드 모드를 API 분석으로 바꾼 뒤 수동 분석하세요." : "분석을 실행하면 외모, 복장, 배경, 표정/자세, 디테일 5개 섹션으로 저장됩니다."}</p>
+          <div class="toolbar" style="justify-content:center">
+            <button class="primary-btn" data-action="analyzeOne" data-id="${itemId}" type="button" ${exifMode ? "disabled" : ""}>수동 분석</button>
+            <button class="ghost-btn" data-action="reloadExif" data-id="${itemId}" type="button" ${exifMode ? "" : "disabled"}>EXIF 원본 불러오기</button>
+          </div>
         </div>
       </div>
     `;
@@ -1408,21 +2903,25 @@
   function renderPromptSection(item, sectionConfig, lang) {
     const section = item.promptJson[sectionConfig.key] || { sentences: [] };
     const label = lang === "ko" ? sectionConfig.labelKo : sectionConfig.labelEn;
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    const sectionKey = escapeHtml(normalizeReferenceIdentifier(sectionConfig.key));
     return `
-      <section class="prompt-section" data-section="${sectionConfig.key}">
+      <section class="prompt-section" data-section="${sectionKey}">
         <div class="section-label-row">
           <h3 class="section-label">${escapeHtml(label)}</h3>
-          <button class="tiny-btn section-copy-btn" data-action="copySection" data-id="${item.id}" data-section="${sectionConfig.key}" data-lang="${lang}" type="button" aria-label="${escapeHtml(label)} 문단 복사" data-tooltip="문단 복사">⧉</button>
+          <button class="tiny-btn section-copy-btn" data-action="copySection" data-id="${itemId}" data-section="${sectionKey}" data-lang="${lang}" type="button" aria-label="${escapeHtml(label)} 문단 복사" data-tooltip="문단 복사">⧉</button>
         </div>
         ${section.sentences.map((sentence) => `
           <p class="sentence ${ui.selectedSentenceId === sentence.id ? "active" : ""}"
-             data-sentence-id="${sentence.id}"
+             data-sentence-id="${escapeHtml(normalizeReferenceIdentifier(sentence.id))}"
              data-lang="${lang}"
              contenteditable="${ui.editMode ? "true" : "false"}"
              spellcheck="false">${renderSentenceContent(sentence, lang)}</p>
         `).join("")}
         <div class="toolbar" style="margin-top: var(--space-2); margin-bottom: 0;">
-          <button class="tiny-btn" data-action="regenerateSection" data-section="${sectionConfig.key}" data-id="${item.id}" type="button">${escapeHtml(label)} 재생성</button>
+          ${lang === "ko"
+            ? `<button class="tiny-btn" data-action="retranslateSection" data-section="${sectionKey}" data-id="${itemId}" type="button">${escapeHtml(label)} 재번역</button>`
+            : `<button class="tiny-btn" data-action="regenerateSection" data-section="${sectionKey}" data-id="${itemId}" type="button">${escapeHtml(label)} 재생성</button>`}
         </div>
       </section>
     `;
@@ -1447,10 +2946,10 @@
         </div>
       </div>
       <div class="settings-shell">
-        <nav class="settings-tabs" aria-label="설정 탭">
-          ${tabs.map(([key, label]) => `<button class="settings-tab-btn ${ui.settingsTab === key ? "active" : ""}" data-settings-tab="${key}" type="button">${label}</button>`).join("")}
+        <nav class="settings-tabs" role="tablist" aria-label="설정 탭">
+          ${tabs.map(([key, label]) => `<button class="settings-tab-btn ${ui.settingsTab === key ? "active" : ""}" id="settings-tab-${key}" data-settings-tab="${key}" type="button" role="tab" aria-selected="${ui.settingsTab === key}" aria-controls="settings-panel-${key}">${label}</button>`).join("")}
         </nav>
-        <section class="settings-tab-panel">${renderSettingsTab()}</section>
+        <section class="settings-tab-panel" id="settings-panel-${ui.settingsTab}" role="tabpanel" aria-labelledby="settings-tab-${ui.settingsTab}" tabindex="0">${renderSettingsTab()}</section>
       </div>
     `;
   }
@@ -1472,10 +2971,10 @@
     return `
       <div class="settings-section">
         <h3 class="card-title">AI 공급자</h3>
-        <p class="notice">정적 MVP에서는 API Key 값을 브라우저에 저장하지 않고, 입력 시 서버 보관 표시만 남깁니다. 실제 연결은 서버 API에서 처리해야 안전합니다.</p>
-        <nav class="provider-tabs" aria-label="API 공급자 전환">
+        <p class="notice">역할은 2개뿐입니다. 이미지 분석(비전 프롬프트) · 번역·제목 요약(텍스트). 태그는 앱 로컬 매칭이며 API 역할이 아닙니다. API Key는 서버에만 보관합니다.</p>
+        <nav class="provider-tabs" role="tablist" aria-label="API 공급자 전환">
           ${state.providers.map((item, index) => `
-            <button class="provider-tab-btn ${index === activeIndex ? "active" : ""}" data-provider-tab="${index}" type="button">
+            <button class="provider-tab-btn ${index === activeIndex ? "active" : ""}" data-provider-tab="${index}" type="button" role="tab" aria-selected="${index === activeIndex}">
               <span>${escapeHtml(item.name)}</span>
               <small>${providerIsActive(item) ? "사용" : "끔"}</small>
             </button>
@@ -1506,27 +3005,19 @@
     const usesGeminiApiKeys = provider.name === "Google Gemini API";
     const usesVertexJsonKey = provider.name === "Google Vertex AI";
     const usesOpenAiCompatibleUrl = ["OpenAI", "xAI Grok", "Cerebras Cloud"].includes(provider.name);
-    const checkboxEvents = providerUsageCheckboxEvents();
     const focusEvents = settingsInputFocusEvents();
     return `
-      <form class="panel provider-card" autocomplete="off" onsubmit="return false">
+      <form class="panel provider-card" autocomplete="off">
         <input type="text" autocomplete="username" value="${escapeHtml(provider.name)}" hidden>
         <div class="provider-head">
           <strong>${escapeHtml(provider.name)}</strong>
           <span class="status-pill">${providerIsActive(provider) ? "사용 중" : "미사용"}</span>
         </div>
         <div class="form-grid">
-          <div class="field">
-            <label>기본 모델</label>
+          <div class="field wide-field">
+            <label>모델</label>
             <input class="input" data-provider-model="${index}" ${focusEvents} value="${escapeHtml(provider.model || "")}" placeholder="model-name">
-          </div>
-          <div class="field">
-            <label>비전 모델</label>
-            <input class="input" data-provider-vision-model="${index}" ${focusEvents} value="${escapeHtml(provider.visionModel || "")}" placeholder="vision model">
-          </div>
-          <div class="field">
-            <label>텍스트 모델</label>
-            <input class="input" data-provider-text-model="${index}" ${focusEvents} value="${escapeHtml(provider.textModel || "")}" placeholder="text model">
+            <p class="field-help">비전/텍스트 구분 없이 이 공급자가 쓰는 모델 하나만 설정합니다.</p>
           </div>
           ${usesOpenAiCompatibleUrl ? `
             <div class="field wide-field">
@@ -1555,11 +3046,10 @@
           </div>
         </div>
         <div class="option-grid">
-          <label class="option-item"><input data-provider-use-image="${index}" type="checkbox" ${checkboxEvents} ${provider.useForImageAnalysis ? "checked" : ""}><span>이미지 분석</span></label>
-          <label class="option-item"><input data-provider-use-translation="${index}" type="checkbox" ${checkboxEvents} ${provider.useForTranslation ? "checked" : ""}><span>번역</span></label>
-          <label class="option-item"><input data-provider-use-cleanup="${index}" type="checkbox" ${checkboxEvents} ${provider.useForPromptCleanup ? "checked" : ""}><span>프롬프트 정리</span></label>
-          <label class="option-item"><input data-provider-use-tagging="${index}" type="checkbox" ${checkboxEvents} ${provider.useForTagging ? "checked" : ""}><span>태그 분류</span></label>
+          <label class="option-item"><input data-provider-use-image="${index}" type="checkbox" ${provider.useForImageAnalysis ? "checked" : ""}><span>이미지 분석</span></label>
+          <label class="option-item"><input data-provider-use-translation="${index}" type="checkbox" ${provider.useForTranslation ? "checked" : ""}><span>번역 · 제목 요약</span></label>
         </div>
+        <p class="field-help">이미지 분석: 비전으로 5문단 프롬프트 생성. 번역·제목 요약: 한국어 번역 + 앨범 키워드 제목(헤어·의상·소품/가방·배경). 피부·톤·스냅·조명·여성 표현은 제외. 태그(복장/장소)는 프롬프트 로컬 매칭이며 API 역할이 아닙니다.</p>
         <div class="toolbar" style="margin: 0;">
           <button class="ghost-btn" data-action="saveProvider" data-index="${index}" type="button">설정 저장</button>
           <button class="ghost-btn" data-action="testProvider" data-index="${index}" type="button">연결 테스트</button>
@@ -1601,11 +3091,7 @@
   }
 
   function providerIsActive(provider) {
-    return Boolean(provider.useForImageAnalysis || provider.useForTranslation || provider.useForPromptCleanup || provider.useForTagging);
-  }
-
-  function providerUsageCheckboxEvents() {
-    return `onpointerdown="window.promptArchiveRememberProviderCheckbox(this)" onmousedown="window.promptArchiveRememberProviderCheckbox(this)" onclick="window.promptArchiveProviderCheckbox(this)"`;
+    return Boolean(provider.useForImageAnalysis || provider.useForTranslation);
   }
 
   function settingsInputFocusEvents() {
@@ -1731,6 +3217,15 @@
   function renderUploadSettings() {
     return `
       <div class="settings-section">
+        <h3 class="card-title">프롬프트 입력 방식</h3>
+        <div class="option-grid">
+          <label class="option-item"><input type="radio" name="promptSourceMode" value="ai" ${state.uploadSettings.promptSourceMode !== "exif" ? "checked" : ""}><span>API 이미지 분석 사용</span></label>
+          <label class="option-item"><input type="radio" name="promptSourceMode" value="exif" ${state.uploadSettings.promptSourceMode === "exif" ? "checked" : ""}><span>EXIF / 메타데이터 프롬프트 읽기</span></label>
+          ${checkboxOption("translateExifPrompt", state.uploadSettings.translateExifPrompt, "EXIF 프롬프트 저장 후 한국어 자동 번역")}
+        </div>
+        <p class="notice">EXIF 모드에서는 이미지 분석 API를 호출하지 않고, 업로드 파일의 EXIF / PNG / WebP 메타데이터에서 프롬프트를 읽어 5문단으로 저장합니다. 메타데이터가 없거나 5문단으로 나눌 수 없으면 저장을 막고 해당 파일을 강조 표시합니다.</p>
+      </div>
+      <div class="settings-section">
         <h3 class="card-title">업로드 최적화</h3>
         <div class="option-grid">
           ${checkboxOption("preserveOriginal", state.uploadSettings.preserveOriginal, "원본 이미지 보관")}
@@ -1740,7 +3235,7 @@
           ${checkboxOption("generateThumbnail", state.uploadSettings.generateThumbnail, "썸네일 자동 생성")}
           ${checkboxOption("allowClipboardPaste", state.uploadSettings.allowClipboardPaste, "클립보드 붙여넣기 허용")}
           ${checkboxOption("allowDragDrop", state.uploadSettings.allowDragDrop, "드래그 앤 드롭 허용")}
-          ${checkboxOption("detectDuplicates", state.uploadSettings.detectDuplicates, "중복 업로드 감지")}
+          ${checkboxOption("detectDuplicates", state.uploadSettings.detectDuplicates, "중복 업로드 감지 (파일 + 의상·배경 프롬프트)")}
         </div>
         <div class="form-grid">
           ${numberField("displayMaxSize", "최대 표시 이미지 크기", state.uploadSettings.displayMaxSize, 512, 4096)}
@@ -1752,7 +3247,7 @@
           ${numberField("concurrentAnalysisCount", "동시 분석 수", state.uploadSettings.concurrentAnalysisCount, 1, 8)}
         </div>
         <div class="toolbar"><button class="primary-btn" data-action="saveUploadSettings" type="button">업로드 설정 저장</button></div>
-        <p class="notice">브라우저 캔버스로 리사이즈와 포맷 변환을 수행해 서버 트래픽과 저장 용량을 줄입니다. GIF는 기본 차단합니다.</p>
+        <p class="notice">브라우저 캔버스로 리사이즈와 포맷 변환을 수행해 서버 트래픽과 저장 용량을 줄입니다. GIF는 기본 차단합니다. 중복 감지는 제목·태그·외모·포즈·디테일을 제외하고 의상과 배경 문단이 모두 같은 업로드를 막습니다.</p>
       </div>
     `;
   }
@@ -1763,8 +3258,15 @@
         <h3 class="card-title">갤러리 표시 설정</h3>
         <div class="form-grid">
           ${numberField("albumColumns", "열 개수", state.albumSettings.columns, 2, 8)}
-          ${numberField("albumRows", "행 개수", state.albumSettings.rows, 2, 8)}
-          <div class="field"><label>페이지당 이미지</label><input class="input" value="${state.albumSettings.columns * state.albumSettings.rows}" disabled></div>
+          ${numberField("albumRows", "묶음당 행 개수", state.albumSettings.rows, 2, 8)}
+          <div class="field"><label>묶음당 이미지</label><input class="input" value="${state.albumSettings.columns * state.albumSettings.rows}" disabled></div>
+          <div class="field">
+            <label for="galleryLoadMode">탐색 방식</label>
+            <select class="select" id="galleryLoadMode">
+              ${option("infinite", "아래로 계속 보기", state.albumSettings.loadMode)}
+              ${option("pages", "페이지로 이동", state.albumSettings.loadMode)}
+            </select>
+          </div>
           <div class="field">
             <label for="paginationPosition">페이지 이동 위치</label>
             <select class="select" id="paginationPosition">
@@ -1783,6 +3285,13 @@
               ${option("original", "원본형", state.albumSettings.cardAspectRatio)}
             </select>
           </div>
+        </div>
+        <p class="field-help">페이지 이동 위치는 탐색 방식을 ‘페이지로 이동’으로 선택했을 때 적용됩니다.</p>
+        <div class="option-grid" style="margin-top: var(--space-3);">
+          ${checkboxOption("showTitle", state.albumSettings.showTitle !== false, "카드 제목 표시")}
+          ${checkboxOption("showTags", state.albumSettings.showTags !== false, "카드 태그 표시")}
+          ${checkboxOption("showStatus", state.albumSettings.showStatus !== false, "원본/수정 상태 표시")}
+          ${checkboxOption("showFavorite", state.albumSettings.showFavorite !== false, "즐겨찾기 버튼 표시")}
         </div>
         <div class="toolbar"><button class="primary-btn" data-action="saveAlbumSettings" type="button">갤러리 설정 저장</button></div>
       </div>
@@ -1876,10 +3385,47 @@
         <div class="toolbar">
           <button class="primary-btn" data-action="saveAdvancedSettings" type="button">고급 설정 저장</button>
           <button class="ghost-btn" data-action="retryFailed" type="button">실패 항목 재시도</button>
-          <button class="ghost-btn" data-action="exportJson" type="button">JSON 백업</button>
+          <button class="ghost-btn" data-action="exportJson" type="button">JSON 클립보드 복사</button>
+          <button class="ghost-btn" data-action="exportArchive" type="button">전체 백업 저장</button>
+          <button class="ghost-btn" data-action="importArchive" type="button">백업 가져오기</button>
           <button class="ghost-btn" data-action="exportCsv" type="button">CSV 내보내기</button>
           <button class="danger-btn" data-action="resetSettingsOnly" type="button">설정 기본값 복원</button>
         </div>
+        <div class="option-grid backup-secret-option">
+          ${checkboxOption("includeSecretsInBackup", false, "전체 백업에 API 비밀키 포함")}
+        </div>
+        <p class="notice">비밀키는 기본적으로 백업에서 제외됩니다. 다른 기기로 완전히 이전해야 할 때만 포함하고, 생성된 파일을 암호화된 저장소에 보관하세요.</p>
+        <p class="field-help" style="margin-top: var(--space-2);">
+          <strong>전체 백업 저장</strong>은 게시물·설정·태그·API 설정·업로드 이미지를 하나의 JSON 파일로 내보냅니다.
+          <strong>백업 가져오기</strong>는 그 파일로 현재 데이터를 교체 복원합니다. (가져오기 전 현재 상태를 백업해 두세요.)
+        </p>
+        <input id="archiveImportInput" type="file" accept="application/json,.json" hidden>
+        <h3 class="card-title" style="margin-top: var(--space-5);">배치 작업</h3>
+        <div class="toolbar">
+          <button class="ghost-btn" data-action="batchRetitle" type="button">전체 제목 재요약</button>
+          <button class="ghost-btn" data-action="batchRetag" type="button">전체 태그 재추론</button>
+          <button class="ghost-btn" data-action="migrateBaselines" type="button">원본 기준 보정</button>
+        </div>
+        <h3 class="card-title" style="margin-top: var(--space-5);">단축키</h3>
+        <p class="field-help">비워 두면 해당 단축키는 비활성입니다. 입력칸을 클릭한 뒤 원하는 키를 누르면 등록됩니다.</p>
+        <div class="form-grid shortcut-grid">
+          ${shortcutField("shortcutNextItem", "다음 게시물", state.advancedSettings.shortcuts?.nextItem || "")}
+          ${shortcutField("shortcutPrevItem", "이전 게시물", state.advancedSettings.shortcuts?.prevItem || "")}
+          ${shortcutField("shortcutCopyFinal", "최종 프롬프트 복사", state.advancedSettings.shortcuts?.copyFinal || "")}
+          ${shortcutField("shortcutGoBack", "뒤로", state.advancedSettings.shortcuts?.goBack || "")}
+        </div>
+        <div class="toolbar">
+          <button class="ghost-btn" data-action="clearShortcuts" type="button">단축키 모두 비우기</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function shortcutField(id, label, value) {
+    return `
+      <div class="field">
+        <label for="${id}">${label}</label>
+        <input class="input shortcut-input" id="${id}" type="text" value="${escapeHtml(value)}" placeholder="비활성" readonly data-shortcut-field="${id}">
       </div>
     `;
   }
@@ -1896,13 +3442,24 @@
     return `<option value="${value}" ${current === value ? "selected" : ""}>${label}</option>`;
   }
 
+  function bindImageErrorEvents(root) {
+    root?.querySelectorAll("img").forEach((image) => {
+      image.addEventListener("error", () => {
+        image.classList.add("broken-image");
+        image.alt = "이미지 없음";
+      });
+    });
+  }
+
   function bindCommonEvents() {
+    bindImageErrorEvents(document);
     document.querySelectorAll("[data-view]").forEach((node) => {
       node.addEventListener("click", () => {
         if (node.dataset.view === "upload" || node.dataset.view === "settings") {
-          ui.modal = node.dataset.view;
-          if (node.dataset.view === "settings") ui.settingsTab = "api";
+          openModal(node.dataset.view);
+          return;
         } else {
+          ui.previousView = ui.view;
           ui.view = node.dataset.view;
           ui.modal = null;
         }
@@ -1912,6 +3469,21 @@
     document.querySelectorAll("[data-settings-tab]").forEach((node) => {
       node.addEventListener("click", () => {
         ui.settingsTab = node.dataset.settingsTab;
+        postRenderFocusSelector = `[data-settings-tab="${ui.settingsTab}"]`;
+        render();
+      });
+      node.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        const tabs = [...document.querySelectorAll("[data-settings-tab]")];
+        const current = tabs.indexOf(node);
+        const next = event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? tabs.length - 1
+            : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+        event.preventDefault();
+        ui.settingsTab = tabs[next].dataset.settingsTab;
+        postRenderFocusSelector = `[data-settings-tab="${ui.settingsTab}"]`;
         render();
       });
     });
@@ -1960,58 +3532,273 @@
     });
     const search = document.getElementById("globalSearch");
     if (search) {
+      // Keep the input node stable. Full app re-render destroys Hangul IME composition.
+      search.addEventListener("compositionstart", () => {
+        searchImeComposing = true;
+      });
+      search.addEventListener("compositionend", (event) => {
+        searchImeComposing = false;
+        ui.query = event.target.value;
+        syncSearchClearButton();
+        scheduleSearchRefresh();
+      });
       search.addEventListener("input", (event) => {
         ui.query = event.target.value;
-        if (ui.view !== "gallery") ui.view = "gallery";
-        resetGalleryWindow();
-        render();
+        syncSearchClearButton();
+        if (searchImeComposing || event.isComposing) {
+          // Still refresh results with current composition text, without touching the input DOM.
+          scheduleSearchRefresh({ immediate: false });
+          return;
+        }
+        scheduleSearchRefresh({ immediate: true });
+      });
+      search.addEventListener("keydown", (event) => {
+        // Prevent global shortcuts from stealing keys while searching.
+        event.stopPropagation();
       });
     }
-    const sort = document.getElementById("sortSelect");
-    if (sort) {
-      sort.addEventListener("change", (event) => {
-        ui.sort = event.target.value;
-        resetGalleryWindow();
-        render();
-      });
-    }
-    document.querySelector('[data-action="logout"]')?.addEventListener("click", () => {
-      sessionStorage.removeItem(SESSION_KEY);
-      render();
-    });
+    bindGallerySelectEvents();
+  }
+
+  function syncSearchClearButton() {
+    const clearButton = document.querySelector('[data-action="clearSearch"]');
+    if (!clearButton) return;
+    clearButton.hidden = !ui.query;
+    clearButton.disabled = !ui.query;
   }
 
   function bindViewEvents() {
     bindGalleryInfiniteScroll();
     document.querySelectorAll("[data-open-item]").forEach((node) => {
       node.addEventListener("click", (event) => {
-        if (event.target.closest("button")) return;
+        if (event.target.closest("button, input, label, .bulk-delete-check")) return;
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
+        if (ui.bulkCategoryMode) {
+          toggleBulkCategoryItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
         openItem(node.dataset.openItem);
       });
       node.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") openItem(node.dataset.openItem);
+        if (event.target !== node) return;
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        if (ui.bulkDeleteMode) {
+          toggleBulkDeleteItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
+        if (ui.bulkCategoryMode) {
+          toggleBulkCategoryItem(node.dataset.openItem);
+          refreshBulkSelectionUi();
+          return;
+        }
+        openItem(node.dataset.openItem);
       });
     });
     document.querySelectorAll("[data-action]").forEach((node) => {
       node.addEventListener("click", (event) => handleAction(event, node));
     });
+    bindModalBackdropGuard();
     bindUploadEvents();
+    bindConverterEvents();
+    bindLoraSorterEvents();
     bindPromptEvents();
     bindSettingsEvents();
+    bindShortcutCaptureFields();
+  }
+
+  function bindModalBackdropGuard() {
+    const backdrop = document.querySelector(".modal-backdrop");
+    if (!backdrop) {
+      modalBackdropPointerDown = false;
+      return;
+    }
+    // Only close when the press starts on the dimmed backdrop itself.
+    // Prevents text-selection drags from inputs closing the modal on mouseup outside.
+    backdrop.addEventListener("pointerdown", (event) => {
+      modalBackdropPointerDown = event.target === backdrop;
+    }, true);
+    backdrop.querySelector("[data-modal-panel]")?.addEventListener("pointerdown", () => {
+      modalBackdropPointerDown = false;
+    }, true);
+    window.addEventListener("pointerup", () => {
+      // Keep flag until the following click handler runs, then clear on next tick.
+      setTimeout(() => {
+        modalBackdropPointerDown = false;
+      }, 0);
+    }, { once: true });
   }
 
   async function handleAction(event, node) {
     const action = node.dataset.action;
-    if (action === "upload" || action === "settings") {
-      ui.modal = action;
-      if (action === "settings") ui.settingsTab = "api";
-      render();
+    if (action === "upload" || action === "settings" || action === "converter") {
+      openModal(action);
+      return;
+    }
+    if (action === "loraSorter") {
+      openModal(action);
+      await loraSorterRestorePromise;
+      if (loraSorterState.sourceHandle && !loraSorterState.groups.length && !loraSorterState.scanning) {
+        try {
+          if (await ensureDirectoryPermission(loraSorterState.sourceHandle, true)) await scanLoraSorterFolder();
+          else showToast("저장된 이미지 폴더를 다시 사용하려면 접근 권한이 필요합니다.", "warning", 3200);
+        } catch (error) {
+          showToast(error.message || "저장된 이미지 폴더를 다시 열지 못했습니다.", "warning", 3200);
+        }
+      }
       return;
     }
     if (action === "closeModal") {
-      if (node.classList.contains("modal-backdrop") && event.target !== node) return;
+      if (node.classList.contains("modal-backdrop")) {
+        // Require both target and pointer-down origin to be the backdrop.
+        if (event.target !== node || !modalBackdropPointerDown) return;
+      }
+      closeModal();
+      return;
+    }
+    if (action === "retryServer") {
+      await retryServerConnection();
+      return;
+    }
+    if (action === "selectConverterSource") {
+      await selectConverterSourceFolder();
+      return;
+    }
+    if (action === "selectConverterDestination") {
+      await selectConverterDestinationFolder();
+      return;
+    }
+    if (action === "resetConverterSelection") {
+      resetConverterSelection();
+      return;
+    }
+    if (action === "startConverter") {
+      await startPngToWebpConversion();
+      return;
+    }
+    if (action === "selectLoraSorterSource") {
+      await selectLoraSorterSourceFolder();
+      return;
+    }
+    if (action === "selectLoraSorterBaseDestination") {
+      await selectLoraSorterBaseDestination();
+      return;
+    }
+    if (action === "selectLoraGroupDestination") {
+      await selectLoraGroupDestination(node.dataset.loraKey);
+      return;
+    }
+    if (action === "toggleLoraGroupExcluded") {
+      toggleLoraGroupExcluded(node.dataset.loraKey);
+      return;
+    }
+    if (action === "rescanLoraSorter") {
+      await scanLoraSorterFolder();
+      return;
+    }
+    if (action === "startLoraSorterMove") {
+      await startLoraSorterMove();
+      return;
+    }
+    if (action === "syncWildcards") {
+      await syncWildcardsFromArchive();
+      return;
+    }
+    if (action === "rebuildWildcards") {
+      await rebuildWildcardsFromArchive();
+      return;
+    }
+    if (action === "clearSearch") {
+      ui.query = "";
+      resetGalleryWindow();
+      postRenderFocusSelector = "#globalSearch";
+      render();
+      return;
+    }
+    if (action === "resetGalleryFilters") {
+      resetGalleryFilters();
+      render();
+      return;
+    }
+    if (action === "toggleFavoriteFilter") {
+      ui.favoriteOnly = !ui.favoriteOnly;
+      resetGalleryWindow();
+      render();
+      return;
+    }
+    if (action === "toggleDuplicatesFilter") {
+      ui.showDuplicatesOnly = !ui.showDuplicatesOnly;
+      resetGalleryWindow();
+      render();
+      return;
+    }
+    if (action === "toggleBulkDeleteMode") {
+      ui.bulkDeleteMode = !ui.bulkDeleteMode;
+      ui.selectedBulkDeleteIds = [];
+      ui.bulkCategoryMode = false;
+      ui.selectedBulkCategoryIds = [];
+      ui.view = "gallery";
       ui.modal = null;
       render();
+      return;
+    }
+    if (action === "toggleBulkCategoryMode") {
+      ui.bulkCategoryMode = !ui.bulkCategoryMode;
+      ui.selectedBulkCategoryIds = [];
+      ui.bulkDeleteMode = false;
+      ui.selectedBulkDeleteIds = [];
+      ui.view = "gallery";
+      ui.modal = null;
+      render();
+      return;
+    }
+    if (action === "cancelBulkDeleteMode") {
+      ui.bulkDeleteMode = false;
+      ui.selectedBulkDeleteIds = [];
+      render();
+      return;
+    }
+    if (action === "cancelBulkCategoryMode") {
+      ui.bulkCategoryMode = false;
+      ui.selectedBulkCategoryIds = [];
+      render();
+      return;
+    }
+    if (action === "bulkCategoryToggleItem") {
+      event.stopPropagation();
+      setBulkCategoryItemSelection(node.dataset.bulkCategoryId, node.checked);
+      refreshBulkSelectionUi();
+      return;
+    }
+    if (action === "applyBulkCategory") {
+      const categoryId = document.getElementById("bulkCategorySelect")?.value;
+      applyBulkCategory(categoryId);
+      return;
+    }
+    if (action === "bulkToggleItem") {
+      event.stopPropagation();
+      setBulkDeleteItemSelection(node.dataset.bulkDeleteId, node.checked);
+      refreshBulkSelectionUi();
+      return;
+    }
+    if (action === "bulkSelectVisible") {
+      toggleVisibleBulkDeleteSelection();
+      refreshBulkSelectionUi();
+      return;
+    }
+    if (action === "clearBulkDeleteSelection") {
+      ui.selectedBulkDeleteIds = [];
+      refreshBulkSelectionUi();
+      return;
+    }
+    if (action === "confirmBulkDelete") {
+      deleteSelectedItems();
       return;
     }
     if (action === "searchFocus") document.getElementById("globalSearch")?.focus();
@@ -2025,15 +3812,35 @@
       const item = findItem(node.dataset.id);
       item.isFavorite = !item.isFavorite;
       item.updatedAt = Date.now();
-      saveItemState(item);
+      await saveItemState(item);
       render();
     }
-    if (action === "openUploaded") openItem(node.dataset.id);
+    if (action === "openUploaded") {
+      ui.modal = null;
+      modalReturnAction = "";
+      ui.view = "gallery";
+      openItem(node.dataset.id);
+    }
     if (action === "togglePendingUpload") togglePendingUpload(node.dataset.key);
     if (action === "removeSelectedPendingUploads") removeSelectedPendingUploads();
     if (action === "clearUploadWorkspace") clearUploadWorkspace();
     if (action === "saveAndAnalyzeUploads") await processPendingUploads(true);
-    if (action === "analyzeOne") await analyzeItem(node.dataset.id);
+    if (action === "analyzeOne") {
+      if (isExifPromptMode()) {
+        showToast("EXIF 모드에서는 재분석 대신 EXIF 원본 불러오기를 사용하세요.", "warning");
+        return;
+      }
+      captureSelectedDetailDraft();
+      await analyzeItem(node.dataset.id);
+    }
+    if (action === "reloadExif") {
+      if (!isExifPromptMode()) {
+        showToast("API 모드에서는 EXIF 원본 불러오기 대신 재분석을 사용하세요.", "warning");
+        return;
+      }
+      captureSelectedDetailDraft();
+      await reloadExifPrompt(node.dataset.id);
+    }
     if (action === "bulkAnalyze") {
       let analyzedCount = 0;
       for (const item of state.items.filter((entry) => entry.status === "uploaded" || entry.status === "analysis_failed")) {
@@ -2049,11 +3856,82 @@
     if (action === "copyPrompt") copyPrompt(node.dataset.id, node.dataset.mode);
     if (action === "copySection") copySection(node.dataset.id, node.dataset.section, node.dataset.lang);
     if (action === "toggleEdit") {
+      captureSelectedDetailDraft();
       ui.editMode = !ui.editMode;
       render();
     }
-    if (action === "regenerateSection") regenerateSection(node.dataset.id, node.dataset.section);
-    if (action === "saveDetail") saveDetail(node.dataset.id);
+    if (action === "regenerateSection") {
+      captureSelectedDetailDraft();
+      await regenerateSection(node.dataset.id, node.dataset.section);
+    }
+    if (action === "retranslateSection") {
+      captureSelectedDetailDraft();
+      await retranslateSection(node.dataset.id, node.dataset.section);
+    }
+    if (action === "saveDetail") await saveDetail(node.dataset.id);
+    if (action === "revisePrompt") await revisePromptFromDetail(node.dataset.id);
+    if (action === "restoreBaseline") {
+      const item = findItem(node.dataset.id);
+      if (!item) return;
+      captureSelectedDetailDraft();
+      try {
+        restorePromptBaseline(item);
+        item.updatedAt = Date.now();
+        const saved = await saveItemState(item);
+        render();
+        showToast(saved ? "원본 프롬프트로 되돌리고 서버에 저장했습니다." : "원본 프롬프트를 브라우저에 임시 저장했습니다.", saved ? "success" : "warning");
+      } catch (error) {
+        showToast(error.message || "원본 되돌리기 실패", "warning");
+      }
+    }
+    if (action === "restoreVersion") {
+      const item = findItem(node.dataset.id);
+      const index = Number(node.dataset.index);
+      const version = item?.versions?.[index];
+      if (!item || !version?.promptJson) return;
+      captureSelectedDetailDraft();
+      applyPrompt(item, clonePromptJson(version.promptJson));
+      syncPromptEditState(item, "manual");
+      item.status = "modified";
+      applyLocalTagsFromPrompt(item);
+      const saved = await saveItemState(item);
+      render();
+      showToast(saved ? "이전 버전을 복원하고 서버에 저장했습니다." : "복원본을 브라우저에 임시 저장했습니다.", saved ? "success" : "warning");
+    }
+    if (action === "togglePromptCompare") {
+      captureSelectedDetailDraft();
+      ui.promptCompareMode = !ui.promptCompareMode;
+      render();
+    }
+    if (action === "retitleOne") await retitleOneItem(node.dataset.id);
+    if (action === "retagOne") await retagOneItem(node.dataset.id);
+    if (action === "toggleDetailTag") {
+      event.preventDefault();
+      event.stopPropagation();
+      const item = findItem(node.dataset.id);
+      if (!item) return;
+      collectDetailFields(item);
+      const type = node.dataset.type;
+      const key = node.dataset.key;
+      const field = type === "outfit" ? "outfitTags" : "backgroundTags";
+      const list = new Set(item[field] || []);
+      if (list.has(key)) list.delete(key);
+      else list.add(key);
+      item[field] = [...list];
+      item.updatedAt = Date.now();
+      await saveItemState(item);
+      render();
+    }
+    if (action === "batchRetitle") await batchRetitleAll();
+    if (action === "batchRetag") batchRetagAll();
+    if (action === "migrateBaselines") {
+      migrateAllPromptBaselines();
+      saveItemsState();
+      render();
+      showToast("원본 기준을 보정했습니다.", "success");
+    }
+    if (action === "exportArchive") await exportArchiveBackup();
+    if (action === "importArchive") triggerArchiveImport();
     if (action === "deleteItem") deleteItem(node.dataset.id);
     if (action === "addExcludeOption") addExcludeOption();
     if (action === "saveExcludeOption") saveExcludeOption(node.dataset.key);
@@ -2065,6 +3943,7 @@
     if (action === "saveCopyDisplaySettings") saveCopyDisplaySettings();
     if (action === "saveThemeSettings") saveThemeSettings();
     if (action === "saveAdvancedSettings") saveAdvancedSettings();
+    if (action === "clearShortcuts") clearAllShortcuts();
     if (action === "saveCategorySettings") saveCategorySettings();
     if (action === "addCategory") addCategory();
     if (action === "saveCategory") saveCategory(node.dataset.id);
@@ -2094,6 +3973,9 @@
     if (!dropZone || !input || !pick) return;
     pick.addEventListener("click", () => input.click());
     input.addEventListener("change", () => addPendingUploadFiles(input.files));
+    document.getElementById("uploadTitle")?.addEventListener("input", captureUploadDraft);
+    document.getElementById("uploadCategory")?.addEventListener("change", captureUploadDraft);
+    document.getElementById("uploadCustomInstruction")?.addEventListener("input", captureUploadDraft);
     document.querySelectorAll('input[name="uploadExclude"]').forEach((node) => {
       node.addEventListener("change", rememberUploadExcludeOptions);
     });
@@ -2112,6 +3994,12 @@
       });
       dropZone.addEventListener("drop", (event) => addPendingUploadFiles(event.dataTransfer.files));
     }
+  }
+
+  function captureUploadDraft() {
+    ui.uploadDraft.title = document.getElementById("uploadTitle")?.value || ui.uploadDraft.title || "";
+    ui.uploadDraft.categoryId = document.getElementById("uploadCategory")?.value || ui.uploadDraft.categoryId || state.categories[0]?.id || "";
+    ui.uploadDraft.customInstruction = document.getElementById("uploadCustomInstruction")?.value || ui.uploadDraft.customInstruction || "";
   }
 
   window.addEventListener("paste", (event) => {
@@ -2158,6 +4046,8 @@
   }
 
   function resetGalleryWindow() {
+    if (galleryLoadTimer) window.clearTimeout(galleryLoadTimer);
+    galleryLoadTimer = null;
     ui.page = 1;
     ui.galleryLoadedPages = 1;
     ui.galleryLoading = false;
@@ -2168,14 +4058,14 @@
       window.removeEventListener("scroll", window.promptArchiveGalleryScrollHandler);
       window.promptArchiveGalleryScrollHandler = null;
     }
-    if (ui.view !== "gallery" || ui.modal) return;
+    if (ui.view !== "gallery" || ui.modal || state.albumSettings.loadMode === "pages") return;
     window.promptArchiveGalleryScrollHandler = () => maybeLoadMoreGallery();
     window.addEventListener("scroll", window.promptArchiveGalleryScrollHandler, { passive: true });
     maybeLoadMoreGallery();
   }
 
   function maybeLoadMoreGallery() {
-    if (ui.view !== "gallery" || ui.modal || ui.galleryLoading) return;
+    if (ui.view !== "gallery" || ui.modal || ui.galleryLoading || state.albumSettings.loadMode === "pages") return;
     const perPage = state.albumSettings.columns * state.albumSettings.rows;
     const totalCount = getFilteredItems().length;
     if ((ui.galleryLoadedPages || 1) * perPage >= totalCount) return;
@@ -2183,16 +4073,37 @@
     const distanceToBottom = document.documentElement.scrollHeight - scrollBottom;
     if (distanceToBottom > 420) return;
     ui.galleryLoading = true;
-    render();
-    window.setTimeout(() => {
+    refreshGalleryContentPreservingSearch();
+    galleryLoadTimer = window.setTimeout(() => {
+      galleryLoadTimer = null;
+      if (ui.view !== "gallery" || ui.modal || state.albumSettings.loadMode === "pages") {
+        ui.galleryLoading = false;
+        return;
+      }
       ui.galleryLoadedPages = (ui.galleryLoadedPages || 1) + 1;
       ui.galleryLoading = false;
-      render();
+      refreshGalleryContentPreservingSearch();
       window.setTimeout(() => maybeLoadMoreGallery(), 0);
     }, 260);
   }
 
+  function refreshGalleryContentPreservingSearch() {
+    const search = document.getElementById("globalSearch");
+    if (search && (document.activeElement === search || searchImeComposing)) {
+      const content = document.querySelector("main > .content");
+      if (content && ui.view === "gallery" && !ui.modal) {
+        content.innerHTML = renderGallery();
+        bindGalleryContentEvents();
+        return;
+      }
+    }
+    render();
+  }
+
   function bindSettingsEvents() {
+    document.querySelectorAll("form.provider-card").forEach((form) => {
+      form.addEventListener("submit", (event) => event.preventDefault());
+    });
     document.querySelectorAll("[data-theme]").forEach((node) => {
       node.addEventListener("click", () => {
         document.querySelectorAll("[data-theme]").forEach((themeNode) => themeNode.classList.toggle("active", themeNode === node));
@@ -2231,6 +4142,7 @@
     const files = [...(fileList || [])].filter((file) => file?.type?.startsWith("image/"));
     if (!files.length) return;
     const existing = new Set(ui.pendingUploadFiles.map(pendingUploadKey));
+    ui.pendingUploadErrors = ui.pendingUploadErrors || {};
     files.forEach((file) => {
       const key = pendingUploadKey(file);
       if (!existing.has(key)) {
@@ -2241,6 +4153,7 @@
     ui.pendingUploadFiles = ui.pendingUploadFiles.slice(0, state.advancedSettings.maxImagesPerBatch);
     const validKeys = new Set(ui.pendingUploadFiles.map(pendingUploadKey));
     ui.selectedPendingUploadKeys = ui.selectedPendingUploadKeys.filter((key) => validKeys.has(key));
+    ui.pendingUploadErrors = Object.fromEntries(Object.entries(ui.pendingUploadErrors || {}).filter(([key]) => validKeys.has(key)));
     render();
   }
 
@@ -2256,10 +4169,27 @@
     }
     rememberUploadExcludeOptions();
     const files = [...ui.pendingUploadFiles];
-    revokePendingUploadUrls(ui.pendingUploadFiles);
-    ui.pendingUploadFiles = [];
+    let exifPromptByKey = null;
+    if (isExifPromptMode()) {
+      const validation = await validatePendingExifPrompts(files);
+      if (validation.invalidKeys.length) {
+        ui.pendingUploadErrors = validation.errors;
+        ui.selectedPendingUploadKeys = validation.invalidKeys;
+        render();
+        showToast(`${validation.invalidKeys.length}개 파일에서 EXIF 프롬프트를 찾지 못했습니다. 강조된 파일을 제거한 뒤 다시 저장하세요.`, "warning", 4200);
+        return;
+      }
+      exifPromptByKey = validation.prompts;
+      ui.pendingUploadErrors = {};
+    }
     ui.selectedPendingUploadKeys = [];
-    await processFiles(files, shouldAnalyze);
+    const failedFiles = await processFiles(files, shouldAnalyze, { exifPromptByKey });
+    const failedKeys = new Set(failedFiles.map(pendingUploadKey));
+    revokePendingUploadUrls(files.filter((file) => !failedKeys.has(pendingUploadKey(file))));
+    ui.pendingUploadFiles = failedFiles;
+    ui.selectedPendingUploadKeys = [...failedKeys];
+    ui.uploadProgress = null;
+    render();
   }
 
   function togglePendingUpload(key) {
@@ -2278,6 +4208,7 @@
     const removed = ui.pendingUploadFiles.filter((file) => selected.has(pendingUploadKey(file)));
     revokePendingUploadUrls(removed);
     ui.pendingUploadFiles = ui.pendingUploadFiles.filter((file) => !selected.has(pendingUploadKey(file)));
+    ui.pendingUploadErrors = Object.fromEntries(Object.entries(ui.pendingUploadErrors || {}).filter(([key]) => !selected.has(key)));
     ui.selectedPendingUploadKeys = [];
     render();
   }
@@ -2286,30 +4217,44 @@
     revokePendingUploadUrls(ui.pendingUploadFiles);
     ui.pendingUploadFiles = [];
     ui.selectedPendingUploadKeys = [];
+    ui.pendingUploadErrors = {};
     ui.uploadQueue = [];
     ui.uploadProgress = null;
+    ui.uploadDraft = { title: "", categoryId: state.categories[0]?.id || "", customInstruction: "" };
     render();
   }
 
-  async function processFiles(fileList, shouldAnalyze = false) {
+  async function processFiles(fileList, shouldAnalyze = false, options = {}) {
     const files = [...fileList].slice(0, state.advancedSettings.maxImagesPerBatch);
-    const title = document.getElementById("uploadTitle")?.value.trim() || "";
-    const categoryId = document.getElementById("uploadCategory")?.value || state.categories[0]?.id || "";
+    const failedFiles = [];
+    const exifMode = isExifPromptMode();
+    captureUploadDraft();
+    const title = ui.uploadDraft.title.trim();
+    const categoryId = ui.uploadDraft.categoryId || state.categories[0]?.id || "";
     const tags = [];
-    const customInstruction = document.getElementById("uploadCustomInstruction")?.value.trim() || "";
+    const customInstruction = ui.uploadDraft.customInstruction.trim();
     const excludeOptions = selectedCheckboxValues("uploadExclude");
     ui.uploadProgress = files.length ? { done: 0, total: files.length } : null;
     render();
     for (const [index, file] of files.entries()) {
+      let item = null;
+      let queueEntry = null;
       try {
         validateUploadFile(file);
         if (state.uploadSettings.detectDuplicates && isDuplicateFile(file)) {
           throw new Error("같은 이름과 용량의 이미지가 이미 업로드되어 있습니다.");
         }
+        const exifPrompt = exifMode ? (options.exifPromptByKey?.[pendingUploadKey(file)] || await readExifPromptFromFile(file)) : null;
+        const existingPromptDuplicate = state.uploadSettings.detectDuplicates && exifPrompt
+          ? findCorePromptDuplicate({ promptJson: exifPrompt.promptJson })
+          : null;
+        if (existingPromptDuplicate) {
+          throw new Error(`의상·배경 프롬프트가 "${displayTitle(existingPromptDuplicate)}" 항목과 같습니다. 외모·포즈·디테일 차이는 중복 판정에서 제외합니다.`);
+        }
         const optimized = await optimizeImageFile(file, state.uploadSettings);
-        const item = {
+        item = {
           id: uid("img"),
-          title,
+          title: title || "",
           titleSummary: "",
           memo: "",
           imageUrl: optimized.displayImage.dataUrl,
@@ -2318,57 +4263,242 @@
           thumbnailImage: optimized.thumbnailImage,
           analysisImage: optimized.analysisImage,
           originalImage: optimized.originalImage,
-          uploadMeta: optimized.meta,
+          uploadMeta: exifMode ? {
+            ...optimized.meta,
+            promptSourceMode: "exif",
+            exifPromptFound: true,
+            exifPromptSource: exifPrompt?.source || "metadata",
+            exifPromptLength: exifPrompt?.rawText?.length || 0,
+            exifRawText: exifPrompt?.rawText || "",
+          } : optimized.meta,
           categoryId,
           tags,
           outfitTags: inferTags(file.name, "outfit"),
           backgroundTags: inferTags(file.name, "background"),
-          status: shouldAnalyze ? "analyzing" : "uploaded",
+          status: exifMode ? "analyzed" : shouldAnalyze ? "analyzing" : "uploaded",
           isFavorite: false,
-          promptJson: null,
-          finalPrompt: "",
+          promptJson: exifMode ? exifPrompt.promptJson : null,
+          finalPrompt: exifMode ? promptText({ promptJson: exifPrompt.promptJson }, "final") : "",
           errorMessage: "",
           customInstruction,
           excludeOptions,
           includeOptions: [],
-          analysisRequest: "",
+          analysisRequest: exifMode ? "EXIF / metadata prompt import" : "",
           createdAt: Date.now(),
           updatedAt: Date.now(),
           versions: [],
         };
         state.items.unshift(item);
-        ui.uploadQueue.unshift({
+        queueEntry = {
           name: file.name,
           originalSize: file.size,
           optimizedSize: optimized.displayImage.size,
           url: optimized.thumbnailImage.dataUrl,
-          status: shouldAnalyze ? "저장 및 분석 완료" : "저장 완료",
+          status: exifMode ? "EXIF 처리 중" : shouldAnalyze ? "분석 중" : "저장 중",
           itemId: item.id,
-        });
-        if (shouldAnalyze) await analyzeItem(item.id, false, { silent: true });
-        saveItemState(item);
+        };
+        ui.uploadQueue.unshift(queueEntry);
+        if (exifMode) {
+          const exifTagContext = `${file.name} ${promptText(item, "final")}`;
+          item.outfitTags = inferTags(exifTagContext, "outfit");
+          item.backgroundTags = inferTags(exifTagContext, "background");
+          if (state.uploadSettings.translateExifPrompt) {
+            try {
+              item.status = "modified";
+              await translateItemPromptSections(item, { silent: true });
+              item.status = "analyzed";
+              ui.uploadQueue[0].status = "EXIF 저장 및 번역 완료";
+            } catch (translationError) {
+              item.status = "modified";
+              item.errorMessage = `EXIF 프롬프트는 저장됐지만 번역 실패: ${translationError.message || translationError}`;
+              ui.uploadQueue[0].status = "EXIF 저장 완료, 번역 실패";
+              ui.uploadQueue[0].error = item.errorMessage;
+            }
+          }
+          try {
+            await ensureKoreanTitle(item, { force: !title });
+            if (ui.uploadQueue[0] && !ui.uploadQueue[0].error) {
+              ui.uploadQueue[0].status = `${ui.uploadQueue[0].status} · 제목 요약`;
+            }
+          } catch (titleError) {
+            if (!isUsableAlbumTitle(item.title)) {
+              item.titleSummary = compactImageTitle(item);
+              item.title = item.titleSummary;
+            }
+            if (ui.uploadQueue[0]) {
+              ui.uploadQueue[0].status = `${ui.uploadQueue[0].status} · 제목 실패`;
+            }
+            console.warn("title summary failed after EXIF import", titleError);
+          }
+          markPromptBaseline(item, "exif");
+          item.status = item.errorMessage ? "modified" : "analyzed";
+        } else if (shouldAnalyze) {
+          await analyzeItem(item.id, false, { silent: true });
+        }
+        const analyzedPromptDuplicate = state.uploadSettings.detectDuplicates && item.status !== "analysis_failed"
+          ? findCorePromptDuplicate(item, item.id)
+          : null;
+        if (analyzedPromptDuplicate) {
+          throw new Error(`의상·배경 프롬프트가 "${displayTitle(analyzedPromptDuplicate)}" 항목과 같습니다. 외모·포즈·디테일 차이는 중복 판정에서 제외합니다.`);
+        }
+        if (queueEntry) queueEntry.status = "저장 확인 중";
         render();
-        if (shouldAnalyze) showToast(`${item.title || file.name} 분석이 끝났습니다.`, item.status === "analyzed" ? "success" : "warning");
+        const serverSaved = await saveItemState(item);
+        const durablySaved = serverSaved || persistenceStatus === "fallback";
+        if (!durablySaved) throw new Error("서버와 브라우저 임시 저장에 모두 실패했습니다. 원본 파일을 유지합니다.");
+        if (queueEntry) {
+          if (exifMode) queueEntry.status = item.errorMessage ? "EXIF 저장 완료, 일부 후처리 실패" : "EXIF 프롬프트 저장 완료";
+          else if (shouldAnalyze) queueEntry.status = item.status === "analyzed" ? "저장 및 분석 완료" : "분석 실패, 임시 프롬프트 저장";
+          else queueEntry.status = "저장 완료";
+          if (!serverSaved) queueEntry.status += " · 브라우저 임시 저장";
+        }
+        render();
+        if (exifMode) showToast(`${item.title || file.name} EXIF 프롬프트 저장이 끝났습니다.`, item.errorMessage || !serverSaved ? "warning" : "success");
+        else if (shouldAnalyze) showToast(`${item.title || file.name} 분석과 저장이 끝났습니다.`, item.status === "analyzed" && serverSaved ? "success" : "warning");
       } catch (error) {
-        ui.uploadQueue.unshift({
-          name: file.name,
-          originalSize: file.size,
-          optimizedSize: 0,
-          url: "",
-          status: "업로드 오류",
-          error: error.message || "이미지 변환에 실패했습니다.",
-        });
+        if (item) state.items = state.items.filter((entry) => entry.id !== item.id);
+        const errorMessage = error.message || "이미지 변환 또는 저장에 실패했습니다.";
+        failedFiles.push(file);
+        ui.pendingUploadErrors[pendingUploadKey(file)] = errorMessage;
+        if (queueEntry) {
+          queueEntry.status = "업로드 오류";
+          queueEntry.error = errorMessage;
+          delete queueEntry.itemId;
+        } else {
+          ui.uploadQueue.unshift({
+            name: file.name,
+            originalSize: file.size,
+            optimizedSize: 0,
+            url: "",
+            status: "업로드 오류",
+            error: errorMessage,
+          });
+        }
         render();
       } finally {
         if (ui.uploadProgress) ui.uploadProgress = { done: index + 1, total: files.length };
         render();
       }
     }
+    return failedFiles;
+  }
+
+  async function reloadExifPrompt(id, shouldRender = true) {
+    const item = findItem(id);
+    if (!item) return;
+    item.status = "analyzing";
+    item.errorMessage = "";
+    item.updatedAt = Date.now();
+    item.analysisRequest = "EXIF / metadata prompt reload";
+    if (shouldRender) render();
+    try {
+      const exifPrompt = await loadExifPromptForItem(item);
+      applyPrompt(item, exifPrompt.promptJson);
+      item.uploadMeta = {
+        ...(item.uploadMeta || {}),
+        promptSourceMode: "exif",
+        exifPromptFound: true,
+        exifPromptSource: exifPrompt.source || item.uploadMeta?.exifPromptSource || "metadata",
+        exifPromptLength: exifPrompt.rawText?.length || 0,
+        exifRawText: exifPrompt.rawText || item.uploadMeta?.exifRawText || "",
+      };
+      applyLocalTagsFromPrompt(item);
+      if (state.uploadSettings.translateExifPrompt) {
+        try {
+          await translateItemPromptSections(item, { silent: true });
+        } catch (translationError) {
+          item.errorMessage = `EXIF는 불러왔지만 번역 실패: ${translationError.message || translationError}`;
+        }
+      }
+      try {
+        await ensureKoreanTitle(item, { force: true });
+      } catch (titleError) {
+        if (!isUsableAlbumTitle(item.title)) {
+          item.titleSummary = compactImageTitle(item);
+          item.title = item.titleSummary;
+        }
+        console.warn("title summary failed after EXIF reload", titleError);
+      }
+      markPromptBaseline(item, "exif");
+      item.status = item.errorMessage ? "modified" : "analyzed";
+      item.updatedAt = Date.now();
+      const saved = await saveItemState(item);
+      if (shouldRender) render();
+      showToast(item.errorMessage ? "EXIF 원본을 불러왔지만 일부 후처리에 실패했습니다." : saved ? "EXIF 원본 프롬프트를 다시 불러오고 저장했습니다." : "EXIF 원본을 브라우저에 임시 저장했습니다.", item.errorMessage || !saved ? "warning" : "success");
+    } catch (error) {
+      item.status = "modified";
+      item.errorMessage = error.message || "EXIF 원본 프롬프트를 불러오지 못했습니다.";
+      item.updatedAt = Date.now();
+      await saveItemState(item);
+      if (shouldRender) render();
+      showToast(item.errorMessage, "warning", 2800);
+    }
+  }
+
+  async function loadExifPromptForItem(item) {
+    const rawText = String(item.uploadMeta?.exifRawText || "").trim();
+    if (rawText) {
+      const promptJson = promptJsonFromMetadataText(rawText);
+      if (promptJson) {
+        return {
+          promptJson,
+          rawText,
+          source: item.uploadMeta?.exifPromptSource || "stored-exif-raw",
+        };
+      }
+      throw new Error("저장된 EXIF 원문 파싱 실패");
+    }
+
+    const file = await itemImageAsFile(item);
+    if (!file) {
+      throw new Error("EXIF 원문 미보관 · 원본 이미지 없음");
+    }
+    try {
+      return await readExifPromptFromFile(file);
+    } catch (error) {
+      throw new Error(`이미지 메타 읽기 실패: ${error.message || error}`);
+    }
+  }
+
+  async function itemImageAsFile(item) {
+    const candidates = [
+      item.originalImage?.dataUrl,
+      item.displayImage?.dataUrl,
+      item.imageUrl,
+      item.analysisImage?.dataUrl,
+    ].filter(Boolean);
+    for (const src of candidates) {
+      try {
+        const file = await urlOrDataUrlToFile(src, item.uploadMeta?.originalName || `${item.id}.img`, item.uploadMeta?.originalType || "");
+        if (file) return file;
+      } catch (_error) {}
+    }
+    return null;
+  }
+
+  async function urlOrDataUrlToFile(src, fileName, preferredType) {
+    const value = String(src || "").trim();
+    if (!value) return null;
+    if (value.startsWith("data:")) {
+      const response = await fetch(value);
+      const blob = await response.blob();
+      const type = preferredType || blob.type || "application/octet-stream";
+      return new File([blob], fileName || "image.bin", { type });
+    }
+    const response = await fetch(value);
+    if (!response.ok) throw new Error(`image fetch failed: ${response.status}`);
+    const blob = await response.blob();
+    const type = preferredType || blob.type || "application/octet-stream";
+    return new File([blob], fileName || "image.bin", { type });
   }
 
   async function analyzeItem(id, shouldRender = true, options = {}) {
     const item = findItem(id);
     if (!item) return;
+    if (isExifPromptMode() && !options.forceApi) {
+      showToast("EXIF 모드에서는 재분석 대신 EXIF 원본 불러오기를 사용하세요.", "warning");
+      return;
+    }
     let completedWithFallback = false;
     item.status = "analyzing";
     item.updatedAt = Date.now();
@@ -2377,20 +4507,43 @@
     try {
       const result = await requestProviderAnalysis(item);
       applyAnalysisResult(item, result);
+      try {
+        await ensureKoreanTitle(item, { force: true });
+      } catch (titleError) {
+        if (!isUsableAlbumTitle(item.title)) {
+          item.titleSummary = item.titleSummary || compactImageTitle(item);
+          item.title = item.titleSummary;
+        }
+        console.warn("title summary failed after analysis", titleError);
+      }
+      markPromptBaseline(item, "analysis");
     } catch (error) {
-      item.errorMessage = error.message || "API 분석에 실패해 로컬 임시 분석으로 대체했습니다.";
+      const failureMessage = error.message || "API 분석에 실패해 로컬 임시 분석으로 대체했습니다.";
       item.outfitTags = item.outfitTags?.length ? item.outfitTags : inferTags(item.title + " " + item.tags.join(" "), "outfit");
       item.backgroundTags = item.backgroundTags?.length ? item.backgroundTags : inferTags(item.title + " " + item.tags.join(" "), "background");
       applyPrompt(item, makePrompt(item.tags.includes("product") ? "product" : "upload"));
-      item.status = "modified";
+      item.status = "analysis_failed";
+      item.errorMessage = failureMessage;
       completedWithFallback = true;
+      try {
+        await ensureKoreanTitle(item, { force: true });
+      } catch (_titleError) {
+        if (!isUsableAlbumTitle(item.title)) {
+          item.titleSummary = compactImageTitle(item);
+          item.title = item.titleSummary;
+        }
+      }
     }
+    let savedToServer = true;
     if (shouldRender) {
-      saveItemState(item);
+      savedToServer = await saveItemState(item);
       render();
     }
     if (!options.silent) {
-      showToast(completedWithFallback ? "API 분석 실패, 임시 프롬프트로 대체했습니다." : "AI 분석이 끝났습니다.", completedWithFallback ? "warning" : "success");
+      const message = completedWithFallback
+        ? "API 분석 실패, 임시 프롬프트로 대체했습니다."
+        : savedToServer ? "AI 분석과 서버 저장이 끝났습니다." : "AI 분석 결과를 브라우저에 임시 저장했습니다.";
+      showToast(message, completedWithFallback || !savedToServer ? "warning" : "success");
     }
   }
 
@@ -2419,18 +4572,104 @@
   function applyAnalysisResult(item, result) {
     const promptJson = normalizeAnalysisPrompt(result.promptJson || result.promptSections);
     applyPrompt(item, promptJson);
-    if (Array.isArray(result.outfitTags)) item.outfitTags = resolveAnalysisTagKeys(result.outfitTags, "outfit", item);
-    if (Array.isArray(result.backgroundTags)) item.backgroundTags = resolveAnalysisTagKeys(result.backgroundTags, "background", item);
-    if (Array.isArray(result.generalTags) && result.generalTags.length) item.tags = [...new Set([...item.tags, ...result.generalTags.map((tag) => String(tag).trim()).filter(Boolean)])];
-    item.titleSummary = cleanTitleSummary(result.titleSummary) || compactImageTitle(item);
-    if (!item.title || looksLikeFileTitle(item.title)) item.title = item.titleSummary;
+    // Tags are local keyword matching against prompt text (not a separate API role).
+    applyLocalTagsFromPrompt(item);
+    // Album titles are filled by the translation provider via /api/title-summary.
+    // Ignore analysis titleSummary fragments so we keep one consistent title path.
+    if (!isKoreanTitleSummary(item.titleSummary)) item.titleSummary = "";
     item.errorMessage = "";
   }
 
+  function applyLocalTagsFromPrompt(item) {
+    const sectionText = (key) => (item.promptJson?.[key]?.sentences || [])
+      .map((sentence) => [sentence.en, sentence.ko].filter(Boolean).join(" "))
+      .join(" ");
+    // Match outfit tags from outfit section, place tags from background section first.
+    const outfitContext = [
+      sectionText("outfit"),
+      item.title || "",
+    ].filter(Boolean).join(" ");
+    const placeContext = [
+      sectionText("background"),
+      item.title || "",
+    ].filter(Boolean).join(" ");
+    const fullFallback = [
+      promptText(item, "final"),
+      promptText(item, "ko"),
+      promptText(item, "en"),
+      item.finalPrompt || "",
+    ].filter(Boolean).join(" ");
+    item.outfitTags = inferTags(outfitContext || fullFallback, "outfit");
+    item.backgroundTags = inferTags(placeContext || fullFallback, "background");
+  }
+
   function cleanTitleSummary(value) {
-    const text = String(value || "").trim().replace(/\.(jpe?g|png|webp|gif|bmp|avif)\b/ig, "");
-    if (!text || looksLikeFileTitle(text)) return "";
-    return text.split(",").map((part) => part.trim()).filter(Boolean).slice(0, 5).join(", ");
+    let text = String(value || "")
+      .replace(/^["'`]+|["'`]+$/g, "")
+      .replace(/\.(jpe?g|png|webp|gif|bmp|avif)\b/ig, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text || looksLikeFileTitle(text) || looksLikeEnglishPromptSnippet(text)) return "";
+    if (text.length > 60) text = text.slice(0, 60).replace(/\s+\S*$/, "").trim();
+    return text;
+  }
+
+  async function ensureKoreanTitle(item, options = {}) {
+    if (!item?.promptJson) return false;
+    const force = options.force === true;
+    if (!force && isKoreanTitleSummary(item.titleSummary)) {
+      if (!isUsableAlbumTitle(item.title) || looksLikeEnglishPromptSnippet(item.title)) {
+        item.title = item.titleSummary;
+      }
+      return false;
+    }
+    if (!force && isUsableAlbumTitle(item.title) && isKoreanTitleSummary(item.title)) {
+      item.titleSummary = item.title;
+      return false;
+    }
+    const summary = await requestTitleSummary(item);
+    if (!summary) return false;
+    item.titleSummary = summary;
+    if (force || !isUsableAlbumTitle(item.title) || looksLikeEnglishPromptSnippet(item.title)) {
+      item.title = summary;
+    }
+    item.updatedAt = Date.now();
+    return true;
+  }
+
+  async function requestTitleSummary(item) {
+    const sections = {};
+    sectionMeta.forEach((section) => {
+      const sentences = item.promptJson?.[section.key]?.sentences || [];
+      const text = sentences
+        .map((sentence) => [sentence.ko, sentence.en].filter(Boolean).join(" / "))
+        .filter(Boolean)
+        .join(" ");
+      if (text) sections[section.key] = text;
+    });
+    const promptTextValue = [
+      promptText(item, "ko"),
+      promptText(item, "en"),
+      item.finalPrompt || "",
+    ].filter(Boolean).join("\n\n").trim();
+    // Only place/background tags are sent as title context.
+    const placeTags = tagNames(item.backgroundTags, "background").filter((name) => name && name !== "기타");
+    const response = await fetch(SERVER_TITLE_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        itemId: item.id,
+        promptText: promptTextValue.slice(0, 6000),
+        sections,
+        backgroundTags: placeTags,
+        placeTags,
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || payload.error || "제목 요약 요청에 실패했습니다.");
+    }
+    return cleanTitleSummary(payload.titleSummary) || "";
   }
 
   function normalizeAnalysisPrompt(value) {
@@ -2442,7 +4681,7 @@
       prompt[section.key] = {
         title_ko: repairText(sectionValue.title_ko, section.labelKo),
         sentences: sentences.length ? sentences.map((sentence, index) => ({
-          id: sentence.id || `${section.key}-${index + 1}`,
+          id: normalizeIdentifier(sentence.id || `${section.key}-${index + 1}`, `${section.key}-sentence`),
           en: String(sentence.en || sentence.text || "").trim(),
           ko: repairText(String(sentence.ko || "").trim(), ""),
         })).filter((sentence) => sentence.en || sentence.ko) : makePrompt("upload")[section.key].sentences,
@@ -2455,14 +4694,14 @@
     if (item.promptJson) {
       item.versions.unshift({ id: uid("ver"), promptJson: structuredClone(item.promptJson), finalPrompt: item.finalPrompt, createdAt: Date.now() });
     }
-    item.promptJson = promptJson;
+    item.promptJson = normalizeAnalysisPrompt(promptJson);
     item.finalPrompt = promptText(item, "final");
     item.status = "analyzed";
     item.errorMessage = "";
     item.updatedAt = Date.now();
   }
 
-  function regenerateSection(id, key) {
+  async function regenerateSection(id, key) {
     const item = findItem(id);
     if (!item?.promptJson) return;
     item.versions.unshift({ id: uid("ver"), promptJson: structuredClone(item.promptJson), finalPrompt: item.finalPrompt, createdAt: Date.now() });
@@ -2470,8 +4709,9 @@
     item.promptJson[key] = fresh;
     item.finalPrompt = promptText(item, "final");
     item.status = "modified";
+    syncPromptEditState(item, "section");
     item.updatedAt = Date.now();
-    saveItemState(item);
+    await saveItemState(item);
     render();
   }
 
@@ -2523,25 +4763,356 @@
     item.finalPrompt = promptText(item, "final");
   }
 
-  function saveDetail(id) {
+  async function saveDetail(id) {
     const item = findItem(id);
     if (!item) return;
-    collectPromptEditsFromDom(item);
-    item.title = document.getElementById("detailTitle").value.trim();
-    item.categoryId = document.getElementById("detailCategory").value;
-    item.outfitTags = namesToTagKeys(document.getElementById("detailOutfitTags")?.value || "", "outfit");
-    item.backgroundTags = namesToTagKeys(document.getElementById("detailBackgroundTags")?.value || "", "background");
-    item.memo = document.getElementById("detailMemo").value.trim();
-    item.customInstruction = document.getElementById("detailCustomInstruction")?.value.trim() || "";
-    item.excludeOptions = selectedCheckboxValues("detailExclude");
+    collectDetailFields(item);
     if (item.promptJson) {
-      item.status = "modified";
       item.finalPrompt = promptText(item, "final");
+      const editState = syncPromptEditState(item);
+      if (editState === "modified") item.status = "modified";
     }
     item.updatedAt = Date.now();
-    saveItemState(item);
-    showToast("저장했습니다.", "success", 1200);
+    setDetailSavingState(true);
+    const serverSaved = await saveItemState(item);
     render();
+    if (serverSaved) showToast("서버에 저장했습니다.", "success", 1400);
+    else if (persistenceStatus === "fallback") showToast("브라우저에 임시 저장했습니다. 서버 연결 후 동기화해 주세요.", "warning", 3000);
+  }
+
+  function setDetailSavingState(saving) {
+    const detail = document.querySelector(".detail-grid");
+    if (!detail) return;
+    detail.setAttribute("aria-busy", String(saving));
+    detail.querySelectorAll("input, textarea, select, button").forEach((control) => {
+      control.disabled = saving;
+    });
+  }
+
+  function collectDetailFields(item) {
+    collectPromptEditsFromDom(item);
+    item.title = document.getElementById("detailTitle")?.value.trim() || item.title || "";
+    item.categoryId = document.getElementById("detailCategory")?.value || item.categoryId || "";
+    // Tags are managed via chip toggles on the item object directly.
+    item.memo = document.getElementById("detailMemo")?.value.trim() || "";
+    item.customInstruction = document.getElementById("detailCustomInstruction")?.value.trim() || "";
+    item.excludeOptions = selectedCheckboxValues("detailExclude");
+    ui.reviseAlsoRetag = document.getElementById("reviseAlsoRetag")?.checked !== false;
+    ui.reviseAlsoRetitle = document.getElementById("reviseAlsoRetitle")?.checked === true;
+  }
+
+  function captureSelectedDetailDraft() {
+    const item = selectedItem();
+    if (ui.view !== "detail" || !item || !document.getElementById("detailTitle")) return;
+    collectDetailFields(item);
+  }
+
+  async function revisePromptFromDetail(id) {
+    const item = findItem(id);
+    if (!item) return;
+    if (!item.promptJson) {
+      showToast("수정할 프롬프트가 없습니다.", "warning");
+      return;
+    }
+    collectDetailFields(item);
+    const customInstruction = String(item.customInstruction || "").trim();
+    const excluded = excludeLabels(item.excludeOptions);
+    if (!customInstruction && !excluded.length) {
+      showToast("추가 요청사항 또는 제외 요소를 하나 이상 지정해 주세요.", "warning", 2200);
+      return;
+    }
+    const confirmed = confirm([
+      "현재 입력된 프롬프트를 요청사항과 제외 요소 기준으로 수정합니다.",
+      "",
+      "• 이미지를 다시 분석하지 않습니다.",
+      "• 기존 프롬프트 문장에서 필요한 부분만 최소로 추가/삭제합니다.",
+      "• 번역·텍스트 API(번역 · 제목 요약 역할)를 사용합니다.",
+      "• 업로드 화면의 요청사항/제외 체크와는 별개입니다.",
+      "",
+      customInstruction ? `추가 요청: ${customInstruction}` : "추가 요청: (없음)",
+      excluded.length ? `제외 요소: ${excluded.join(", ")}` : "제외 요소: (없음)",
+      "",
+      "실행할까요?",
+    ].join("\n"));
+    if (!confirmed) return;
+
+    item.status = "modified";
+    item.errorMessage = "";
+    item.updatedAt = Date.now();
+    render();
+    showToast("프롬프트 수정 중…", "info", 1600);
+    try {
+      const response = await fetch(SERVER_EDIT_PROMPT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          customInstruction,
+          excludeLabels: excluded,
+          promptJson: item.promptJson,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.message || payload.error || "프롬프트 수정 요청에 실패했습니다.");
+      }
+      const nextPrompt = normalizeAnalysisPrompt(payload.promptJson || payload.promptSections);
+      applyPrompt(item, nextPrompt);
+      if (ui.reviseAlsoRetag) applyLocalTagsFromPrompt(item);
+      item.status = "modified";
+      syncPromptEditState(item, "api_revise");
+      if (ui.reviseAlsoRetitle) {
+        try {
+          await ensureKoreanTitle(item, { force: true });
+        } catch (_titleError) {}
+      }
+      item.errorMessage = "";
+      item.updatedAt = Date.now();
+      const saved = await saveItemState(item);
+      render();
+      showToast(saved ? "프롬프트 수정과 서버 저장을 마쳤습니다." : "수정한 프롬프트를 브라우저에 임시 저장했습니다.", saved ? "success" : "warning");
+    } catch (error) {
+      item.errorMessage = error.message || "프롬프트 수정에 실패했습니다.";
+      item.updatedAt = Date.now();
+      await saveItemState(item);
+      render();
+      showToast(item.errorMessage, "warning", 2800);
+    }
+  }
+
+  async function retitleOneItem(id, options = {}) {
+    const item = findItem(id);
+    if (!item?.promptJson) return;
+    if (!options.silent && item.id === ui.selectedId) captureSelectedDetailDraft();
+    try {
+      await ensureKoreanTitle(item, { force: true });
+      const saved = await saveItemState(item);
+      if (!options.silent) {
+        render();
+        showToast(saved ? "제목 요약을 갱신하고 저장했습니다." : "제목 요약을 브라우저에 임시 저장했습니다.", saved ? "success" : "warning");
+      }
+    } catch (error) {
+      if (!options.silent) showToast(error.message || "제목 요약 실패", "warning");
+      throw error;
+    }
+  }
+
+  async function retagOneItem(id, options = {}) {
+    const item = findItem(id);
+    if (!item?.promptJson) return;
+    if (!options.silent && item.id === ui.selectedId) captureSelectedDetailDraft();
+    applyLocalTagsFromPrompt(item);
+    item.updatedAt = Date.now();
+    const saved = await saveItemState(item);
+    if (!options.silent) {
+      render();
+      showToast(saved ? "태그를 재추론하고 저장했습니다." : "태그 변경을 브라우저에 임시 저장했습니다.", saved ? "success" : "warning");
+    }
+  }
+
+  async function batchRetitleAll() {
+    const targets = state.items.filter((item) => item.promptJson);
+    let ok = 0;
+    for (const item of targets) {
+      try {
+        await ensureKoreanTitle(item, { force: true });
+        ok += 1;
+      } catch (_error) {}
+    }
+    saveItemsState();
+    render();
+    showToast(`제목 요약 ${ok}/${targets.length} 완료`, ok ? "success" : "warning");
+  }
+
+  function batchRetagAll() {
+    const targets = state.items.filter((item) => item.promptJson);
+    targets.forEach((item) => applyLocalTagsFromPrompt(item));
+    saveItemsState();
+    render();
+    showToast(`${targets.length}개 태그 재추론 완료`, "success");
+  }
+
+  function applyBulkCategory(categoryId) {
+    const ids = ui.selectedBulkCategoryIds || [];
+    if (!ids.length || !categoryId) return;
+    ids.forEach((id) => {
+      const item = findItem(id);
+      if (!item) return;
+      item.categoryId = categoryId;
+      item.updatedAt = Date.now();
+    });
+    saveItemsState();
+    ui.selectedBulkCategoryIds = [];
+    ui.bulkCategoryMode = false;
+    render();
+    showToast(`${ids.length}개 분류 변경`, "success");
+  }
+
+  async function exportArchiveBackup() {
+    const includeSecrets = document.getElementById("includeSecretsInBackup")?.checked === true;
+    if (includeSecrets && !confirm("API 비밀키가 포함된 백업을 만들까요?\n이 파일을 공유하거나 일반 클라우드 폴더에 두면 키가 노출될 수 있습니다.")) return;
+    showToast("전체 백업 파일을 준비하는 중…", "info", 4000);
+    try {
+      if (serverAvailable) {
+        const response = await fetch(`${SERVER_BACKUP_ENDPOINT}?includeSecrets=${includeSecrets ? "1" : "0"}`, { cache: "no-store" });
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.message || err.error || "백업 생성 실패");
+        }
+        const blob = await response.blob();
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        downloadBlob(blob, `prompt-archive-backup${includeSecrets ? "-WITH-SECRETS" : ""}-${stamp}.json`);
+        showToast(`게시물·설정·이미지 백업을 저장했습니다.${includeSecrets ? " API 비밀키 포함 파일이므로 안전하게 보관하세요." : " API 비밀키는 제외했습니다."}`, includeSecrets ? "warning" : "success", 3200);
+        return;
+      }
+      // 서버 없을 때: 메타데이터만 (이미지 바이너리 미포함)
+      const payload = buildClientOnlyBackupPayload();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      downloadBlob(blob, `prompt-archive-backup-meta-${Date.now()}.json`);
+      showToast("서버 미연결: 메타데이터만 저장했습니다. 이미지는 포함되지 않습니다.", "warning", 3200);
+    } catch (error) {
+      console.error(error);
+      showToast(error.message || "백업 저장에 실패했습니다.", "warning", 2800);
+    }
+  }
+
+  function buildClientOnlyBackupPayload() {
+    return {
+      format: "prompt-archive-backup",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      settings: settingsSlice(),
+      tags: tagsSlice(),
+      providers: sanitizedProviders(),
+      items: state.items.map((item) => ({
+        ...item,
+        displayImage: item.displayImage ? { ...item.displayImage, dataUrl: item.displayImage.dataUrl?.startsWith("data:") ? undefined : item.displayImage.dataUrl } : null,
+        analysisImage: item.analysisImage ? { ...item.analysisImage, dataUrl: item.analysisImage.dataUrl?.startsWith("data:") ? undefined : item.analysisImage.dataUrl } : null,
+        thumbnailImage: item.thumbnailImage ? { ...item.thumbnailImage, dataUrl: item.thumbnailImage.dataUrl?.startsWith("data:") ? undefined : item.thumbnailImage.dataUrl } : null,
+        originalImage: item.originalImage ? { ...item.originalImage, dataUrl: item.originalImage.dataUrl?.startsWith("data:") ? undefined : item.originalImage.dataUrl } : null,
+      })),
+      images: {},
+      stats: { itemCount: state.items.length, imageCount: 0, note: "client-only-metadata" },
+    };
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function triggerArchiveImport() {
+    const input = document.getElementById("archiveImportInput");
+    if (!input) {
+      showToast("가져오기 UI를 찾을 수 없습니다. 고급 설정 탭을 연 뒤 다시 시도하세요.", "warning");
+      return;
+    }
+    input.value = "";
+    input.onchange = async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      await importArchiveBackup(file);
+      input.value = "";
+    };
+    input.click();
+  }
+
+  async function importArchiveBackup(file) {
+    if (!file) return;
+    if (!confirm("백업 파일로 현재 데이터를 교체할까요?\n게시물·설정·업로드 이미지가 백업 내용으로 덮어씌워집니다.\n계속하기 전에 현재 상태를 먼저 백업하는 것을 권장합니다.")) {
+      return;
+    }
+    showToast("백업을 가져오는 중…", "info", 6000);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!serverAvailable) {
+        applyImportedStateLocally(parsed);
+        showToast("서버 미연결: 브라우저 상태에만 메타데이터를 반영했습니다. 이미지는 복원되지 않을 수 있습니다.", "warning", 3600);
+        return;
+      }
+
+      const response = await fetch(SERVER_IMPORT_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "replace", backup: parsed }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.ok) {
+        throw new Error(result.message || result.error || "백업 가져오기 실패");
+      }
+
+      const stateResponse = await fetch(SERVER_STATE_ENDPOINT, { cache: "no-store" });
+      if (!stateResponse.ok) throw new Error("복원 후 상태 로드 실패");
+      const statePayload = await stateResponse.json();
+      if (!statePayload?.state) throw new Error("복원된 상태가 비어 있습니다.");
+
+      Object.assign(state, normalizeState(statePayload.state));
+      document.documentElement.dataset.theme = state.theme;
+      applyThemeOptions();
+      migrateAllPromptBaselines();
+      ui.selectedId = state.items[0]?.id || null;
+      ui.view = "gallery";
+      ui.page = 1;
+      ui.galleryLoadedPages = 1;
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+      render();
+      showToast(
+        `가져오기 완료: 게시물 ${result.itemCount ?? state.items.length}개, 이미지 ${result.imageCount ?? 0}개${result.clearedSecretCount ? `. 안전을 위해 API 비밀키 ${result.clearedSecretCount}개를 지웠으므로 다시 입력해 주세요.` : ""}`,
+        result.clearedSecretCount ? "warning" : "success",
+        result.clearedSecretCount ? 5200 : 2800
+      );
+    } catch (error) {
+      console.error(error);
+      showToast(error.message || "백업 가져오기에 실패했습니다.", "warning", 3200);
+    }
+  }
+
+  function applyImportedStateLocally(parsed) {
+    const backup = parsed?.format === "prompt-archive-backup" ? parsed : parsed;
+    const settings = backup.settings || pickLocalSettingsFromDump(backup);
+    const tags = backup.tags || {
+      excludeOptions: backup.excludeOptions || settings.excludeOptions,
+      outfitTagOptions: backup.outfitTagOptions || settings.outfitTagOptions,
+      backgroundTagOptions: backup.backgroundTagOptions || settings.backgroundTagOptions,
+    };
+    const next = normalizeState({
+      ...settings,
+      ...tags,
+      providers: Array.isArray(backup.providers) ? backup.providers : state.providers,
+      items: Array.isArray(backup.items) ? backup.items : state.items,
+    });
+    Object.assign(state, next);
+    document.documentElement.dataset.theme = state.theme;
+    applyThemeOptions();
+    migrateAllPromptBaselines();
+    ui.selectedId = state.items[0]?.id || null;
+    ui.view = "gallery";
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    render();
+  }
+
+  function pickLocalSettingsFromDump(dump) {
+    return {
+      theme: dump.theme,
+      categories: dump.categories,
+      promptInstruction: dump.promptInstruction,
+      promptSettings: dump.promptSettings,
+      uploadSettings: dump.uploadSettings,
+      albumSettings: dump.albumSettings,
+      copyDisplaySettings: dump.copyDisplaySettings,
+      categorySettings: dump.categorySettings,
+      themeSettings: dump.themeSettings,
+      advancedSettings: dump.advancedSettings,
+      excludeOptions: dump.excludeOptions,
+      outfitTagOptions: dump.outfitTagOptions,
+      backgroundTagOptions: dump.backgroundTagOptions,
+    };
   }
 
   function deleteItem(id) {
@@ -2552,6 +5123,97 @@
     ui.view = "gallery";
     deleteItemState(id);
     render();
+  }
+
+  function toggleBulkDeleteItem(id) {
+    if (!id) return;
+    const selected = new Set(ui.selectedBulkDeleteIds || []);
+    setBulkDeleteItemSelection(id, !selected.has(id));
+  }
+
+  function setBulkDeleteItemSelection(id, shouldSelect) {
+    if (!id || !state.items.some((item) => item.id === id)) return;
+    const selected = new Set(ui.selectedBulkDeleteIds || []);
+    if (shouldSelect) selected.add(id);
+    else selected.delete(id);
+    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => state.items.some((item) => item.id === entryId));
+  }
+
+  function toggleBulkCategoryItem(id) {
+    if (!id) return;
+    const selected = new Set(ui.selectedBulkCategoryIds || []);
+    setBulkCategoryItemSelection(id, !selected.has(id));
+  }
+
+  function setBulkCategoryItemSelection(id, shouldSelect) {
+    if (!id || !state.items.some((item) => item.id === id)) return;
+    const selected = new Set(ui.selectedBulkCategoryIds || []);
+    if (shouldSelect) selected.add(id);
+    else selected.delete(id);
+    ui.selectedBulkCategoryIds = [...selected].filter((entryId) => state.items.some((item) => item.id === entryId));
+  }
+
+  function refreshBulkSelectionUi() {
+    if (!ui.bulkDeleteMode && !ui.bulkCategoryMode) return;
+    const categoryMode = ui.bulkCategoryMode;
+    const selectedIds = new Set(categoryMode ? ui.selectedBulkCategoryIds || [] : ui.selectedBulkDeleteIds || []);
+    document.querySelectorAll("[data-open-item]").forEach((card) => {
+      const selected = selectedIds.has(card.dataset.openItem);
+      card.classList.toggle("selected-for-delete", selected);
+      const checkbox = card.querySelector(categoryMode ? "[data-bulk-category-id]" : "[data-bulk-delete-id]");
+      if (checkbox) checkbox.checked = selected;
+    });
+
+    if (categoryMode) {
+      const count = document.querySelector(".bulk-category-count");
+      if (count) count.textContent = `${selectedIds.size}개 선택`;
+      const applyButton = document.querySelector('[data-action="applyBulkCategory"]');
+      if (applyButton) applyButton.disabled = selectedIds.size === 0;
+      return;
+    }
+
+    const visibleCheckboxes = [...document.querySelectorAll("[data-bulk-delete-id]")];
+    const visibleSelectedCount = visibleCheckboxes.filter((checkbox) => selectedIds.has(checkbox.dataset.bulkDeleteId)).length;
+    const allVisibleSelected = visibleCheckboxes.length > 0 && visibleSelectedCount === visibleCheckboxes.length;
+    const count = document.querySelector(".bulk-delete-count");
+    if (count) count.textContent = `선택 ${selectedIds.size}개`;
+    const selectVisibleButton = document.querySelector('[data-action="bulkSelectVisible"]');
+    if (selectVisibleButton) selectVisibleButton.textContent = allVisibleSelected ? "표시 항목 선택 해제" : "표시 항목 전체 선택";
+    const clearButton = document.querySelector('[data-action="clearBulkDeleteSelection"]');
+    if (clearButton) clearButton.disabled = selectedIds.size === 0;
+    const deleteButton = document.querySelector('[data-action="confirmBulkDelete"]');
+    if (deleteButton) deleteButton.disabled = selectedIds.size === 0;
+  }
+
+  function toggleVisibleBulkDeleteSelection() {
+    const visibleIds = [...document.querySelectorAll("[data-bulk-delete-id]")].map((node) => node.dataset.bulkDeleteId).filter(Boolean);
+    if (!visibleIds.length) return;
+    const selected = new Set(ui.selectedBulkDeleteIds || []);
+    const allVisibleSelected = visibleIds.every((id) => selected.has(id));
+    visibleIds.forEach((id) => {
+      if (allVisibleSelected) selected.delete(id);
+      else selected.add(id);
+    });
+    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => state.items.some((item) => item.id === entryId));
+  }
+
+  function deleteSelectedItems() {
+    const selectedIds = [...new Set(ui.selectedBulkDeleteIds || [])].filter((id) => state.items.some((item) => item.id === id));
+    if (!selectedIds.length) {
+      alert("삭제할 게시물을 먼저 선택하세요.");
+      return;
+    }
+    if (!confirm(`선택한 ${selectedIds.length}개 게시물을 삭제할까요?`)) return;
+    const selected = new Set(selectedIds);
+    state.items = state.items.filter((item) => !selected.has(item.id));
+    if (selected.has(ui.selectedId)) ui.selectedId = state.items[0]?.id || null;
+    ui.bulkDeleteMode = false;
+    ui.selectedBulkDeleteIds = [];
+    ui.view = "gallery";
+    resetGalleryWindow();
+    saveItemsState();
+    render();
+    showToast(`${selectedIds.length}개 게시물을 삭제했습니다.`, "success", 1600);
   }
 
   function addExcludeOption() {
@@ -2614,6 +5276,8 @@
 
   function saveUploadSettings() {
     state.uploadSettings = normalizeUploadSettings({
+      promptSourceMode: document.querySelector('input[name="promptSourceMode"]:checked')?.value || state.uploadSettings.promptSourceMode,
+      translateExifPrompt: document.getElementById("translateExifPrompt")?.checked,
       preserveOriginal: document.getElementById("preserveOriginal")?.checked,
       autoCompress: document.getElementById("autoCompress")?.checked,
       stripExif: document.getElementById("stripExif")?.checked,
@@ -2640,12 +5304,13 @@
     state.albumSettings = normalizeAlbumSettings({
       columns: document.getElementById("albumColumns")?.value,
       rows: document.getElementById("albumRows")?.value,
+      loadMode: document.getElementById("galleryLoadMode")?.value,
       paginationPosition: document.getElementById("paginationPosition")?.value,
       cardAspectRatio: document.getElementById("cardAspectRatio")?.value,
-      showTitle: true,
-      showTags: false,
-      showStatus: false,
-      showFavorite: false,
+      showTitle: document.getElementById("showTitle")?.checked !== false,
+      showTags: document.getElementById("showTags")?.checked !== false,
+      showStatus: document.getElementById("showStatus")?.checked !== false,
+      showFavorite: document.getElementById("showFavorite")?.checked !== false,
     });
     resetGalleryWindow();
     saveSettingsState();
@@ -2686,9 +5351,57 @@
       monthlyMaxAnalyses: document.getElementById("monthlyMaxAnalyses")?.value,
       maxImagesPerBatch: document.getElementById("maxImagesPerBatch")?.value,
       maxRegenerationsPerImage: document.getElementById("maxRegenerationsPerImage")?.value,
+      shortcuts: {
+        nextItem: document.getElementById("shortcutNextItem")?.value || "",
+        prevItem: document.getElementById("shortcutPrevItem")?.value || "",
+        copyFinal: document.getElementById("shortcutCopyFinal")?.value || "",
+        goBack: document.getElementById("shortcutGoBack")?.value || "",
+      },
     });
     saveSettingsState();
     render();
+  }
+
+  function clearAllShortcuts() {
+    state.advancedSettings = normalizeAdvancedSettings({
+      ...state.advancedSettings,
+      shortcuts: {
+        nextItem: "",
+        prevItem: "",
+        copyFinal: "",
+        goBack: "",
+      },
+    });
+    saveSettingsState();
+    render();
+    showToast("단축키를 모두 비웠습니다.", "success");
+  }
+
+  function bindShortcutCaptureFields() {
+    document.querySelectorAll("[data-shortcut-field]").forEach((input) => {
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" || event.key === "Tab") return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.key === "Backspace" || event.key === "Delete") {
+          input.value = "";
+          return;
+        }
+        input.value = shortcutLabelFromEvent(event);
+      });
+    });
+  }
+
+  function shortcutLabelFromEvent(event) {
+    if (event.key === " ") return "Space";
+    return event.key;
+  }
+
+  function shortcutMatches(event, binding) {
+    const value = String(binding || "").trim();
+    if (!value) return false;
+    if (value === "Space") return event.key === " ";
+    return event.key === value || event.key.toLowerCase() === value.toLowerCase();
   }
 
   function saveCategorySettings() {
@@ -2696,6 +5409,56 @@
     state.categorySettings.allowAiSuggestedTags = Boolean(document.getElementById("allowAiSuggestedTags")?.checked);
     saveSettingsState();
     render();
+  }
+
+  async function retranslateSection(id, key) {
+    const item = findItem(id);
+    if (!item?.promptJson?.[key]) return;
+    collectPromptEditsFromDom(item);
+    const sectionConfig = state.promptSettings.sections.find((section) => section.key === key) || sectionMeta.find((section) => section.key === key);
+    const sentences = item.promptJson[key].sentences.map((sentence) => ({
+      id: sentence.id,
+      en: String(sentence.en || "").trim(),
+    })).filter((sentence) => sentence.en);
+    if (!sentences.length) {
+      showToast("재번역할 영어 문장이 없습니다.", "warning", 1600);
+      return;
+    }
+    item.versions.unshift({ id: uid("ver"), promptJson: structuredClone(item.promptJson), finalPrompt: item.finalPrompt, createdAt: Date.now() });
+    item.status = "modified";
+    await saveItemState(item);
+    showToast("번역 중입니다.", "info", 1000);
+    try {
+      const response = await fetch(SERVER_TRANSLATE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          sectionKey: key,
+          sectionLabel: sectionConfig?.labelKo || key,
+          sentences,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || "번역 요청에 실패했습니다.");
+      const byId = new Map((payload.translations || []).map((entry) => [entry.id, entry.ko]));
+      item.promptJson[key].sentences.forEach((sentence) => {
+        const translated = byId.get(sentence.id);
+        if (translated) sentence.ko = translated;
+      });
+      item.finalPrompt = promptText(item, "final");
+      syncPromptEditState(item, "translate");
+      if (item.promptEditState === "modified") item.status = "modified";
+      item.updatedAt = Date.now();
+      const saved = await saveItemState(item);
+      render();
+      showToast(saved ? "한국어 재번역과 저장이 끝났습니다." : "재번역 결과를 브라우저에 임시 저장했습니다.", saved ? "success" : "warning", 1800);
+    } catch (error) {
+      item.versions.shift();
+      await saveItemState(item);
+      render();
+      showToast(error.message || "번역에 실패했습니다.", "warning", 2200);
+    }
   }
 
   function findCategoryInput(attribute, id) {
@@ -2853,8 +5616,6 @@
     const isActive = Boolean(
       document.querySelector("[data-provider-use-image]")?.checked
       || document.querySelector("[data-provider-use-translation]")?.checked
-      || document.querySelector("[data-provider-use-cleanup]")?.checked
-      || document.querySelector("[data-provider-use-tagging]")?.checked
     );
     if (activeButton) activeButton.textContent = isActive ? "사용" : "끔";
     const status = document.querySelector(".provider-head .status-pill");
@@ -2862,51 +5623,38 @@
   }
 
   function saveProviderCheckbox(input) {
-    const index = Number(input.dataset.providerUseImage ?? input.dataset.providerUseTranslation ?? input.dataset.providerUseCleanup ?? input.dataset.providerUseTagging);
+    const index = Number(input.dataset.providerUseImage ?? input.dataset.providerUseTranslation);
     const provider = state.providers[index];
     if (!provider) return;
     if (input.dataset.providerUseImage !== undefined) provider.useForImageAnalysis = input.checked;
     if (input.dataset.providerUseTranslation !== undefined) provider.useForTranslation = input.checked;
-    if (input.dataset.providerUseCleanup !== undefined) provider.useForPromptCleanup = input.checked;
-    if (input.dataset.providerUseTagging !== undefined) provider.useForTagging = input.checked;
+    provider.useForPromptCleanup = false;
+    provider.useForTagging = false;
     provider.enabled = providerIsActive(provider);
     updateVisibleProviderTabStatus();
   }
-
-  window.promptArchiveRememberProviderCheckbox = (input) => {
-    input.dataset.wasChecked = String(input.checked);
-  };
-
-  window.promptArchiveProviderCheckbox = (input) => {
-    if (input.dataset.wasChecked !== undefined && input.checked === (input.dataset.wasChecked === "true")) {
-      input.checked = !input.checked;
-    }
-    saveProviderCheckbox(input);
-    delete input.dataset.wasChecked;
-  };
 
   function saveProviderDraft(index) {
     const provider = state.providers[index];
     if (!provider) return false;
     const keyInput = document.querySelector(`[data-provider-key="${index}"]`);
-    provider.model = document.querySelector(`[data-provider-model="${index}"]`)?.value.trim() || "";
-    provider.visionModel = document.querySelector(`[data-provider-vision-model="${index}"]`)?.value.trim() || "";
-    provider.textModel = document.querySelector(`[data-provider-text-model="${index}"]`)?.value.trim() || "";
+    const unifiedModel = document.querySelector(`[data-provider-model="${index}"]`)?.value.trim() || "";
+    provider.model = unifiedModel;
+    provider.visionModel = unifiedModel;
+    provider.textModel = unifiedModel;
     provider.apiUrl = document.querySelector(`[data-provider-api-url="${index}"]`)?.value.trim() || provider.apiUrl || defaultProviderApiUrl(provider.name);
     provider.location = document.querySelector(`[data-provider-location="${index}"]`)?.value.trim() || provider.location || "";
     const pendingKey = keyInput?.value.trim() || "";
     if (pendingKey) provider._pendingKey = pendingKey;
     const pendingKeys = [0, 1, 2].map((slot) => document.querySelector(`[data-provider-api-key="${index}"][data-provider-api-key-slot="${slot}"]`)?.value.trim() || "");
     if (pendingKeys.some(Boolean)) provider._pendingKeys = pendingKeys;
-    if (provider.name === "Google Gemini API" && pendingKeys.some(Boolean)) provider.keyCount = pendingKeys.filter(Boolean).length;
-    provider.hasServerKey = Boolean(pendingKey) || pendingKeys.some(Boolean) || provider.hasServerKey;
     provider.priority = clampNumber(document.querySelector(`[data-provider-priority="${index}"]`)?.value, 1, 20, provider.priority);
     provider.timeoutSeconds = clampNumber(document.querySelector(`[data-provider-timeout="${index}"]`)?.value, 5, 300, provider.timeoutSeconds);
     provider.maxRetries = clampNumber(document.querySelector(`[data-provider-retries="${index}"]`)?.value, 0, 10, provider.maxRetries);
     provider.useForImageAnalysis = document.querySelector(`[data-provider-use-image="${index}"]`)?.checked === true;
     provider.useForTranslation = document.querySelector(`[data-provider-use-translation="${index}"]`)?.checked === true;
-    provider.useForPromptCleanup = document.querySelector(`[data-provider-use-cleanup="${index}"]`)?.checked === true;
-    provider.useForTagging = document.querySelector(`[data-provider-use-tagging="${index}"]`)?.checked === true;
+    provider.useForPromptCleanup = false;
+    provider.useForTagging = false;
     provider.enabled = providerIsActive(provider);
     saveProvidersState();
     return true;
@@ -2921,7 +5669,8 @@
     saveProvidersState();
     render();
     try {
-      await syncProvidersToServer();
+      const saved = await syncProvidersToServer();
+      if (!saved) throw new Error("공급자 설정을 서버에 저장하지 못해 연결 테스트를 중단했습니다.");
       const response = await fetch(`${SERVER_PROVIDERS_ENDPOINT}/test`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2939,7 +5688,7 @@
   }
 
   function exportJson() {
-    const payload = JSON.stringify(state, null, 2);
+    const payload = JSON.stringify(serializableState(), null, 2);
     writeClipboard(payload, "전체 백업 JSON을 복사했습니다.");
   }
 
@@ -2967,12 +5716,17 @@
     const item = findItem(id);
     const sectionConfig = state.promptSettings.sections.find((section) => section.key === sectionKey);
     const sentences = item?.promptJson?.[sectionKey]?.sentences || [];
-    const mode = state.copyDisplaySettings.defaultCopyMode || lang || "en";
+    // Prefer the column language from the button (en/ko). defaultCopyMode is only a fallback.
+    const mode = ["en", "ko", "both", "final"].includes(lang)
+      ? lang
+      : (state.copyDisplaySettings.defaultCopyMode || "en");
     const parts = [];
-    if (state.copyDisplaySettings.includeSectionTitles && sectionConfig) parts.push(mode === "ko" ? sectionConfig.labelKo : sectionConfig.labelEn);
+    if (state.copyDisplaySettings.includeSectionTitles && sectionConfig) {
+      parts.push(mode === "ko" ? sectionConfig.labelKo : sectionConfig.labelEn);
+    }
     if (mode === "both") parts.push(...sentences.map((sentence) => `${sentence.en}\n${sentence.ko}`));
-    else if (mode === "ko") parts.push(...sentences.map((sentence) => sentence.ko));
-    else parts.push(...sentences.map((sentence) => sentence.en));
+    else if (mode === "ko") parts.push(...sentences.map((sentence) => sentence.ko).filter(Boolean));
+    else parts.push(...sentences.map((sentence) => sentence.en).filter(Boolean));
     writeClipboard(joinCopiedLines(parts, mode === "final"), "문단을 복사했습니다.");
   }
 
@@ -3082,16 +5836,1320 @@
 
   function inferTags(source, type) {
     const text = String(source || "").toLowerCase();
-    const matched = tagOptions(type)
+    const otherKey = fallbackTag(type);
+    const scored = tagOptions(type)
       .filter((tag) => tag.enabled !== false && tag.allowAiAssign !== false)
-      .filter((tag) => tag.name.toLowerCase().split(/\s+/).some((part) => text.includes(part)) || (tag.keywords || []).some((keyword) => text.includes(keyword.toLowerCase())))
-      .map((tag) => tag.key);
-    if (matched.length) return matched.slice(0, 3);
-    return [fallbackTag(type)];
+      .filter((tag) => tag.key !== otherKey && tag.name !== "기타")
+      .map((tag) => {
+        let score = 0;
+        const terms = [tag.name, ...(tag.keywords || [])]
+          .map((term) => String(term || "").toLowerCase().trim())
+          .filter(Boolean);
+        terms.forEach((term) => {
+          if (termMatchesPromptText(text, term)) score += Math.min(term.length, 24) + (term.includes(" ") ? 4 : 0);
+        });
+        return { key: tag.key, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || a.key.localeCompare(b.key));
+    if (!scored.length) return otherKey ? [otherKey] : [];
+    return scored.slice(0, 3).map((entry) => entry.key);
+  }
+
+  function termMatchesPromptText(text, term) {
+    const value = String(term || "").toLowerCase().trim();
+    if (!value || !text) return false;
+    // Short English tokens use word-ish boundaries so "suit" does not match "suitcase".
+    if (/^[a-z0-9][a-z0-9\s/-]{0,20}$/i.test(value) && value.length <= 12) {
+      const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+      return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`, "i").test(text);
+    }
+    return text.includes(value);
   }
 
   function fallbackTag(type) {
     return tagOptions(type).find((tag) => tag.name === "기타")?.key || tagOptions(type)[0]?.key || "";
+  }
+
+  function bindLoraSorterEvents() {
+    if (ui.modal !== "loraSorter") return;
+    document.getElementById("loraSorterIncludeSubfolders")?.addEventListener("change", async (event) => {
+      loraSorterState.includeSubfolders = event.target.checked;
+      void saveLoraSorterSettings();
+      if (loraSorterState.sourceHandle) await scanLoraSorterFolder();
+    });
+    document.getElementById("loraSorterCollisionMode")?.addEventListener("change", (event) => {
+      loraSorterState.collisionMode = event.target.value === "skip" ? "skip" : "rename";
+      void saveLoraSorterSettings();
+    });
+  }
+
+  async function restoreLoraSorterSettings() {
+    if (!window.PromptArchiveLoraSorterStorage) return;
+    try {
+      const restored = await window.PromptArchiveLoraSorterStorage.load();
+      if (!restored) return;
+      loraSorterState.sourceHandle = restored.sourceHandle;
+      loraSorterState.baseDestinationHandle = restored.baseDestinationHandle;
+      loraSorterState.destinationHandles = restored.destinationHandles;
+      loraSorterState.excludedGroupKeys = restored.excludedGroupKeys;
+      loraSorterState.includeSubfolders = restored.includeSubfolders;
+      loraSorterState.collisionMode = restored.collisionMode;
+      render();
+    } catch (error) {
+      console.warn("LoRA sorter settings restore failed", error);
+    }
+  }
+
+  async function saveLoraSorterSettings() {
+    if (!window.PromptArchiveLoraSorterStorage) return false;
+    try {
+      return await window.PromptArchiveLoraSorterStorage.save(loraSorterState);
+    } catch (error) {
+      console.warn("LoRA sorter settings save failed", error);
+      return false;
+    }
+  }
+
+  async function selectLoraSorterSourceFolder() {
+    if (loraSorterState.scanning || loraSorterState.moving) return;
+    try {
+      const handle = await window.showDirectoryPicker({ id: "prompt-archive-lora-source", mode: "readwrite" });
+      if (!(await ensureDirectoryPermission(handle, true))) throw new Error("이미지를 이동하려면 원본 폴더의 읽기·쓰기 권한이 필요합니다.");
+      loraSorterState.sourceHandle = handle;
+      loraSorterState.scannedFiles = [];
+      loraSorterState.groups = [];
+      loraSorterState.excludedGroupKeys.clear();
+      loraSorterState.result = null;
+      await saveLoraSorterSettings();
+      await scanLoraSorterFolder();
+    } catch (error) {
+      if (error?.name !== "AbortError") showToast(error.message || "이미지 폴더를 열지 못했습니다.", "warning", 3200);
+    }
+  }
+
+  async function selectLoraSorterBaseDestination() {
+    if (loraSorterState.scanning || loraSorterState.moving) return;
+    try {
+      const handle = await window.showDirectoryPicker({ id: "prompt-archive-lora-destination", mode: "readwrite" });
+      if (!(await ensureDirectoryPermission(handle, true))) throw new Error("목적지 폴더의 쓰기 권한이 필요합니다.");
+      loraSorterState.baseDestinationHandle = handle;
+      loraSorterState.result = null;
+      await saveLoraSorterSettings();
+      render();
+    } catch (error) {
+      if (error?.name !== "AbortError") showToast(error.message || "목적지 폴더를 열지 못했습니다.", "warning", 3200);
+    }
+  }
+
+  async function selectLoraGroupDestination(groupKey) {
+    if (!groupKey || loraSorterState.scanning || loraSorterState.moving) return;
+    const group = loraSorterState.groups.find((entry) => entry.key === groupKey && entry.movable);
+    if (!group) return;
+    try {
+      const handle = await window.showDirectoryPicker({ id: "pa-lora-dest", mode: "readwrite" });
+      if (!(await ensureDirectoryPermission(handle, true))) throw new Error("선택한 폴더의 쓰기 권한이 필요합니다.");
+      loraSorterState.destinationHandles.set(group.key, handle);
+      loraSorterState.excludedGroupKeys.delete(group.key);
+      loraSorterState.result = null;
+      await saveLoraSorterSettings();
+      render();
+    } catch (error) {
+      if (error?.name !== "AbortError") showToast(error.message || "LoRA 목적지 폴더를 열지 못했습니다.", "warning", 3200);
+    }
+  }
+
+  function toggleLoraGroupExcluded(groupKey) {
+    if (!groupKey || loraSorterState.scanning || loraSorterState.moving) return;
+    const group = loraSorterState.groups.find((entry) => entry.key === groupKey && entry.movable);
+    if (!group) return;
+    if (loraSorterState.excludedGroupKeys.has(groupKey)) {
+      loraSorterState.excludedGroupKeys.delete(groupKey);
+    } else {
+      loraSorterState.excludedGroupKeys.add(groupKey);
+    }
+    loraSorterState.result = null;
+    void saveLoraSorterSettings();
+    render();
+  }
+
+  async function collectLoraImageHandles(rootHandle, recursive, relativeParts = [], results = []) {
+    for await (const [name, handle] of rootHandle.entries()) {
+      if (handle.kind === "file" && window.PromptArchiveLoraSorter.isSupportedImageName(name)) {
+        results.push({ handle, parentHandle: rootHandle, name, relativeParts: [...relativeParts] });
+      } else if (recursive && handle.kind === "directory") {
+        await collectLoraImageHandles(handle, true, [...relativeParts, name], results);
+      }
+    }
+    return results.sort((left, right) => {
+      const leftPath = [...left.relativeParts, left.name].join("/");
+      const rightPath = [...right.relativeParts, right.name].join("/");
+      return leftPath.localeCompare(rightPath, "ko");
+    });
+  }
+
+  async function scanLoraSorterFolder() {
+    if (!loraSorterState.sourceHandle || loraSorterState.scanning || loraSorterState.moving) return;
+    loraSorterState.scanning = true;
+    loraSorterState.result = null;
+    loraSorterState.scannedFiles = [];
+    loraSorterState.groups = [];
+    try {
+      const files = await collectLoraImageHandles(loraSorterState.sourceHandle, loraSorterState.includeSubfolders);
+      loraSorterState.progress = { phase: "scan", current: 0, total: files.length, fileName: "메타데이터 검사 준비 중", errors: [] };
+      render();
+      for (let index = 0; index < files.length; index += 1) {
+        const entry = files[index];
+        const relativeName = [...entry.relativeParts, entry.name].join("/");
+        loraSorterState.progress.current = index;
+        loraSorterState.progress.fileName = relativeName;
+        updateLoraSorterProgressDom();
+        try {
+          const file = await entry.handle.getFile();
+          const inspection = window.PromptArchiveLoraSorter.inspectImageMetadata(await file.arrayBuffer(), file.type);
+          loraSorterState.scannedFiles.push({
+            ...entry,
+            size: file.size,
+            lastModified: file.lastModified,
+            inspection,
+            classification: window.PromptArchiveLoraSorter.classificationForInspection(inspection),
+          });
+        } catch (error) {
+          loraSorterState.progress.errors.push(`${relativeName}: ${error.message || error}`);
+          loraSorterState.scannedFiles.push({
+            ...entry,
+            inspection: { status: "unreadable", loras: [], error: error.message || String(error) },
+            classification: { key: "__unreadable__", label: "메타데이터 판독 불가", kind: "unreadable" },
+          });
+        } finally {
+          loraSorterState.progress.current = index + 1;
+          updateLoraSorterProgressDom();
+        }
+      }
+      loraSorterState.groups = window.PromptArchiveLoraSorter.groupInspectedFiles(loraSorterState.scannedFiles);
+      const matched = loraSorterState.groups.filter((group) => group.movable).reduce((total, group) => total + group.count, 0);
+      loraSorterState.progress.fileName = `${matched}장 LoRA 분류 가능`;
+      showToast(files.length ? `${files.length}장 검사 완료 · ${matched}장 분류 가능` : "지원하는 이미지 파일을 찾지 못했습니다.", files.length ? "success" : "warning", 3000);
+    } finally {
+      loraSorterState.scanning = false;
+      render();
+    }
+  }
+
+  async function startLoraSorterMove() {
+    if (loraSorterState.scanning || loraSorterState.moving || !loraSorterState.sourceHandle) return;
+    loraSorterState.collisionMode = document.getElementById("loraSorterCollisionMode")?.value === "skip" ? "skip" : "rename";
+    const jobs = [];
+    for (const group of loraSorterState.groups.filter((entry) => entry.movable && !loraSorterState.excludedGroupKeys.has(entry.key))) {
+      const customDestination = loraSorterState.destinationHandles.get(group.key);
+      if (!customDestination && !loraSorterState.baseDestinationHandle) continue;
+      group.files.forEach((file) => jobs.push({ file, group, customDestination }));
+    }
+    if (!jobs.length) {
+      showToast("이동할 LoRA와 목적지 폴더를 먼저 지정해주세요.", "warning");
+      return;
+    }
+    const confirmed = confirm(`${jobs.length}개 이미지를 LoRA별 폴더로 이동합니다.\n\n목적지에 복사하고 크기를 검증한 뒤 원본을 영구 삭제합니다. 계속할까요?`);
+    if (!confirmed) return;
+    if (!(await ensureDirectoryPermission(loraSorterState.sourceHandle, true))) {
+      showToast("원본 폴더의 읽기·쓰기 권한이 필요합니다.", "warning");
+      return;
+    }
+    if (loraSorterState.baseDestinationHandle && !(await ensureDirectoryPermission(loraSorterState.baseDestinationHandle, true))) {
+      showToast("자동 분류 기준 폴더의 쓰기 권한이 필요합니다.", "warning");
+      return;
+    }
+    const customHandles = [...new Set(jobs.map((job) => job.customDestination).filter(Boolean))];
+    for (const handle of customHandles) {
+      if (!(await ensureDirectoryPermission(handle, true))) {
+        showToast(`${handle.name} 폴더의 쓰기 권한이 필요합니다.`, "warning");
+        return;
+      }
+    }
+
+    loraSorterState.moving = true;
+    loraSorterState.result = null;
+    const result = {
+      total: jobs.length,
+      moved: 0,
+      skipped: 0,
+      excluded: Math.max(0, loraSorterState.scannedFiles.length - jobs.length),
+      failed: 0,
+      errors: [],
+      summary: "",
+    };
+    const movedEntries = new Set();
+    loraSorterState.progress = { phase: "move", current: 0, total: jobs.length, fileName: "이동 준비 중", errors: result.errors };
+    render();
+    try {
+      for (let index = 0; index < jobs.length; index += 1) {
+        const { file: entry, group, customDestination } = jobs[index];
+        const relativeName = [...entry.relativeParts, entry.name].join("/");
+        loraSorterState.progress.current = index;
+        loraSorterState.progress.fileName = relativeName;
+        updateLoraSorterProgressDom();
+        try {
+          const destination = customDestination || await loraSorterState.baseDestinationHandle.getDirectoryHandle(
+            window.PromptArchiveLoraSorter.safeFolderName(group.label),
+            { create: true },
+          );
+          if (typeof destination.isSameEntry === "function" && await destination.isSameEntry(entry.parentHandle)) {
+            throw new Error("원본과 목적지 폴더가 같습니다.");
+          }
+          const outputName = await loraSorterOutputName(destination, entry.name, loraSorterState.collisionMode);
+          if (!outputName) {
+            result.skipped += 1;
+            continue;
+          }
+          await moveLoraSorterFile(entry, destination, outputName);
+          result.moved += 1;
+          movedEntries.add(entry);
+        } catch (error) {
+          result.failed += 1;
+          result.errors.push(`${relativeName}: ${error.message || error}`);
+          loraSorterState.progress.errors = result.errors;
+        } finally {
+          loraSorterState.progress.current = index + 1;
+          updateLoraSorterProgressDom();
+        }
+      }
+    } finally {
+      loraSorterState.moving = false;
+      loraSorterState.scannedFiles = loraSorterState.scannedFiles.filter((entry) => !movedEntries.has(entry));
+      loraSorterState.groups = window.PromptArchiveLoraSorter.groupInspectedFiles(loraSorterState.scannedFiles);
+      result.summary = `${result.moved}장 이동 · ${result.skipped}장 건너뜀 · ${result.failed}장 오류`;
+      loraSorterState.result = result;
+      loraSorterState.progress = { phase: "move", current: jobs.length, total: jobs.length, fileName: result.summary, errors: result.errors };
+      render();
+      showToast(result.errors.length ? result.summary : `${result.moved}장 LoRA별 이동 완료`, result.errors.length ? "warning" : "success", 4200);
+    }
+  }
+
+  async function loraSorterOutputName(directory, fileName, collisionMode) {
+    for (let attempt = 0; attempt < 10000; attempt += 1) {
+      const candidate = window.PromptArchiveLoraSorter.collisionFileName(fileName, attempt);
+      if (!(await directoryHasFile(directory, candidate))) return candidate;
+      if (collisionMode === "skip") return "";
+    }
+    throw new Error("사용 가능한 중복 파일명을 만들지 못했습니다.");
+  }
+
+  async function moveLoraSorterFile(entry, destination, outputName) {
+    const sourceFile = await entry.handle.getFile();
+    const outputHandle = await destination.getFileHandle(outputName, { create: true });
+    let written = false;
+    try {
+      await writeConverterOutput(outputHandle, sourceFile);
+      written = true;
+      const outputFile = await outputHandle.getFile();
+      if (outputFile.size !== sourceFile.size) throw new Error("복사된 파일 크기 검증에 실패했습니다.");
+      if (!entry.parentHandle || typeof entry.parentHandle.removeEntry !== "function") throw new Error("현재 브라우저가 원본 파일 이동을 지원하지 않습니다.");
+      await entry.parentHandle.removeEntry(entry.name);
+    } catch (error) {
+      if (written && typeof destination.removeEntry === "function") {
+        try {
+          await destination.removeEntry(outputName);
+        } catch (_) {
+          // Keep the original failure; an incomplete destination is reported by its filename.
+        }
+      }
+      throw error;
+    }
+  }
+
+  function updateLoraSorterProgressDom() {
+    const progress = loraSorterState.progress;
+    if (!progress) return;
+    const percent = progress.total ? Math.round((progress.current / progress.total) * 100) : 0;
+    const values = [
+      ["[data-lora-progress-title]", loraSorterProgressTitle(progress)],
+      ["[data-lora-progress-file]", progress.fileName || ""],
+      ["[data-lora-progress-percent]", `${percent}%`],
+      ["[data-lora-mini-title]", loraSorterProgressTitle(progress)],
+      ["[data-lora-mini-file]", progress.fileName || ""],
+      ["[data-lora-mini-percent]", `${percent}%`],
+    ];
+    values.forEach(([selector, value]) => {
+      const element = document.querySelector(selector);
+      if (element) element.textContent = value;
+    });
+    document.querySelectorAll("[data-lora-progress-bar], [data-lora-mini-bar]").forEach((bar) => {
+      bar.style.width = `${percent}%`;
+    });
+    const errors = document.querySelector("[data-lora-progress-errors]");
+    if (errors) errors.innerHTML = (progress.errors || []).slice(-5).map((message) => `<li>${escapeHtml(message)}</li>`).join("");
+  }
+
+  function bindConverterEvents() {
+    if (ui.modal !== "converter") return;
+    document.querySelectorAll('input[name="converterSourceMode"]').forEach((input) => {
+      input.addEventListener("change", async (event) => {
+        converterState.sourceMode = event.target.value === "files" ? "files" : "folder";
+        if (converterState.sourceMode === "files") {
+          converterState.destinationMode = "custom";
+          converterState.deleteOriginals = false;
+          converterState.sourceFiles = [...converterState.selectedFiles];
+        } else {
+          converterState.sourceFiles = converterState.sourceHandle
+            ? await collectPngFileHandles(converterState.sourceHandle, converterState.includeSubfolders)
+            : [];
+        }
+        converterState.progress = null;
+        converterState.result = null;
+        render();
+      });
+    });
+    document.querySelectorAll('input[name="converterDestinationMode"]').forEach((input) => {
+      input.addEventListener("change", (event) => {
+        converterState.destinationMode = event.target.value === "custom" ? "custom" : "source";
+        document.querySelectorAll(".converter-choice").forEach((choice) => {
+          choice.classList.toggle("selected", choice.querySelector("input")?.checked);
+        });
+        document.querySelector("[data-converter-destination]")?.classList.toggle("visible", converterState.destinationMode === "custom");
+      });
+    });
+    document.getElementById("converterIncludeSubfolders")?.addEventListener("change", async (event) => {
+      converterState.includeSubfolders = event.target.checked;
+      if (!converterState.sourceHandle) return;
+      converterState.sourceFiles = await collectPngFileHandles(converterState.sourceHandle, converterState.includeSubfolders);
+      converterState.result = null;
+      render();
+    });
+    document.getElementById("converterQuality")?.addEventListener("input", (event) => {
+      converterState.quality = clampNumber(event.target.value, 70, 100, 100);
+      const output = document.getElementById("converterQualityOutput");
+      if (output) output.textContent = String(converterState.quality);
+    });
+    document.getElementById("converterCollisionMode")?.addEventListener("change", (event) => {
+      converterState.collisionMode = ["rename", "skip", "overwrite"].includes(event.target.value) ? event.target.value : "rename";
+    });
+    document.getElementById("converterDeleteOriginals")?.addEventListener("change", (event) => {
+      converterState.deleteOriginals = converterState.sourceMode === "folder" && event.target.checked;
+      event.target.closest(".converter-delete-check")?.classList.toggle("active", converterState.deleteOriginals);
+      const copy = document.querySelector(".converter-run-summary small");
+      if (copy) {
+        copy.textContent = converterState.deleteOriginals
+          ? "변환 성공 PNG는 작업 완료 후 영구 삭제됩니다."
+          : "원본 PNG는 삭제하거나 변경하지 않습니다.";
+        copy.classList.toggle("converter-destructive-copy", converterState.deleteOriginals);
+      }
+    });
+    document.getElementById("converterFileInput")?.addEventListener("change", (event) => {
+      addConverterFiles(event.target.files);
+    });
+    const dropzone = document.querySelector("[data-converter-dropzone]");
+    if (dropzone && converterState.sourceMode === "files") {
+      ["dragenter", "dragover"].forEach((name) => dropzone.addEventListener(name, (event) => {
+        event.preventDefault();
+        if (!converterState.running) dropzone.classList.add("dragging");
+      }));
+      ["dragleave", "drop"].forEach((name) => dropzone.addEventListener(name, (event) => {
+        event.preventDefault();
+        dropzone.classList.remove("dragging");
+      }));
+      dropzone.addEventListener("drop", (event) => {
+        if (!converterState.running) addConverterFiles(event.dataTransfer?.files);
+      });
+    }
+  }
+
+  async function rebuildWildcardsFromArchive() {
+    if (converterState.wildcardSyncing) return;
+    const confirmed = confirm("전체 갱신은 현재 아카이브에 남아 있는 프롬프트만으로 와일드카드 파일을 다시 작성합니다.\n\n삭제한 항목은 빠지며, 와일드카드 파일에 수동으로 추가한 줄도 제거됩니다. 계속할까요?");
+    if (!confirmed) return;
+    await syncWildcardsFromArchive({ mode: "rebuild" });
+  }
+
+  async function syncWildcardsFromArchive(options = {}) {
+    if (converterState.wildcardSyncing) return;
+    const mode = options.mode === "rebuild" ? "rebuild" : "incremental";
+    converterState.wildcardSyncing = true;
+    converterState.wildcardSyncMode = mode;
+    converterState.wildcardSyncResult = null;
+    render();
+    try {
+      clearTimeout(itemsSaveTimer);
+      const itemsSaved = await syncItemsToServer();
+      if (!itemsSaved) throw new Error("최신 프롬프트 항목을 서버에 저장하지 못했습니다.");
+      const endpoint = mode === "rebuild" ? `${SERVER_WILDCARD_SYNC_ENDPOINT}?mode=rebuild` : SERVER_WILDCARD_SYNC_ENDPOINT;
+      const response = await fetch(endpoint, { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.message || "와일드카드 업데이트에 실패했습니다.");
+      converterState.wildcardSyncResult = payload;
+      if (payload.rebuilt) {
+        showToast(`전체 갱신 완료 · 외모 ${payload.appearanceWritten}줄 · 시나리오 ${payload.scenarioWritten}줄`, payload.invalidItems ? "warning" : "success", 3200);
+      } else if (payload.initialized) {
+        showToast(`현재 ${payload.totalItems}개를 업데이트 기준으로 등록했습니다.`, "success", 2600);
+      } else {
+        showToast(`와일드카드 업데이트 완료 · 새 항목 ${payload.newItems}개`, payload.invalidItems ? "warning" : "success", 2600);
+      }
+    } catch (error) {
+      converterState.wildcardSyncResult = { error: error?.message || "와일드카드 업데이트에 실패했습니다." };
+      showToast(converterState.wildcardSyncResult.error, "warning", 3200);
+    } finally {
+      converterState.wildcardSyncing = false;
+      converterState.wildcardSyncMode = "";
+      render();
+    }
+  }
+
+  function addConverterFiles(fileList) {
+    const incoming = [...(fileList || [])].filter((file) => file.type === "image/png" || /\.png$/i.test(file.name));
+    if (!incoming.length) {
+      showToast("PNG 파일만 선택할 수 있습니다.", "warning");
+      return;
+    }
+    const filesByKey = new Map(converterState.selectedFiles.map((entry) => [entry.key, entry]));
+    incoming.forEach((file) => {
+      const key = `${file.name}:${file.size}:${file.lastModified}`;
+      filesByKey.set(key, { file, key, name: file.name, relativeParts: [] });
+    });
+    converterState.selectedFiles = [...filesByKey.values()].sort((left, right) => left.name.localeCompare(right.name, "ko"));
+    converterState.sourceFiles = [...converterState.selectedFiles];
+    converterState.progress = null;
+    converterState.result = null;
+    render();
+  }
+
+  function resetConverterSelection() {
+    if (converterState.running) return;
+    converterState.sourceHandle = null;
+    converterState.selectedFiles = [];
+    converterState.sourceFiles = [];
+    converterState.deleteOriginals = false;
+    converterState.progress = null;
+    converterState.result = null;
+    render();
+  }
+
+  async function selectConverterSourceFolder() {
+    try {
+      const handle = await window.showDirectoryPicker({ id: "prompt-archive-png-source", mode: "readwrite" });
+      if (!(await ensureDirectoryPermission(handle, true))) throw new Error("원본 폴더의 읽기·쓰기 권한이 필요합니다.");
+      converterState.sourceHandle = handle;
+      converterState.sourceMode = "folder";
+      converterState.sourceFiles = await collectPngFileHandles(handle, converterState.includeSubfolders);
+      converterState.progress = null;
+      converterState.result = null;
+      render();
+      if (!converterState.sourceFiles.length) showToast("선택한 범위에서 PNG 파일을 찾지 못했습니다.", "warning");
+    } catch (error) {
+      if (error?.name !== "AbortError") showToast(error.message || "원본 폴더를 열지 못했습니다.", "warning");
+    }
+  }
+
+  async function selectConverterDestinationFolder() {
+    try {
+      const handle = await window.showDirectoryPicker({ id: "prompt-archive-webp-destination", mode: "readwrite" });
+      if (!(await ensureDirectoryPermission(handle, true))) throw new Error("저장 폴더의 쓰기 권한이 필요합니다.");
+      converterState.destinationHandle = handle;
+      converterState.destinationMode = "custom";
+      render();
+    } catch (error) {
+      if (error?.name !== "AbortError") showToast(error.message || "저장 폴더를 열지 못했습니다.", "warning");
+    }
+  }
+
+  async function ensureDirectoryPermission(handle, write = false) {
+    const options = { mode: write ? "readwrite" : "read" };
+    if ((await handle.queryPermission(options)) === "granted") return true;
+    return (await handle.requestPermission(options)) === "granted";
+  }
+
+  async function collectPngFileHandles(rootHandle, recursive, relativeParts = [], results = []) {
+    for await (const [name, handle] of rootHandle.entries()) {
+      if (handle.kind === "file" && /\.png$/i.test(name)) {
+        results.push({ handle, parentHandle: rootHandle, name, relativeParts: [...relativeParts] });
+      } else if (recursive && handle.kind === "directory") {
+        await collectPngFileHandles(handle, true, [...relativeParts, name], results);
+      }
+    }
+    return results.sort((left, right) => {
+      const leftPath = [...left.relativeParts, left.name].join("/");
+      const rightPath = [...right.relativeParts, right.name].join("/");
+      return leftPath.localeCompare(rightPath, "ko");
+    });
+  }
+
+  async function startPngToWebpConversion() {
+    if (converterState.running || !converterState.sourceFiles.length) return;
+    converterState.destinationMode = converterState.sourceMode === "files"
+      ? "custom"
+      : document.querySelector('input[name="converterDestinationMode"]:checked')?.value === "custom" ? "custom" : "source";
+    if (converterState.sourceMode === "folder") {
+      converterState.includeSubfolders = Boolean(document.getElementById("converterIncludeSubfolders")?.checked);
+      converterState.deleteOriginals = Boolean(document.getElementById("converterDeleteOriginals")?.checked);
+    } else {
+      converterState.deleteOriginals = false;
+    }
+    converterState.quality = clampNumber(document.getElementById("converterQuality")?.value, 70, 100, 100);
+    converterState.collisionMode = document.getElementById("converterCollisionMode")?.value || "rename";
+    if (converterState.destinationMode === "custom" && !converterState.destinationHandle) {
+      showToast("WebP를 저장할 폴더를 선택해주세요.", "warning");
+      return;
+    }
+    if (converterState.deleteOriginals && !confirm("변환과 WebP 저장에 성공한 원본 PNG를 영구 삭제합니다.\n\n휴지통으로 이동하지 않으며 복구할 수 없습니다. 계속할까요?")) {
+      return;
+    }
+
+    if (converterState.sourceMode === "folder") {
+      const needsSourceWrite = converterState.destinationMode === "source" || converterState.deleteOriginals;
+      if (!converterState.sourceHandle || !(await ensureDirectoryPermission(converterState.sourceHandle, needsSourceWrite))) {
+        showToast("원본 폴더 권한이 만료되었습니다. 폴더를 다시 선택해주세요.", "warning");
+        return;
+      }
+    }
+    if (converterState.destinationMode === "custom" && !(await ensureDirectoryPermission(converterState.destinationHandle, true))) {
+      showToast("저장 폴더 권한이 만료되었습니다. 폴더를 다시 선택해주세요.", "warning");
+      return;
+    }
+
+    const files = converterState.sourceMode === "folder"
+      ? await collectPngFileHandles(converterState.sourceHandle, converterState.includeSubfolders)
+      : [...converterState.selectedFiles];
+    if (!files.length) {
+      showToast("변환할 PNG 파일이 없습니다.", "warning");
+      return;
+    }
+    converterState.sourceFiles = files;
+    converterState.running = true;
+    converterState.result = null;
+    converterState.progress = { current: 0, total: files.length, fileName: "변환 준비 중", errors: [] };
+    render();
+
+    const deleteQueue = [];
+    const result = {
+      total: files.length,
+      converted: 0,
+      skipped: 0,
+      deleted: 0,
+      metadataFiles: 0,
+      inputBytes: 0,
+      outputBytes: 0,
+      errors: [],
+      summary: "",
+    };
+
+    try {
+      for (let index = 0; index < files.length; index += 1) {
+        const entry = files[index];
+        const relativeName = [...entry.relativeParts, entry.name].join("/");
+        converterState.progress.current = index;
+        converterState.progress.fileName = relativeName;
+        updateConverterProgressDom();
+        try {
+          const outputDirectory = await converterOutputDirectory(entry);
+          const outputName = await converterOutputName(outputDirectory, entry.name, converterState.collisionMode);
+          if (!outputName) {
+            result.skipped += 1;
+            continue;
+          }
+          const converted = await convertPngEntryToWebp(entry, converterState.quality);
+          const outputHandle = await outputDirectory.getFileHandle(outputName, { create: true });
+          await writeConverterOutput(outputHandle, converted.blob);
+          result.converted += 1;
+          result.inputBytes += converted.inputBytes;
+          result.outputBytes += converted.blob.size;
+          if (converted.metadataPreserved) result.metadataFiles += 1;
+          if (converterState.deleteOriginals) deleteQueue.push({ entry, relativeName });
+        } catch (error) {
+          const message = `${relativeName}: ${error.message || error}`;
+          result.errors.push(message);
+          converterState.progress.errors = result.errors;
+        } finally {
+          converterState.progress.current = index + 1;
+          updateConverterProgressDom();
+        }
+      }
+      if (converterState.deleteOriginals && deleteQueue.length) {
+        converterState.progress = { current: 0, total: deleteQueue.length, fileName: "원본 삭제 준비 중", errors: result.errors, phase: "delete" };
+        updateConverterProgressDom();
+        for (let index = 0; index < deleteQueue.length; index += 1) {
+          const { entry, relativeName } = deleteQueue[index];
+          converterState.progress.current = index;
+          converterState.progress.fileName = relativeName;
+          updateConverterProgressDom();
+          try {
+            await permanentlyDeleteConvertedPng(entry);
+            result.deleted += 1;
+          } catch (error) {
+            result.errors.push(`${relativeName}: 원본 삭제 실패 · ${error.message || error}`);
+            converterState.progress.errors = result.errors;
+          } finally {
+            converterState.progress.current = index + 1;
+            updateConverterProgressDom();
+          }
+        }
+      }
+    } finally {
+      converterState.running = false;
+      result.summary = result.converted
+        ? `${formatBytes(result.inputBytes)} → ${formatBytes(result.outputBytes)} · ${Math.max(0, Math.round((1 - result.outputBytes / Math.max(1, result.inputBytes)) * 100))}% 절감`
+        : "저장된 파일이 없습니다.";
+      converterState.result = result;
+      converterState.progress = { current: files.length, total: files.length, fileName: result.summary, errors: result.errors };
+      addConverterHistory(result);
+      render();
+      showToast(
+        result.errors.length
+          ? `${result.converted}개 변환 완료, 원본 ${result.deleted}개 삭제, ${result.errors.length}개 오류`
+          : `${result.converted}개 변환 완료${result.deleted ? ` · 원본 ${result.deleted}개 영구 삭제` : ""}`,
+        result.errors.length ? "warning" : "success",
+        4200
+      );
+    }
+  }
+
+  async function converterOutputDirectory(entry) {
+    if (converterState.destinationMode === "source" && entry.parentHandle) return entry.parentHandle;
+    let directory = converterState.destinationHandle;
+    for (const name of entry.relativeParts) directory = await directory.getDirectoryHandle(name, { create: true });
+    return directory;
+  }
+
+  async function converterOutputName(directory, pngName, collisionMode) {
+    const base = pngName.replace(/\.png$/i, "");
+    const preferred = `${base}.webp`;
+    if (!(await directoryHasFile(directory, preferred)) || collisionMode === "overwrite") return preferred;
+    if (collisionMode === "skip") return "";
+    let index = 0;
+    while (true) {
+      const suffix = index === 0 ? "_webp" : `_webp_${index + 1}`;
+      const candidate = `${base}${suffix}.webp`;
+      if (!(await directoryHasFile(directory, candidate))) return candidate;
+      index += 1;
+    }
+  }
+
+  async function directoryHasFile(directory, name) {
+    try {
+      await directory.getFileHandle(name);
+      return true;
+    } catch (error) {
+      if (error?.name === "NotFoundError") return false;
+      throw error;
+    }
+  }
+
+  async function writeConverterOutput(fileHandle, blob) {
+    const writable = await fileHandle.createWritable();
+    try {
+      await writable.write(blob);
+      await writable.close();
+    } catch (error) {
+      try {
+        if (typeof writable.abort === "function") await writable.abort();
+      } catch (_) {
+        // The original write error is more useful than a secondary abort error.
+      }
+      throw error;
+    }
+  }
+
+  async function permanentlyDeleteConvertedPng(entry) {
+    if (entry.parentHandle && typeof entry.parentHandle.removeEntry === "function") {
+      await entry.parentHandle.removeEntry(entry.name);
+      return;
+    }
+    if (entry.handle && typeof entry.handle.remove === "function") {
+      await entry.handle.remove();
+      return;
+    }
+    throw new Error("현재 브라우저가 선택한 원본 파일 삭제를 지원하지 않습니다.");
+  }
+
+  async function convertPngEntryToWebp(entry, quality) {
+    const file = entry.file || await entry.handle.getFile();
+    const pngBuffer = await file.arrayBuffer();
+    const bitmap = await createImageBitmap(new Blob([pngBuffer], { type: "image/png" }));
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext("2d", { alpha: true });
+      if (!context) throw new Error("브라우저 캔버스를 만들 수 없습니다.");
+      context.drawImage(bitmap, 0, 0);
+      const encoded = await canvasToBlob(canvas, "image/webp", quality / 100);
+      const preserved = await window.PromptArchiveImageConverter.preservePngMetadataInWebp(
+        await encoded.arrayBuffer(),
+        pngBuffer,
+        bitmap.width,
+        bitmap.height
+      );
+      const chunks = window.PromptArchiveImageConverter.parseWebpChunks(preserved.bytes);
+      if (preserved.hasExif && !chunks.some((chunk) => chunk.type === "EXIF")) throw new Error("EXIF 기록 검증에 실패했습니다.");
+      if (preserved.hasXmp && !chunks.some((chunk) => chunk.type === "XMP ")) throw new Error("XMP 기록 검증에 실패했습니다.");
+      return {
+        blob: new Blob([preserved.bytes], { type: "image/webp" }),
+        inputBytes: file.size,
+        metadataPreserved: preserved.hasExif || preserved.hasXmp,
+      };
+    } finally {
+      bitmap.close?.();
+    }
+  }
+
+  function updateConverterProgressDom() {
+    const progress = converterState.progress;
+    if (!progress) return;
+    const percent = progress.total ? Math.round((progress.current / progress.total) * 100) : 0;
+    const title = document.querySelector("[data-converter-progress-title]");
+    const file = document.querySelector("[data-converter-progress-file]");
+    const percentNode = document.querySelector("[data-converter-progress-percent]");
+    const bar = document.querySelector("[data-converter-progress-bar]");
+    const errors = document.querySelector("[data-converter-errors]");
+    const miniTitle = document.querySelector("[data-converter-mini-title]");
+    const miniFile = document.querySelector("[data-converter-mini-file]");
+    const miniPercent = document.querySelector("[data-converter-mini-percent]");
+    const miniBar = document.querySelector("[data-converter-mini-bar]");
+    if (title) title.textContent = converterProgressTitle(progress);
+    if (file) file.textContent = progress.fileName || "";
+    if (percentNode) percentNode.textContent = `${percent}%`;
+    if (bar) bar.style.width = `${percent}%`;
+    if (errors) errors.innerHTML = (progress.errors || []).slice(-5).map((message) => `<li>${escapeHtml(message)}</li>`).join("");
+    if (miniTitle) miniTitle.textContent = converterProgressTitle(progress);
+    if (miniFile) miniFile.textContent = progress.fileName || "";
+    if (miniPercent) miniPercent.textContent = `${percent}%`;
+    if (miniBar) miniBar.style.width = `${percent}%`;
+  }
+
+  async function validatePendingExifPrompts(files) {
+    const prompts = {};
+    const errors = {};
+    const invalidKeys = [];
+    for (const file of files) {
+      const key = pendingUploadKey(file);
+      try {
+        validateUploadFile(file);
+        const parsed = await readExifPromptFromFile(file);
+        prompts[key] = parsed;
+      } catch (error) {
+        errors[key] = error.message || "EXIF 프롬프트를 읽지 못했습니다.";
+        invalidKeys.push(key);
+      }
+    }
+    return { prompts, errors, invalidKeys };
+  }
+
+  async function readExifPromptFromFile(file) {
+    const buffer = await file.arrayBuffer();
+    const metadata = extractImageMetadataText(buffer, file.type || "");
+    const parsed = parseExifPromptMetadata(metadata);
+    if (!parsed?.promptJson) {
+      throw new Error("EXIF / 메타데이터에 5문단 프롬프트가 없습니다.");
+    }
+    return parsed;
+  }
+
+  function extractImageMetadataText(buffer, mimeType) {
+    const bytes = new Uint8Array(buffer);
+    const chunks = [];
+    const add = (source, value) => {
+      const text = cleanMetadataText(value);
+      if (text) chunks.push({ source, text });
+    };
+    if (mimeType === "image/png" || hasPngSignature(bytes)) {
+      extractPngMetadata(bytes).forEach((entry) => add(entry.source, entry.text));
+    }
+    if (mimeType === "image/jpeg" || hasJpegSignature(bytes)) {
+      extractJpegMetadata(bytes).forEach((entry) => add(entry.source, entry.text));
+    }
+    if (mimeType === "image/webp" || hasWebpSignature(bytes)) {
+      extractWebpMetadata(bytes).forEach((entry) => add(entry.source, entry.text));
+    }
+    add("raw-scan", scanBufferForPromptText(bytes));
+    return chunks;
+  }
+
+  function hasPngSignature(bytes) {
+    return bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  }
+
+  function hasJpegSignature(bytes) {
+    return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8;
+  }
+
+  function hasWebpSignature(bytes) {
+    return bytes.length > 12 && ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WEBP";
+  }
+
+  function extractPngMetadata(bytes) {
+    const entries = [];
+    if (!hasPngSignature(bytes)) return entries;
+    let offset = 8;
+    while (offset + 12 <= bytes.length) {
+      const length = readUint32BE(bytes, offset);
+      const type = ascii(bytes, offset + 4, 4);
+      const dataStart = offset + 8;
+      const dataEnd = dataStart + length;
+      if (dataEnd > bytes.length) break;
+      const data = bytes.slice(dataStart, dataEnd);
+      if (type === "tEXt") {
+        const nul = data.indexOf(0);
+        const key = nul >= 0 ? latin1(data.slice(0, nul)) : "tEXt";
+        const value = nul >= 0 ? latin1(data.slice(nul + 1)) : latin1(data);
+        entries.push({ source: key || "PNG tEXt", text: value });
+      } else if (type === "iTXt") {
+        const parsed = parsePngItxt(data);
+        if (parsed.text) entries.push(parsed);
+      } else if (type === "zTXt") {
+        const nul = data.indexOf(0);
+        const key = nul >= 0 ? latin1(data.slice(0, nul)) : "zTXt";
+        entries.push({ source: key || "PNG zTXt", text: scanBufferForPromptText(data) });
+      }
+      offset = dataEnd + 4;
+      if (type === "IEND") break;
+    }
+    return entries;
+  }
+
+  function parsePngItxt(data) {
+    let cursor = 0;
+    const readNullText = () => {
+      const end = data.indexOf(0, cursor);
+      const stop = end >= 0 ? end : data.length;
+      const value = utf8(data.slice(cursor, stop));
+      cursor = Math.min(stop + 1, data.length);
+      return value;
+    };
+    const key = readNullText() || "PNG iTXt";
+    cursor += 2;
+    readNullText();
+    readNullText();
+    return { source: key, text: utf8(data.slice(cursor)) };
+  }
+
+  function extractJpegMetadata(bytes) {
+    const entries = [];
+    if (!hasJpegSignature(bytes)) return entries;
+    let offset = 2;
+    while (offset + 4 < bytes.length) {
+      if (bytes[offset] !== 0xff) break;
+      const marker = bytes[offset + 1];
+      offset += 2;
+      if (marker === 0xda || marker === 0xd9) break;
+      const length = readUint16BE(bytes, offset);
+      const start = offset + 2;
+      const end = start + length - 2;
+      if (length < 2 || end > bytes.length) break;
+      const segment = bytes.slice(start, end);
+      if (marker === 0xe1 && ascii(segment, 0, 6) === "Exif\0\0") {
+        extractExifTiff(segment.slice(6)).forEach((entry) => entries.push(entry));
+      } else if (marker === 0xe1 && ascii(segment, 0, 29).includes("http://ns.adobe.com/xap")) {
+        entries.push({ source: "XMP", text: utf8(segment) });
+      } else if (marker === 0xfe) {
+        entries.push({ source: "JPEG Comment", text: utf8(segment) || latin1(segment) });
+      }
+      offset = end;
+    }
+    return entries;
+  }
+
+  function extractExifTiff(tiff) {
+    const entries = [];
+    if (tiff.length < 8) return entries;
+    const little = ascii(tiff, 0, 2) === "II";
+    const read16 = (offset) => little ? readUint16LE(tiff, offset) : readUint16BE(tiff, offset);
+    const read32 = (offset) => little ? readUint32LE(tiff, offset) : readUint32BE(tiff, offset);
+    const firstIfd = read32(4);
+    const visited = new Set();
+    const tagNames = {
+      0x010e: "ImageDescription",
+      0x010f: "Make",
+      0x0110: "Model",
+      0x0131: "Software",
+      0x9286: "UserComment",
+      0x9c9c: "XPComment",
+      0x9c9b: "XPTitle",
+      0x9c9e: "XPSubject",
+    };
+    const parseIfd = (offset) => {
+      if (!offset || visited.has(offset) || offset + 2 > tiff.length) return;
+      visited.add(offset);
+      const count = read16(offset);
+      for (let i = 0; i < count; i++) {
+        const entryOffset = offset + 2 + i * 12;
+        if (entryOffset + 12 > tiff.length) break;
+        const tag = read16(entryOffset);
+        const type = read16(entryOffset + 2);
+        const countValue = read32(entryOffset + 4);
+        const valueOffset = read32(entryOffset + 8);
+        if (tag === 0x8769 || tag === 0x8825) {
+          parseIfd(valueOffset);
+          continue;
+        }
+        if (!tagNames[tag]) continue;
+        const value = readExifValue(tiff, entryOffset + 8, type, countValue, valueOffset, little);
+        entries.push({ source: tagNames[tag], text: value });
+      }
+      const next = offset + 2 + count * 12;
+      if (next + 4 <= tiff.length) parseIfd(read32(next));
+    };
+    parseIfd(firstIfd);
+    return entries;
+  }
+
+  function readExifValue(tiff, inlineOffset, type, countValue, valueOffset, little) {
+    const typeSize = { 1: 1, 2: 1, 3: 2, 4: 4, 7: 1 }[type] || 1;
+    const byteLength = Math.max(0, countValue * typeSize);
+    const start = byteLength <= 4 ? inlineOffset : valueOffset;
+    if (start < 0 || start + byteLength > tiff.length) return "";
+    const data = tiff.slice(start, start + byteLength);
+    if (type === 2) return latin1(data).replace(/\0+$/g, "");
+    if (type === 7) return decodeExifUndefined(data);
+    if (type === 1 && byteLength > 4) return utf8(data) || latin1(data);
+    if (type === 3 && byteLength > 4) return decodeUtf16(data, little);
+    return utf8(data) || latin1(data);
+  }
+
+  function decodeExifUndefined(data) {
+    const prefix = ascii(data, 0, 8);
+    const body = data.slice(8);
+    if (prefix.startsWith("UNICODE")) return decodeUtf16(body, false);
+    if (prefix.startsWith("ASCII")) return latin1(body).replace(/\0+$/g, "");
+    return utf8(data) || latin1(data);
+  }
+
+  function extractWebpMetadata(bytes) {
+    const entries = [];
+    if (!hasWebpSignature(bytes)) return entries;
+    let offset = 12;
+    while (offset + 8 <= bytes.length) {
+      const type = ascii(bytes, offset, 4);
+      const size = readUint32LE(bytes, offset + 4);
+      const start = offset + 8;
+      const end = start + size;
+      if (end > bytes.length) break;
+      const data = bytes.slice(start, end);
+      if (type === "EXIF") extractExifTiff(stripExifHeader(data)).forEach((entry) => entries.push(entry));
+      if (type === "XMP ") entries.push({ source: "WebP XMP", text: utf8(data) });
+      offset = end + (size % 2);
+    }
+    return entries;
+  }
+
+  function stripExifHeader(data) {
+    return ascii(data, 0, 6) === "Exif\0\0" ? data.slice(6) : data;
+  }
+
+  function parseExifPromptMetadata(entries) {
+    const comfyResolved = window.PromptArchiveExifPromptResolver.resolveComfyPrompt(entries);
+    if (comfyResolved?.text) {
+      const sectionTexts = window.PromptArchiveExifPromptResolver.splitResolvedPromptSections(
+        comfyResolved.text,
+        knownWildcardScenarioSections(),
+      );
+      const promptJson = sectionTexts ? promptJsonFromSectionTexts(sectionTexts) : null;
+      if (promptJson) {
+        return {
+          promptJson,
+          rawText: comfyResolved.text,
+          source: comfyResolved.source,
+          titleSummary: titleFromPromptJson(promptJson),
+        };
+      }
+    }
+    const candidates = [];
+    for (const entry of entries) {
+      collectPromptCandidates(entry.text, entry.source).forEach((candidate) => candidates.push(candidate));
+    }
+    candidates.sort((a, b) => promptCandidateScore(b) - promptCandidateScore(a));
+    for (const candidate of candidates) {
+      const promptJson = promptJsonFromMetadataText(candidate.text);
+      if (promptJson) {
+        return {
+          promptJson,
+          rawText: candidate.text,
+          source: candidate.source,
+          titleSummary: titleFromPromptJson(promptJson),
+        };
+      }
+    }
+    return null;
+  }
+
+  function knownWildcardScenarioSections() {
+    return state.items.map((item) => {
+      const sections = {};
+      for (const key of ["outfit", "background", "expression_pose", "details"]) {
+        sections[key] = cleanPromptParagraph((item.promptJson?.[key]?.sentences || [])
+          .map((sentence) => sentence.en || "")
+          .filter(Boolean)
+          .join(" "));
+      }
+      return {
+        ...sections,
+        scenario: cleanPromptParagraph([sections.outfit, sections.background, sections.expression_pose, sections.details].join(" ")),
+      };
+    }).filter((entry) => entry.outfit && entry.background && entry.expression_pose && entry.details);
+  }
+
+  function collectPromptCandidates(text, source = "metadata") {
+    const cleaned = cleanMetadataText(text);
+    if (!cleaned) return [];
+    const candidates = [{ source, text: cleaned }];
+    const json = tryParseJson(cleaned);
+    if (json) {
+      extractStringsFromJson(json).forEach((value, index) => candidates.push({ source: `${source}:json-${index + 1}`, text: value }));
+    }
+    const parameters = extractA1111PositivePrompt(cleaned);
+    if (parameters && parameters !== cleaned) candidates.push({ source: `${source}:parameters`, text: parameters });
+    return candidates;
+  }
+
+  function extractStringsFromJson(value, depth = 0) {
+    if (depth > 5 || value == null) return [];
+    if (typeof value === "string") return [value];
+    const out = [];
+    if (typeof value === "object") {
+      const priorityKeys = ["promptSections", "promptJson", "finalPrompt", "prompt", "parameters", "description", "Comment", "UserComment"];
+      priorityKeys.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(value, key)) out.push(...extractStringsFromJson(value[key], depth + 1));
+      });
+      Object.keys(value).forEach((key) => {
+        if (!priorityKeys.includes(key)) out.push(...extractStringsFromJson(value[key], depth + 1));
+      });
+    }
+    return out.map(cleanMetadataText).filter((text) => text.length > 20);
+  }
+
+  function promptCandidateScore(candidate) {
+    const text = candidate.text.toLowerCase();
+    let score = Math.min(candidate.text.length, 4000) / 1000;
+    if (/appearance|outfit|background|details|외모|복장|배경|디테일/.test(text)) score += 8;
+    if ((candidate.text.match(/\n\s*\n/g) || []).length >= 4) score += 7;
+    if (/negative prompt|steps:|sampler:|cfg scale:/i.test(candidate.text)) score += 2;
+    if (/workflow|class_type|last_node_id/i.test(candidate.text)) score -= 4;
+    return score;
+  }
+
+  function promptJsonFromMetadataText(text) {
+    const cleaned = cleanMetadataText(text);
+    const json = tryParseJson(cleaned);
+    if (json) {
+      if (json.promptSections || json.promptJson) return normalizeAnalysisPrompt(json.promptSections || json.promptJson);
+      if (json.prompt && typeof json.prompt === "object") return normalizeAnalysisPrompt(json.prompt);
+      const strings = extractStringsFromJson(json).sort((a, b) => b.length - a.length);
+      for (const value of strings) {
+        const parsed = promptJsonFromMetadataText(value);
+        if (parsed) return parsed;
+      }
+    }
+    return promptJsonFromPlainText(cleaned);
+  }
+
+  function promptJsonFromPlainText(text) {
+    const withoutNegative = extractA1111PositivePrompt(text) || text;
+    const labeled = splitLabeledSections(withoutNegative);
+    if (labeled) return promptJsonFromSectionTexts(labeled);
+    const paragraphs = withoutNegative
+      .split(/\n\s*\n+/)
+      .map((part) => cleanPromptParagraph(part))
+      .filter(Boolean);
+    if (paragraphs.length >= 5) return promptJsonFromSectionTexts(Object.fromEntries(sectionMeta.map((section, index) => [section.key, paragraphs[index]])));
+    return null;
+  }
+
+  function splitLabeledSections(text) {
+    const labels = [
+      ["appearance", "Appearance", "외모"],
+      ["outfit", "Outfit", "복장"],
+      ["background", "Background", "배경"],
+      ["expression_pose", "Expression / Pose", "Expression/Pose", "Expression Pose", "표정/자세", "표정", "자세"],
+      ["details", "Details", "Detail", "디테일", "품질"],
+    ];
+    const matches = [];
+    labels.forEach(([key, ...names]) => {
+      names.forEach((name) => {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const re = new RegExp(`(^|\\n)\\s*(?:#{1,6}\\s*)?${escaped}\\s*[:：-]?\\s*`, "ig");
+        let match;
+        while ((match = re.exec(text))) matches.push({ key, index: match.index, end: re.lastIndex });
+      });
+    });
+    matches.sort((a, b) => a.index - b.index);
+    const unique = [];
+    matches.forEach((match) => {
+      if (!unique.some((item) => item.key === match.key)) unique.push(match);
+    });
+    if (unique.length < 5) return null;
+    const ordered = sectionMeta.map((section) => unique.find((match) => match.key === section.key)).filter(Boolean);
+    if (ordered.length < 5) return null;
+    const out = {};
+    ordered.forEach((match, index) => {
+      const next = ordered[index + 1];
+      out[match.key] = cleanPromptParagraph(text.slice(match.end, next ? next.index : text.length));
+    });
+    return sectionMeta.every((section) => out[section.key]) ? out : null;
+  }
+
+  function promptJsonFromSectionTexts(sectionTexts) {
+    const prompt = {};
+    sectionMeta.forEach((section) => {
+      const text = cleanPromptParagraph(sectionTexts[section.key] || "");
+      prompt[section.key] = {
+        title_ko: section.labelKo,
+        sentences: splitPromptSentences(text).map((sentence, index) => ({
+          id: `${section.key}-${index + 1}`,
+          en: sentence,
+          ko: "",
+        })),
+      };
+    });
+    if (sectionMeta.some((section) => !prompt[section.key].sentences.length)) return null;
+    return prompt;
+  }
+
+  function splitPromptSentences(text) {
+    const cleaned = cleanPromptParagraph(text);
+    if (!cleaned) return [];
+    const byLine = cleaned.split(/\n+/).map(cleanPromptParagraph).filter(Boolean);
+    if (byLine.length > 1) return byLine;
+    return [cleaned];
+  }
+
+  function cleanPromptParagraph(value) {
+    return String(value || "")
+      .replace(/^[-*\d.)\s]+(?=\S)/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function extractA1111PositivePrompt(text) {
+    const value = cleanMetadataText(text);
+    if (!value) return "";
+    const negativeIndex = value.search(/\bNegative prompt\s*:/i);
+    const stepsIndex = value.search(/\bSteps\s*:/i);
+    const cut = [negativeIndex, stepsIndex].filter((index) => index > 0).sort((a, b) => a - b)[0];
+    return cut ? value.slice(0, cut).trim() : value;
+  }
+
+  function titleFromPromptJson(promptJson) {
+    // Titles come from /api/title-summary (keyword style: hair · outfit · accessory · background).
+    // Keep empty so EXIF import does not chop English prompt words into a fake title.
+    void promptJson;
+    return "";
+  }
+
+  async function translateItemPromptSections(item, options = {}) {
+    let translatedAny = false;
+    for (const sectionConfig of enabledSections()) {
+      const section = item.promptJson?.[sectionConfig.key];
+      if (!section?.sentences?.length) continue;
+      const sentences = section.sentences
+        .filter((sentence) => String(sentence.en || "").trim() && !String(sentence.ko || "").trim())
+        .map((sentence) => ({ id: sentence.id, en: String(sentence.en || "").trim() }));
+      if (!sentences.length) continue;
+      const response = await fetch(SERVER_TRANSLATE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          sectionKey: sectionConfig.key,
+          sectionLabel: sectionConfig.labelKo || sectionConfig.key,
+          sentences,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || "번역 요청에 실패했습니다.");
+      const byId = new Map((payload.translations || []).map((entry) => [entry.id, entry.ko]));
+      section.sentences.forEach((sentence) => {
+        const translated = byId.get(sentence.id);
+        if (translated) {
+          sentence.ko = translated;
+          translatedAny = true;
+        }
+      });
+    }
+    if (translatedAny) {
+      item.finalPrompt = promptText(item, "final");
+      item.updatedAt = Date.now();
+    }
+    if (!translatedAny && !options.silent) showToast("번역할 빈 한국어 문장이 없습니다.", "info", 1400);
+    return translatedAny;
+  }
+
+  function tryParseJson(text) {
+    const cleaned = cleanMetadataText(text);
+    if (!cleaned) return null;
+    try {
+      return JSON.parse(cleaned);
+    } catch (error) {
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
+      if (start >= 0 && end > start) {
+        try {
+          return JSON.parse(cleaned.slice(start, end + 1));
+        } catch (_error) {}
+      }
+    }
+    return null;
+  }
+
+  function cleanMetadataText(value) {
+    return String(value || "")
+      .replace(/^\uFEFF/, "")
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]+/g, " ")
+      .replace(/\r\n/g, "\n")
+      .trim();
+  }
+
+  function scanBufferForPromptText(bytes) {
+    const limit = Math.min(bytes.length, 3 * 1024 * 1024);
+    const text = utf8(bytes.slice(0, limit)) || latin1(bytes.slice(0, limit));
+    const patterns = [
+      /(?:promptSections|promptJson|finalPrompt|parameters|prompt|Description|UserComment)[\s\S]{0,20000}/i,
+      /Appearance[\s\S]{0,20000}Outfit[\s\S]{0,20000}Background[\s\S]{0,20000}Details[\s\S]{0,20000}/i,
+    ];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) return match[0];
+    }
+    return "";
+  }
+
+  function ascii(bytes, offset, length) {
+    return latin1(bytes.slice(offset, offset + length));
+  }
+
+  function utf8(bytes) {
+    try {
+      return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function latin1(bytes) {
+    try {
+      return new TextDecoder("latin1").decode(bytes);
+    } catch (error) {
+      return String.fromCharCode(...bytes);
+    }
+  }
+
+  function decodeUtf16(bytes, little = true) {
+    try {
+      return new TextDecoder(little ? "utf-16le" : "utf-16be").decode(bytes).replace(/\0+$/g, "");
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function readUint16BE(bytes, offset) {
+    return (bytes[offset] << 8) | bytes[offset + 1];
+  }
+
+  function readUint16LE(bytes, offset) {
+    return bytes[offset] | (bytes[offset + 1] << 8);
+  }
+
+  function readUint32BE(bytes, offset) {
+    return ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+  }
+
+  function readUint32LE(bytes, offset) {
+    return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
   }
 
   function validateUploadFile(file) {
@@ -3252,8 +7310,6 @@
 
   function buildAnalysisRequest(item) {
     const excluded = excludeLabels(item.excludeOptions);
-    const enabledOutfits = state.outfitTagOptions.filter((tag) => tag.enabled !== false && tag.allowAiAssign !== false).map((tag) => tag.name);
-    const enabledBackgrounds = state.backgroundTagOptions.filter((tag) => tag.enabled !== false && tag.allowAiAssign !== false).map((tag) => tag.name);
     const instruction = state.promptInstruction.includes("Section boundary rules:")
       ? state.promptInstruction
       : `${state.promptInstruction.trim()}\n\n${sectionBoundaryRules}`;
@@ -3266,26 +7322,89 @@
       "Elements to exclude from the generated prompt:",
       excluded.length ? excluded.map((label) => `- ${label}`).join("\n") : "(none)",
       "",
-      "Enabled outfit tags:",
-      enabledOutfits.map((label) => `- ${label}`).join("\n"),
-      "",
-      "Enabled background tags:",
-      enabledBackgrounds.map((label) => `- ${label}`).join("\n"),
-      "",
-      "Tag selection priority:",
-      "- Choose the closest specific enabled tag when there is any reasonable visual evidence.",
-      "- Do not choose 기타 just because the match is imperfect or broad.",
-      "- Use 기타 only when no enabled tag has meaningful visual support.",
-      "",
-      "Even if excluded elements appear in the image, do not describe them in the final prompt unless the user specifically asks to include them.",
+      "Focus rules for this app:",
+      "- Generate high-density promptSections only (appearance, outfit, background, expression_pose, details).",
+      "- Tags and album titles are handled outside this vision call. Do not spend tokens on tag lists or titleSummary.",
+      "- Even if excluded elements appear in the image, do not describe them in the final prompt unless the user specifically asks to include them.",
     ].join("\n");
   }
 
   function openItem(id) {
+    ui.previousView = ui.view;
     ui.selectedId = id;
     ui.view = "detail";
     ui.editMode = false;
     render();
+  }
+
+  function bindBackspaceNavigation() {
+    document.addEventListener("keydown", (event) => {
+      if (ui.modal && event.key === "Escape") {
+        event.preventDefault();
+        closeModal();
+        return;
+      }
+      if (ui.modal && event.key === "Tab") {
+        trapModalFocus(event);
+        return;
+      }
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (isTextEditingTarget(event.target)) return;
+      if (event.target?.closest?.("[data-shortcut-field]")) return;
+      const shortcuts = state.advancedSettings?.shortcuts || {};
+      if (shortcutMatches(event, shortcuts.goBack)) {
+        if (!goBackInApp()) return;
+        event.preventDefault();
+        return;
+      }
+      if (shortcutMatches(event, shortcuts.nextItem)) {
+        if (navigateAdjacentItem(1)) event.preventDefault();
+        return;
+      }
+      if (shortcutMatches(event, shortcuts.prevItem)) {
+        if (navigateAdjacentItem(-1)) event.preventDefault();
+        return;
+      }
+      if (shortcutMatches(event, shortcuts.copyFinal)) {
+        const item = selectedItem();
+        if (ui.view === "detail" && item?.promptJson) {
+          copyPrompt(item.id, "final");
+          event.preventDefault();
+        }
+      }
+    });
+  }
+
+  function navigateAdjacentItem(delta) {
+    const items = getFilteredItems();
+    if (!items.length) return false;
+    // Only navigate when already viewing a detail item.
+    if (ui.view !== "detail") return false;
+    const index = items.findIndex((item) => item.id === ui.selectedId);
+    const next = items[Math.max(0, Math.min(items.length - 1, (index < 0 ? 0 : index) + delta))];
+    if (!next || next.id === ui.selectedId) return false;
+    openItem(next.id);
+    return true;
+  }
+
+  function isTextEditingTarget(target) {
+    if (!target?.closest) return false;
+    return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+  }
+
+  function goBackInApp() {
+    if (ui.modal) {
+      ui.modal = null;
+      render();
+      return true;
+    }
+    if (ui.view === "detail") {
+      ui.view = ui.previousView || "gallery";
+      ui.editMode = false;
+      render();
+      return true;
+    }
+    return false;
   }
 
   function selectedItem() {
@@ -3348,5 +7467,6 @@
     };
   }
 
+  bindBackspaceNavigation();
   render();
 })();
