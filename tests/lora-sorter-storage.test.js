@@ -14,6 +14,7 @@ test("LoRA sorter settings preserve folder handles, destinations, exclusions, an
     baseDestinationHandle,
     destinationHandles: new Map([["bohee_v1", boheeHandle]]),
     excludedGroupKeys: new Set(["winter_v1"]),
+    detectionExcludedLoras: new Set(["PornMaster_Krea2_Realism_slider_V1"]),
     includeSubfolders: true,
     collisionMode: "skip",
   });
@@ -23,6 +24,7 @@ test("LoRA sorter settings preserve folder handles, destinations, exclusions, an
   assert.equal(restored.baseDestinationHandle, baseDestinationHandle);
   assert.equal(restored.destinationHandles.get("bohee_v1"), boheeHandle);
   assert.deepEqual([...restored.excludedGroupKeys], ["winter_v1"]);
+  assert.deepEqual([...restored.detectionExcludedLoras], ["PornMaster_Krea2_Realism_slider_V1"]);
   assert.equal(restored.includeSubfolders, true);
   assert.equal(restored.collisionMode, "skip");
 });
@@ -31,12 +33,14 @@ test("LoRA sorter settings reject malformed collections and unsafe option values
   const restored = storage.hydrateSettings({
     destinations: [["valid", { kind: "directory", name: "valid" }], ["", null], "bad"],
     excludedGroupKeys: ["one", "", 22, "one"],
+    detectionExcludedLoras: [" valid ", "", 22, "VALID", "other"],
     includeSubfolders: "yes",
     collisionMode: "overwrite",
   });
 
   assert.deepEqual([...restored.destinationHandles.keys()], ["valid"]);
   assert.deepEqual([...restored.excludedGroupKeys], ["one"]);
+  assert.deepEqual([...restored.detectionExcludedLoras], ["valid", "other"]);
   assert.equal(restored.includeSubfolders, false);
   assert.equal(restored.collisionMode, "rename");
 });

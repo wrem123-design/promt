@@ -13,6 +13,18 @@
     return typeof value === "string" && Boolean(value.trim());
   }
 
+  function normalizedStringSet(values) {
+    if (!Array.isArray(values) && !(values instanceof Set)) return new Set();
+    const entries = new Map();
+    for (const value of values) {
+      if (typeof value !== "string") continue;
+      const trimmed = value.trim();
+      const key = trimmed.toLowerCase();
+      if (key && !entries.has(key)) entries.set(key, trimmed);
+    }
+    return new Set(entries.values());
+  }
+
   function snapshotSettings(settings = {}) {
     return {
       version: 1,
@@ -24,6 +36,7 @@
       excludedGroupKeys: settings.excludedGroupKeys instanceof Set
         ? [...settings.excludedGroupKeys].filter(validKey)
         : [],
+      detectionExcludedLoras: [...normalizedStringSet(settings.detectionExcludedLoras)],
       includeSubfolders: settings.includeSubfolders === true,
       collisionMode: settings.collisionMode === "skip" ? "skip" : "rename",
     };
@@ -36,11 +49,13 @@
     const excludedGroupKeys = Array.isArray(record.excludedGroupKeys)
       ? record.excludedGroupKeys.filter(validKey)
       : [];
+    const detectionExcludedLoras = normalizedStringSet(record.detectionExcludedLoras);
     return {
       sourceHandle: record.sourceHandle || null,
       baseDestinationHandle: record.baseDestinationHandle || null,
       destinationHandles: new Map(destinations),
       excludedGroupKeys: new Set(excludedGroupKeys),
+      detectionExcludedLoras,
       includeSubfolders: record.includeSubfolders === true,
       collisionMode: record.collisionMode === "skip" ? "skip" : "rename",
     };

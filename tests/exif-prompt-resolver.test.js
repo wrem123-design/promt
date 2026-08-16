@@ -4,6 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  containsComfyPromptGraph,
   resolveComfyPrompt,
   splitResolvedPromptSections,
 } = require("../exif-prompt-resolver.js");
@@ -72,6 +73,39 @@ test("selected Switch 2 populated wildcard text wins over an inactive five-parag
   assert.doesNotMatch(resolved.text, /stale beige cardigan/);
 });
 
+test("metadata-preservation envelopes resolve the active wildcard result instead of stale user input", () => {
+  const wrapped = [{
+    source: "UserComment",
+    text: JSON.stringify({
+      format: "prompt-archive-png-metadata",
+      version: 1,
+      entries: metadataEntries(2),
+    }),
+  }];
+  const resolved = resolveComfyPrompt(wrapped);
+
+  assert.equal(containsComfyPromptGraph(wrapped), true);
+  assert.equal(resolved.text, wildcardPrompt);
+  assert.equal(resolved.nodeId, "299");
+  assert.equal(resolved.source, "UserComment>Model:comfy-positive-path");
+  assert.doesNotMatch(resolved.text, /stale beige cardigan/);
+});
+
+test("localized CLIP prompt titles resolve when no English Positive label exists", () => {
+  const graph = JSON.parse(metadataEntries(2)[1].text.slice("prompt:".length));
+  graph[6]._meta.title = "CLIP 텍스트 인코딩 (프롬프트)";
+  graph[7] = {
+    inputs: { text: "negative prompt that must never be imported because it is not the generated prompt" },
+    class_type: "CLIPTextEncode",
+    _meta: { title: "CLIP 텍스트 인코딩 (네거티브 프롬프트)" },
+  };
+  const resolved = resolveComfyPrompt([{ source: "prompt", text: JSON.stringify(graph) }]);
+
+  assert.equal(resolved.text, wildcardPrompt);
+  assert.equal(resolved.nodeId, "299");
+  assert.doesNotMatch(resolved.text, /negative prompt/);
+});
+
 test("Switch 1 resolves its direct user prompt", () => {
   const resolved = resolveComfyPrompt(metadataEntries(1));
   assert.equal(resolved.text, staleUserPrompt);
@@ -82,6 +116,25 @@ test("Switch 3 resolves prompt concatenation with the configured separator", () 
   const resolved = resolveComfyPrompt(metadataEntries(3));
   assert.equal(resolved.text, `custom appearance\n\n${outfit} ${background} ${expression} ${details}`);
   assert.equal(resolved.nodeId, "304");
+});
+
+test("Switch 3 follows an rgthree Any Switch to the populated scenario wildcard", () => {
+  const entries = metadataEntries(3);
+  const graph = JSON.parse(entries[1].text.slice("prompt:".length));
+  graph[304].inputs.prompt2 = ["425", 0];
+  graph[425] = {
+    inputs: { any_01: ["303", 0] },
+    class_type: "Any Switch (rgthree)",
+    _meta: { title: "프로필 Switch 3 선택 · 일반 우선 / NSFW" },
+  };
+  const resolved = resolveComfyPrompt([
+    entries[0],
+    { source: entries[1].source, text: `prompt:${JSON.stringify(graph)}` },
+  ]);
+
+  assert.equal(resolved.text, `custom appearance\n\n${outfit} ${background} ${expression} ${details}`);
+  assert.equal(resolved.nodeId, "304");
+  assert.doesNotMatch(resolved.text, /stale beige cardigan/);
 });
 
 test("two-paragraph wildcard output is restored to five sections by scenario boundary cues", () => {
@@ -194,6 +247,8 @@ test("the app loads and prioritizes the ComfyUI graph resolver before generic EX
   const serverSource = fs.readFileSync(path.join(root, "server.js"), "utf8");
 
   assert.match(appSource, /PromptArchiveExifPromptResolver\.resolveComfyPrompt\(entries\)/);
+  assert.match(appSource, /PromptArchiveExifPromptResolver\.containsComfyPromptGraph\(entries\)/);
+  assert.match(appSource, /parseExifPromptMetadata\(\[\{\s*source: item\.uploadMeta\?\.exifPromptSource/);
   assert.match(appSource, /splitResolvedPromptSections/);
   assert.ok(indexSource.indexOf("exif-prompt-resolver.js") < indexSource.indexOf("app.js"));
   assert.match(serverSource, /exif-prompt-resolver\.js/);

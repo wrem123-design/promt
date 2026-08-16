@@ -318,9 +318,35 @@
     return String(value || "").replace(/\//g, "\\").toLowerCase();
   }
 
-  function classificationForInspection(inspection) {
+  function normalizeLoraExclusion(value) {
+    return loraName(String(value || "").trim()).trim();
+  }
+
+  function loraExclusionKey(value) {
+    return normalizeLoraExclusion(value).toLowerCase();
+  }
+
+  function loraExclusionKeys(values) {
+    const entries = typeof values === "string"
+      ? [values]
+      : values && typeof values[Symbol.iterator] === "function" ? values : [];
+    return new Set([...entries].map(loraExclusionKey).filter(Boolean));
+  }
+
+  function isLoraDetectionExcluded(lora, excludedValues) {
+    const value = typeof lora === "string" ? lora : lora?.path || lora?.name;
+    return loraExclusionKeys(excludedValues).has(loraExclusionKey(value));
+  }
+
+  function classificationForInspection(inspection, detectionExcludedLoras = []) {
     if (inspection?.status === "matched" && inspection.loras?.length) {
-      const loras = [...inspection.loras].sort((left, right) => normalizedLoraPath(left.path).localeCompare(normalizedLoraPath(right.path)));
+      const excludedKeys = loraExclusionKeys(detectionExcludedLoras);
+      const loras = inspection.loras
+        .filter((entry) => !excludedKeys.has(loraExclusionKey(entry?.path || entry?.name)))
+        .sort((left, right) => normalizedLoraPath(left.path).localeCompare(normalizedLoraPath(right.path)));
+      if (!loras.length) {
+        return { key: "__excluded_loras_only__", label: "감지 제외 LoRA만 있음", kind: "excluded-only" };
+      }
       return {
         key: loras.map((entry) => normalizedLoraPath(entry.path)).join("+"),
         label: loras.map((entry) => entry.name || loraName(entry.path)).join(" + "),
@@ -344,10 +370,12 @@
     return /\.(?:webp|png|jpe?g)$/i.test(String(value || ""));
   }
 
-  function groupInspectedFiles(files) {
+  function groupInspectedFiles(files, detectionExcludedLoras = []) {
     const grouped = new Map();
     for (const file of Array.isArray(files) ? files : []) {
-      const classification = file?.classification || classificationForInspection(file?.inspection);
+      const classification = file?.inspection
+        ? classificationForInspection(file.inspection, detectionExcludedLoras)
+        : file?.classification || classificationForInspection(file?.inspection, detectionExcludedLoras);
       if (!grouped.has(classification.key)) {
         grouped.set(classification.key, {
           ...classification,
@@ -390,7 +418,9 @@
     imageMetadataEntries,
     inspectImageMetadata,
     inspectMetadataEntries,
+    isLoraDetectionExcluded,
     isSupportedImageName,
+    normalizeLoraExclusion,
     safeFolderName,
   };
 });

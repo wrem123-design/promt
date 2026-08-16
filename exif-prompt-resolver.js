@@ -36,6 +36,24 @@
     return new Map(entries.map(([id, node]) => [String(id), node]));
   }
 
+  function expandMetadataEntries(entries) {
+    const flattened = [];
+    const visit = (entry, depth, parentSource = "") => {
+      if (!entry || depth > 3) return;
+      const text = cleanText(entry.text);
+      if (!text) return;
+      const source = [parentSource, String(entry.source || "metadata")].filter(Boolean).join(">");
+      const parsed = parseEmbeddedJson(text);
+      if (parsed?.format === "prompt-archive-png-metadata" && Array.isArray(parsed.entries)) {
+        parsed.entries.forEach((nested) => visit(nested, depth + 1, source));
+        return;
+      }
+      flattened.push({ source, text });
+    };
+    (Array.isArray(entries) ? entries : []).forEach((entry) => visit(entry, 0));
+    return flattened;
+  }
+
   function resolveInput(value, nodes, visited) {
     if (typeof value === "string") return { text: cleanText(value), nodeId: "" };
     if (Array.isArray(value) && value.length >= 1) return resolveNode(String(value[0]), nodes, visited);
@@ -61,6 +79,16 @@
       const text = [left, right].filter(Boolean).join(typeof inputs.separator === "string" ? inputs.separator : " ");
       return text ? { text: cleanText(text), nodeId } : null;
     }
+    if (classType.includes("any switch") && classType.includes("rgthree")) {
+      const inputKeys = Object.keys(inputs)
+        .filter((key) => /^any_\d+$/i.test(key))
+        .sort((left, right) => Number(left.slice(4)) - Number(right.slice(4)));
+      for (const key of inputKeys) {
+        const resolved = resolveInput(inputs[key], nodes, nextVisited);
+        if (resolved?.text) return resolved;
+      }
+      return null;
+    }
     if (classType.includes("wildcardprocessor") && typeof inputs.populated_text === "string") {
       return { text: cleanText(inputs.populated_text), nodeId };
     }
@@ -76,15 +104,22 @@
   }
 
   function resolveComfyPrompt(entries) {
-    for (const entry of Array.isArray(entries) ? entries : []) {
+    for (const entry of expandMetadataEntries(entries)) {
       const parsed = parseEmbeddedJson(entry?.text);
       const nodes = graphNodes(parsed);
       if (!nodes) continue;
-      const positiveNodes = [...nodes.entries()].filter(([, node]) => {
+      const clipNodes = [...nodes.entries()].filter(([, node]) => {
         const classType = String(node.class_type || "").toLowerCase();
-        const title = String(node._meta?.title || "").toLowerCase();
-        return classType.includes("cliptextencode") && title.includes("positive");
+        return classType.includes("cliptextencode");
       });
+      const explicitPositiveNodes = clipNodes.filter(([, node]) => (
+        /(positive|양성)/i.test(String(node._meta?.title || ""))
+      ));
+      const positiveNodes = explicitPositiveNodes.length
+        ? explicitPositiveNodes
+        : clipNodes.filter(([, node]) => (
+          !/(negative|neg prompt|부정|네거티브)/i.test(String(node._meta?.title || ""))
+        ));
       for (const [, node] of positiveNodes) {
         const resolved = resolveInput(node.inputs?.text, nodes, new Set());
         if (resolved?.text && resolved.text.length > 20) {
@@ -96,6 +131,10 @@
       }
     }
     return null;
+  }
+
+  function containsComfyPromptGraph(entries) {
+    return expandMetadataEntries(entries).some((entry) => graphNodes(parseEmbeddedJson(entry.text)));
   }
 
   function paragraphSections(text) {
@@ -193,6 +232,7 @@
   }
 
   return {
+    containsComfyPromptGraph,
     resolveComfyPrompt,
     splitResolvedPromptSections,
   };

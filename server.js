@@ -1,8 +1,14 @@
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { rebuildWildcards, syncWildcards } = require("./wildcard-sync.js");
+const { spawnSync } = require("child_process");
+const {
+  normalizeWildcardSettings,
+  rebuildWildcards,
+  syncWildcards,
+} = require("./wildcard-sync.js");
 
 const rootDir = __dirname;
 const dataDir = path.join(rootDir, "data");
@@ -14,6 +20,7 @@ const providersPath = path.join(dataDir, "providers.json");
 const providerSecretsPath = path.join(dataDir, "provider-secrets.json");
 const tagsPath = path.join(dataDir, "tags.json");
 const itemsPath = path.join(dataDir, "items.json");
+const videoItemsPath = path.join(dataDir, "video-items.json");
 const wildcardSyncStatePath = path.join(dataDir, "wildcard-sync-state.json");
 const wildcardDir = process.env.COMFYUI_WILDCARD_DIR
   || "D:\\ComfyUI-Easy-Install\\ComfyUI\\custom_nodes\\comfyui-impact-pack\\wildcards\\items";
@@ -31,6 +38,7 @@ const publicFiles = new Map([
   ["/lora-sorter.js", path.join(rootDir, "lora-sorter.js")],
   ["/lora-sorter-storage.js", path.join(rootDir, "lora-sorter-storage.js")],
   ["/exif-prompt-resolver.js", path.join(rootDir, "exif-prompt-resolver.js")],
+  ["/video-prompt-resolver.js", path.join(rootDir, "video-prompt-resolver.js")],
   ["/prompt-similarity.js", path.join(rootDir, "prompt-similarity.js")],
   ["/app.js", path.join(rootDir, "app.js")],
   ["/styles.css", path.join(rootDir, "styles.css")],
@@ -80,12 +88,19 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/tags" && req.method === "PUT") return saveTags(req, res);
     if (url.pathname === "/api/items" && req.method === "GET") return sendItems(res);
     if (url.pathname === "/api/items" && req.method === "PUT") return saveItems(req, res);
+    if (url.pathname === "/api/video-items" && req.method === "GET") return sendVideoItems(res);
+    if (url.pathname === "/api/video-items" && req.method === "PUT") return saveVideoItems(req, res);
+    if (url.pathname === "/api/video-thumbnail" && req.method === "POST") return extractVideoThumbnail(req, res);
+    if (url.pathname === "/api/video-thumbnails" && req.method === "POST") return extractVideoThumbnailSet(req, res);
     if (url.pathname === "/api/wildcards/sync" && req.method === "POST") {
       return syncPromptWildcards(res, url.searchParams.get("mode") || "incremental");
     }
     const itemMatch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (itemMatch && req.method === "PUT") return saveItem(itemMatch[1], req, res);
     if (itemMatch && req.method === "DELETE") return deleteItem(itemMatch[1], res);
+    const videoItemMatch = url.pathname.match(/^\/api\/video-items\/([^/]+)$/);
+    if (videoItemMatch && req.method === "PUT") return saveVideoItem(videoItemMatch[1], req, res);
+    if (videoItemMatch && req.method === "DELETE") return deleteVideoItem(videoItemMatch[1], res);
     if (url.pathname === "/api/backup" && req.method === "GET") return sendBackup(req, res);
     if (url.pathname === "/api/import" && req.method === "POST") return importBackup(req, res);
     if (req.method !== "GET" && req.method !== "HEAD") return sendText(res, 405, "Method not allowed");
@@ -120,7 +135,7 @@ function sendState(res) {
 }
 
 function stateUpdatedAt() {
-  return [settingsPath, providersPath, tagsPath, itemsPath].reduce((latest, filePath) => {
+  return [settingsPath, providersPath, tagsPath, itemsPath, videoItemsPath].reduce((latest, filePath) => {
     if (!fs.existsSync(filePath)) return latest;
     return Math.max(latest, fs.statSync(filePath).mtimeMs || 0);
   }, 0);
@@ -163,7 +178,14 @@ async function saveSettings(req, res) {
   if (!payload.settings || typeof payload.settings !== "object") {
     return sendJson(res, 400, { error: "invalid_settings" });
   }
-  writeJsonFile(settingsPath, payload.settings);
+  try {
+    writeJsonFile(settingsPath, pickSettings(payload.settings));
+  } catch (error) {
+    return sendJson(res, 400, {
+      error: "invalid_settings",
+      message: error.message,
+    });
+  }
   return sendJson(res, 200, {
     ok: true,
     updatedAt: Date.now(),
@@ -380,6 +402,12 @@ async function editPrompt(req, res) {
     "- Keep English and Korean aligned 1:1 for each sentence id.",
     "- Preserve overall style, structure, and high visual density.",
     "- If a section needs no change, return it almost unchanged.",
+    "- Appearance: stable physical appearance only; no expression, gaze, pose, action, framing, background, clothing, accessories, or held objects.",
+    "- Outfit: clothing, accessories, wearable items, and held objects only. Personal accessories and carried items such as bags, phones, sunglasses, eyeglasses, umbrellas, and wallets stay in Outfit even when temporarily set on a seat, table, floor, or beside the subject; no pose, action, background, framing, gaze, or expression.",
+    "- Background: environment, location, furniture, architecture, and ambient scene elements only. Retail merchandise and shared scene props that do not belong to the subject stay in Background; no subject appearance, personal accessories, outfit, pose, action, body placement, gaze, expression, camera angle, or composition.",
+    "- Expression / Pose: pose, action, body placement, hand position, leg position, camera angle, framing, crop, gaze, head angle, and expression only. A personal item may be referenced only generically when needed to describe interaction; never describe its color, material, brand, size, or style here. No stable appearance, outfit details, location, architecture, furniture, or background scenery.",
+    "- Details: technical image quality, lighting, realism, camera style, texture, color, grain, blur, sharpness, and exclusions only.",
+    "- When the old text is misclassified, move or rewrite the affected information into the correct section even if the user request concerns another detail.",
     "",
     `User additional request: ${customInstruction || "(none)"}`,
     `Elements to remove/exclude from the prompt: ${excludeLabels.length ? excludeLabels.join(", ") : "(none)"}`,
@@ -589,7 +617,7 @@ async function saveItems(req, res) {
   const items = payload.items.map((item) => persistItemImages(item));
   writeJsonFile(itemsPath, items);
   // Bulk delete / full list replace: drop any uploads no longer referenced.
-  const prunedImageCount = pruneUploadsOutside(collectUploadNamesFromItems(items));
+  const prunedImageCount = pruneUploadsOutside(unionUploadNames(items, readVideoItems()));
   return sendJson(res, 200, {
     ok: true,
     updatedAt: Date.now(),
@@ -628,7 +656,7 @@ async function saveItem(id, req, res) {
   let deletedImageCount = 0;
   if (previous) {
     const previousNames = collectUploadNamesFromItems([previous]);
-    const keptNames = collectUploadNamesFromItems(items);
+    const keptNames = unionUploadNames(items, readVideoItems());
     deletedImageCount = deleteUploadFiles([...previousNames].filter((name) => !keptNames.has(name)));
   }
   return sendJson(res, 200, {
@@ -645,7 +673,7 @@ function deleteItem(id, res) {
   const items = existing.filter((item) => item.id !== id);
   writeJsonFile(itemsPath, items);
   const removedNames = collectUploadNamesFromItems(removed ? [removed] : []);
-  const keptNames = collectUploadNamesFromItems(items);
+  const keptNames = unionUploadNames(items, readVideoItems());
   const toDelete = [...removedNames].filter((name) => !keptNames.has(name));
   const deletedImageCount = deleteUploadFiles(toDelete);
   return sendJson(res, 200, {
@@ -655,6 +683,320 @@ function deleteItem(id, res) {
     itemCount: items.length,
     deletedImageCount,
   });
+}
+
+function sendVideoItems(res) {
+  return sendJson(res, 200, { videoItems: readVideoItems() });
+}
+
+async function saveVideoItems(req, res) {
+  const body = await readBody(req);
+  const payload = JSON.parse(body || "{}");
+  if (!Array.isArray(payload.videoItems)) {
+    return sendJson(res, 400, { error: "invalid_video_items" });
+  }
+  try {
+    validateItemsForPersistence(payload.videoItems);
+  } catch (error) {
+    return sendJson(res, 400, { error: "invalid_video_items", message: error.message });
+  }
+  const videoItems = payload.videoItems.map((item) => persistItemImages(item));
+  writeJsonFile(videoItemsPath, videoItems);
+  const prunedImageCount = pruneUploadsOutside(unionUploadNames(readItems(), videoItems));
+  return sendJson(res, 200, {
+    ok: true,
+    updatedAt: Date.now(),
+    itemCount: videoItems.length,
+    prunedImageCount,
+    bytes: fs.statSync(videoItemsPath).size,
+  });
+}
+
+async function saveVideoItem(id, req, res) {
+  const body = await readBody(req);
+  const payload = JSON.parse(body || "{}");
+  if (!payload.item || typeof payload.item !== "object") {
+    return sendJson(res, 400, { error: "invalid_video_item" });
+  }
+  let itemId;
+  try {
+    itemId = decodeURIComponent(id);
+  } catch (_error) {
+    return sendJson(res, 400, { error: "invalid_video_item_id" });
+  }
+  const candidate = { ...payload.item, id: itemId };
+  try {
+    validateItemsForPersistence([candidate]);
+  } catch (error) {
+    return sendJson(res, 400, { error: "invalid_video_item", message: error.message });
+  }
+  const videoItems = readVideoItems();
+  const previous = videoItems.find((entry) => entry.id === itemId) || null;
+  const item = persistItemImages(candidate);
+  const index = videoItems.findIndex((entry) => entry.id === itemId);
+  if (index >= 0) videoItems[index] = item;
+  else videoItems.unshift(item);
+  writeJsonFile(videoItemsPath, videoItems);
+  let deletedImageCount = 0;
+  if (previous) {
+    const previousNames = collectUploadNamesFromItems([previous]);
+    const keptNames = unionUploadNames(readItems(), videoItems);
+    deletedImageCount = deleteUploadFiles([...previousNames].filter((name) => !keptNames.has(name)));
+  }
+  return sendJson(res, 200, {
+    ok: true,
+    updatedAt: Date.now(),
+    id: item.id,
+    deletedImageCount,
+  });
+}
+
+function deleteVideoItem(id, res) {
+  const existing = readVideoItems();
+  const removed = existing.find((item) => item.id === id) || null;
+  const videoItems = existing.filter((item) => item.id !== id);
+  writeJsonFile(videoItemsPath, videoItems);
+  const removedNames = collectUploadNamesFromItems(removed ? [removed] : []);
+  const keptNames = unionUploadNames(readItems(), videoItems);
+  const toDelete = [...removedNames].filter((name) => !keptNames.has(name));
+  const deletedImageCount = deleteUploadFiles(toDelete);
+  return sendJson(res, 200, {
+    ok: true,
+    updatedAt: Date.now(),
+    id,
+    itemCount: videoItems.length,
+    deletedImageCount,
+  });
+}
+
+function resolveBinaryPath(envName, fileName) {
+  const candidates = [
+    process.env[envName],
+    `C:\\ffmpeg\\bin\\${fileName}`,
+    fileName.replace(/\.exe$/i, ""),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate.includes("\\") || candidate.includes("/")) {
+      if (fs.existsSync(candidate)) return candidate;
+      continue;
+    }
+    const probe = spawnSync(candidate, ["-version"], { timeout: 8000, windowsHide: true });
+    if (probe.status === 0) return candidate;
+  }
+  return "";
+}
+
+function resolveFfmpegPath() {
+  return resolveBinaryPath("FFMPEG_PATH", "ffmpeg.exe");
+}
+
+function resolveFfprobePath() {
+  return resolveBinaryPath("FFPROBE_PATH", "ffprobe.exe");
+}
+
+function probeVideoDuration(ffprobePath, inputPath) {
+  if (!ffprobePath) return 0;
+  const result = spawnSync(ffprobePath, [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    inputPath,
+  ], { timeout: 20000, windowsHide: true, encoding: "utf8" });
+  const value = Number(String(result.stdout || "").trim());
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function probeVideoSize(ffprobePath, inputPath) {
+  if (!ffprobePath) return { width: 0, height: 0 };
+  const result = spawnSync(ffprobePath, [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+    "-of",
+    "json",
+    inputPath,
+  ], { timeout: 20000, windowsHide: true, encoding: "utf8" });
+  try {
+    const parsed = JSON.parse(String(result.stdout || "{}"));
+    const stream = Array.isArray(parsed.streams) ? parsed.streams[0] : null;
+    let width = Number(stream?.width) || 0;
+    let height = Number(stream?.height) || 0;
+    const sideRotation = Number(stream?.side_data_list?.find((entry) => entry && entry.rotation != null)?.rotation || 0);
+    const rotate = Number(stream?.tags?.rotate || sideRotation || 0);
+    if (width && height && (Math.abs(rotate) === 90 || Math.abs(rotate) === 270)) {
+      const swapped = width;
+      width = height;
+      height = swapped;
+    }
+    return { width, height };
+  } catch (_error) {
+    return { width: 0, height: 0 };
+  }
+}
+
+function probeVideoInfo(ffprobePath, inputPath) {
+  const duration = probeVideoDuration(ffprobePath, inputPath);
+  const size = probeVideoSize(ffprobePath, inputPath);
+  return { duration, width: size.width, height: size.height };
+}
+
+function thumbnailSeekTimes(duration, count) {
+  const total = Math.max(2, Math.min(12, Math.trunc(Number(count) || 6)));
+  const length = Math.max(0.2, Number(duration) || 0);
+  const times = [];
+  for (let index = 0; index < total; index += 1) {
+    const raw = length * index / (total - 1);
+    const clamped = index === 0 ? 0 : Math.min(raw, Math.max(0, length - 0.04));
+    times.push(Number(clamped.toFixed(3)));
+  }
+  return times;
+}
+
+function videoUploadExtension(fileName, mime) {
+  const ext = path.extname(String(fileName || "")).toLowerCase();
+  if ([".webm", ".mp4", ".mov", ".mkv"].includes(ext)) return ext;
+  if (/webm/i.test(mime)) return ".webm";
+  if (/mp4|mpeg/i.test(mime)) return ".mp4";
+  if (/quicktime/i.test(mime)) return ".mov";
+  return ".webm";
+}
+
+function runFfmpegFrame(ffmpegPath, inputPath, outputPath, extraArgs) {
+  return spawnSync(ffmpegPath, [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    ...extraArgs,
+    "-i",
+    inputPath,
+    "-frames:v",
+    "1",
+    "-an",
+    outputPath,
+  ], { timeout: 90000, windowsHide: true, encoding: "utf8" });
+}
+
+function runFfmpegTimedFrame(ffmpegPath, inputPath, outputPath, seek) {
+  const args = ["-hide_banner", "-loglevel", "error", "-y"];
+  if (Number(seek) > 0) args.push("-ss", String(seek));
+  args.push("-i", inputPath, "-frames:v", "1", "-an", "-vf", "scale=-2:480", outputPath);
+  return spawnSync(ffmpegPath, args, { timeout: 90000, windowsHide: true, encoding: "utf8" });
+}
+
+async function extractVideoThumbnail(req, res) {
+  const ffmpegPath = resolveFfmpegPath();
+  if (!ffmpegPath) {
+    return sendJson(res, 503, {
+      error: "ffmpeg_missing",
+      message: "ffmpeg를 찾지 못했습니다. 브라우저 프레임 추출을 사용합니다.",
+    });
+  }
+  const fileName = decodeURIComponent(String(req.headers["x-file-name"] || "video.webm"));
+  const mime = String(req.headers["content-type"] || "");
+  const body = await readBinaryBody(req);
+  if (!body || !body.length) {
+    return sendJson(res, 400, { error: "empty_video", message: "비디오 데이터가 비어 있습니다." });
+  }
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-vid-"));
+  const inputPath = path.join(tmpDir, `in${videoUploadExtension(fileName, mime)}`);
+  const outputPath = path.join(tmpDir, "frame.webp");
+  try {
+    fs.writeFileSync(inputPath, body);
+    let result = runFfmpegFrame(ffmpegPath, inputPath, outputPath, []);
+    if (result.status !== 0 || !fs.existsSync(outputPath) || fs.statSync(outputPath).size < 32) {
+      result = runFfmpegFrame(ffmpegPath, inputPath, outputPath, ["-ss", "0.08"]);
+    }
+    if (result.status !== 0 || !fs.existsSync(outputPath) || fs.statSync(outputPath).size < 32) {
+      return sendJson(res, 422, {
+        error: "thumbnail_failed",
+        message: (result.stderr || result.stdout || "첫 프레임을 추출하지 못했습니다.").trim(),
+      });
+    }
+    const frame = fs.readFileSync(outputPath);
+    return sendJson(res, 200, {
+      ok: true,
+      mime: "image/webp",
+      size: frame.length,
+      dataUrl: `data:image/webp;base64,${frame.toString("base64")}`,
+    });
+  } catch (error) {
+    return sendJson(res, 500, { error: "thumbnail_failed", message: error.message });
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch (_error) {
+      // ignore temp cleanup
+    }
+  }
+}
+
+async function extractVideoThumbnailSet(req, res) {
+  const ffmpegPath = resolveFfmpegPath();
+  if (!ffmpegPath) {
+    return sendJson(res, 503, {
+      error: "ffmpeg_missing",
+      message: "ffmpeg를 찾지 못했습니다.",
+    });
+  }
+  const fileName = decodeURIComponent(String(req.headers["x-file-name"] || "video.webm"));
+  const mime = String(req.headers["content-type"] || "");
+  const count = Number(req.headers["x-frame-count"] || 6);
+  const body = await readBinaryBody(req);
+  if (!body || !body.length) {
+    return sendJson(res, 400, { error: "empty_video", message: "비디오 데이터가 비어 있습니다." });
+  }
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-vid-set-"));
+  const inputPath = path.join(tmpDir, `in${videoUploadExtension(fileName, mime)}`);
+  try {
+    fs.writeFileSync(inputPath, body);
+    const info = probeVideoInfo(resolveFfprobePath(), inputPath);
+    const duration = info.duration;
+    const times = thumbnailSeekTimes(duration || 8, count);
+    const frames = [];
+    for (let index = 0; index < times.length; index += 1) {
+      const outputPath = path.join(tmpDir, `frame-${index}.webp`);
+      const seek = times[index];
+      let result = runFfmpegTimedFrame(ffmpegPath, inputPath, outputPath, seek);
+      if ((result.status !== 0 || !fs.existsSync(outputPath) || fs.statSync(outputPath).size < 32) && seek > 0) {
+        result = runFfmpegTimedFrame(ffmpegPath, inputPath, outputPath, Math.max(0, seek - 0.12));
+      }
+      if (result.status !== 0 || !fs.existsSync(outputPath) || fs.statSync(outputPath).size < 32) continue;
+      const frame = fs.readFileSync(outputPath);
+      frames.push({
+        index,
+        time: seek,
+        percent: times.length > 1 ? Math.round(index * 100 / (times.length - 1)) : 0,
+        mime: "image/webp",
+        size: frame.length,
+        dataUrl: `data:image/webp;base64,${frame.toString("base64")}`,
+      });
+    }
+    if (!frames.length) {
+      return sendJson(res, 422, { error: "thumbnail_failed", message: "구간 썸네일을 추출하지 못했습니다." });
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      duration,
+      width: info.width,
+      height: info.height,
+      frames,
+    });
+  } catch (error) {
+    return sendJson(res, 500, { error: "thumbnail_failed", message: error.message });
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch (_error) {
+      // ignore temp cleanup
+    }
+  }
 }
 
 function sendBackup(req, res) {
@@ -705,6 +1047,7 @@ async function importBackup(req, res) {
 
     let providers = Array.isArray(backup.providers) ? backup.providers : readProviders();
     let items = Array.isArray(backup.items) ? backup.items : [];
+    let videoItems = Array.isArray(backup.videoItems) ? backup.videoItems : (mode === "merge" ? readVideoItems() : []);
     const images = backup.images && typeof backup.images === "object" ? backup.images : {};
 
     if (mode === "merge") {
@@ -714,6 +1057,12 @@ async function importBackup(req, res) {
         if (item?.id) byId.set(item.id, item);
       });
       items = [...byId.values()];
+      const existingVideoItems = readVideoItems();
+      const videoById = new Map(existingVideoItems.map((item) => [item.id, item]));
+      videoItems.forEach((item) => {
+        if (item?.id) videoById.set(item.id, item);
+      });
+      videoItems = [...videoById.values()];
       // Keep current settings/tags/providers unless backup provided them.
       if (!backup.settings) settings = readSettings();
       if (!backup.tags && !(backup.settings && (backup.settings.excludeOptions || backup.settings.outfitTagOptions))) tags = readTags();
@@ -733,6 +1082,7 @@ async function importBackup(req, res) {
     }
     const sanitizedProviders = sanitizeProviderList(providers, currentSecrets).providers;
     items = items.map((item) => persistItemImages(item));
+    videoItems = videoItems.map((item) => persistItemImages(item));
     const writtenImages = writeBackupImages(images);
     writeJsonFile(settingsPath, pickSettings({ ...settings }));
     writeJsonFile(tagsPath, pickTags({ ...tags, ...settings }));
@@ -741,8 +1091,9 @@ async function importBackup(req, res) {
       writeJsonFile(providerSecretsPath, currentSecrets);
     }
     writeJsonFile(itemsPath, items);
+    writeJsonFile(videoItemsPath, videoItems);
 
-    const referenced = collectUploadNamesFromItems(items);
+    const referenced = unionUploadNames(items, videoItems);
     const pruned = pruneUploadsOutside(referenced);
 
     return sendJson(res, 200, {
@@ -780,6 +1131,7 @@ function normalizeIncomingBackup(raw) {
       providers: candidate.providers,
       providerSecrets: candidate.providerSecrets,
       items: candidate.items || [],
+      videoItems: candidate.videoItems || [],
       images: candidate.images || {},
     };
   }
@@ -793,6 +1145,7 @@ function normalizeIncomingBackup(raw) {
       tags: pickTags(candidate),
       providers: candidate.providers,
       items: candidate.items || [],
+      videoItems: candidate.videoItems || [],
       images: candidate.images || {},
     };
   }
@@ -801,11 +1154,12 @@ function normalizeIncomingBackup(raw) {
 
 function createBackupPayload(includeSecrets) {
   const items = readItems();
+  const videoItems = readVideoItems();
   const settings = readSettings();
   const tags = readTags();
   const providers = readProviders();
   const secrets = readProviderSecrets();
-  const imageNames = collectUploadNamesFromItems(items);
+  const imageNames = unionUploadNames(items, videoItems);
   const images = {};
   for (const name of imageNames) {
     const filePath = path.join(uploadsDir, name);
@@ -826,15 +1180,25 @@ function createBackupPayload(includeSecrets) {
     providers,
     includeSecrets: Boolean(includeSecrets),
     items,
+    videoItems,
     images,
     stats: {
       itemCount: items.length,
+      videoItemCount: videoItems.length,
       imageCount: Object.keys(images).length,
       providerCount: providers.length,
     },
   };
   if (includeSecrets) payload.providerSecrets = secrets;
   return payload;
+}
+
+function unionUploadNames(...lists) {
+  const names = new Set();
+  for (const list of lists) {
+    for (const name of collectUploadNamesFromItems(list)) names.add(name);
+  }
+  return names;
 }
 
 function collectUploadNamesFromItems(items) {
@@ -891,6 +1255,7 @@ function validateBackupForImport(backup, mode) {
   if (Number(backup.version || 1) !== 1) throw new Error("지원하지 않는 백업 버전입니다.");
   if (mode === "replace" && !Array.isArray(backup.items)) throw new Error("교체 백업에는 items 배열이 필요합니다.");
   if (Array.isArray(backup.items)) validateItemsForPersistence(backup.items);
+  if (Array.isArray(backup.videoItems)) validateItemsForPersistence(backup.videoItems);
 }
 
 function validateItemsForPersistence(items) {
@@ -1000,18 +1365,20 @@ function writeStateFile(state) {
   writeJsonFile(providersPath, persistedState.providers);
   writeJsonFile(tagsPath, pickTags(persistedState));
   writeJsonFile(itemsPath, Array.isArray(persistedState.items) ? persistedState.items : []);
-  pruneUploadsOutside(collectUploadNamesFromItems(persistedState.items || []));
+  writeJsonFile(videoItemsPath, Array.isArray(persistedState.videoItems) ? persistedState.videoItems : []);
+  pruneUploadsOutside(unionUploadNames(persistedState.items || [], persistedState.videoItems || []));
   return persistedState;
 }
 
 function readSplitState() {
-  const hasSplitFiles = [settingsPath, providersPath, tagsPath, itemsPath].some((filePath) => fs.existsSync(filePath));
+  const hasSplitFiles = [settingsPath, providersPath, tagsPath, itemsPath, videoItemsPath].some((filePath) => fs.existsSync(filePath));
   if (!hasSplitFiles) return null;
   return {
     ...readSettings(),
     ...readTags(),
     providers: readProviders(),
     items: readItems(),
+    videoItems: readVideoItems(),
   };
 }
 
@@ -1056,6 +1423,13 @@ function readItems() {
   return readJsonFile(itemsPath, () => {
     const legacy = readLegacyState();
     return Array.isArray(legacy?.items) ? legacy.items : [];
+  });
+}
+
+function readVideoItems() {
+  return readJsonFile(videoItemsPath, () => {
+    const legacy = readLegacyState();
+    return Array.isArray(legacy?.videoItems) ? legacy.videoItems : [];
   });
 }
 
@@ -1107,6 +1481,7 @@ async function syncPromptWildcards(res, mode) {
     const operation = mode === "rebuild" ? rebuildWildcards : syncWildcards;
     const result = await operation({
       itemsPath,
+      settingsPath,
       statePath: wildcardSyncStatePath,
       wildcardDir,
       refreshUrl: impactWildcardRefreshUrl,
@@ -1164,12 +1539,13 @@ function geminiApiKeysFromSecret(secret) {
   return [];
 }
 
-function resolveProviderModel(provider) {
-  return String(provider.model || provider.visionModel || provider.textModel || "").trim();
+function resolveProviderModel(provider, request = {}) {
+  const purposeModel = request.image ? provider.visionModel : provider.textModel;
+  return String(purposeModel || provider.model || provider.visionModel || provider.textModel || "").trim();
 }
 
 async function callOpenAiCompatibleProvider(provider, request) {
-  const model = resolveProviderModel(provider);
+  const model = resolveProviderModel(provider, request);
   if (!model) throw new Error(`${provider.name} 모델명이 비어 있습니다.`);
 
   if (shouldUseOpenAiResponsesApi(provider, model)) {
@@ -1309,7 +1685,7 @@ function normalizeVertexLocation(provider, serviceAccount, model) {
 async function callGeminiApiProvider(provider, request) {
   const keys = geminiApiKeysFromSecret(provider.secret);
   if (!keys.length) throw new Error("Gemini API Key가 설정되지 않았습니다.");
-  const model = normalizeGeminiModelName(provider.name, resolveProviderModel(provider), "gemini-2.5-flash");
+  const model = normalizeGeminiModelName(provider.name, resolveProviderModel(provider, request), "gemini-2.5-flash");
   const secret = typeof provider.secret === "object" && provider.secret ? provider.secret : {};
   let currentIndex = Math.max(0, Math.min(Number(secret.currentKeyIndex || 0), keys.length - 1));
   let lastError = new Error("Gemini API 요청에 실패했습니다.");
@@ -1352,7 +1728,7 @@ async function callGeminiApiProvider(provider, request) {
 async function callVertexProvider(provider, request) {
   const serviceAccount = parseVertexSecret(vertexJsonFromSecret(provider.secret));
   const accessToken = await getVertexAccessToken(serviceAccount, request.timeoutSeconds);
-  const model = normalizeGeminiModelName(provider.name, resolveProviderModel(provider), "gemini-2.5-flash");
+  const model = normalizeGeminiModelName(provider.name, resolveProviderModel(provider, request), "gemini-2.5-flash");
   const location = normalizeVertexLocation(provider, serviceAccount, model);
   const vertexHost = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
   const endpoint = `https://${vertexHost}/v1/projects/${encodeURIComponent(serviceAccount.project_id)}/locations/${encodeURIComponent(location)}/publishers/google/models/${encodeURIComponent(model)}:generateContent`;
@@ -1537,7 +1913,7 @@ function writeJsonFile(filePath, value) {
 }
 
 function splitStateBytes() {
-  return [settingsPath, providersPath, tagsPath, itemsPath].reduce((total, filePath) => {
+  return [settingsPath, providersPath, tagsPath, itemsPath, videoItemsPath].reduce((total, filePath) => {
     return total + (fs.existsSync(filePath) ? fs.statSync(filePath).size : 0);
   }, 0);
 }
@@ -1552,8 +1928,11 @@ function pickSettings(state) {
     albumSettings: state.albumSettings || {},
     copyDisplaySettings: state.copyDisplaySettings || {},
     categorySettings: state.categorySettings || {},
+    wildcardSettings: normalizeWildcardSettings(state.wildcardSettings),
     themeSettings: state.themeSettings || {},
     advancedSettings: state.advancedSettings || {},
+    videoCategories: Array.isArray(state.videoCategories) ? state.videoCategories : [],
+    videoSettings: state.videoSettings && typeof state.videoSettings === "object" ? state.videoSettings : {},
   };
 }
 
@@ -1568,7 +1947,9 @@ function pickTags(state) {
 function persistImageAssets(state) {
   const copy = structuredCloneCompat(state);
   if (!Array.isArray(copy.items)) copy.items = [];
+  if (!Array.isArray(copy.videoItems)) copy.videoItems = [];
   copy.items = copy.items.map((item) => persistItemImages(item));
+  copy.videoItems = copy.videoItems.map((item) => persistItemImages(item));
   return copy;
 }
 
@@ -1765,6 +2146,24 @@ function readBody(req) {
       chunks.push(chunk);
     });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function readBinaryBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxRequestBytes) {
+        reject(new Error("Request too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }

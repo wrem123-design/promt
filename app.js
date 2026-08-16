@@ -13,6 +13,10 @@
   const SERVER_BACKUP_ENDPOINT = "/api/backup";
   const SERVER_IMPORT_ENDPOINT = "/api/import";
   const SERVER_WILDCARD_SYNC_ENDPOINT = "/api/wildcards/sync";
+  const SERVER_VIDEO_ITEMS_ENDPOINT = "/api/video-items";
+  const SERVER_VIDEO_THUMBNAIL_ENDPOINT = "/api/video-thumbnail";
+  const SERVER_VIDEO_THUMBNAIL_SET_ENDPOINT = "/api/video-thumbnails";
+  const ARCHIVE_MODE_KEY = "promptArchiveMode.v1";
   const CONVERTER_HISTORY_KEY = "promptArchiveConverterHistory.v1";
   let serverAvailable = false;
   let saveTimer = null;
@@ -20,6 +24,7 @@
   let providerSaveTimer = null;
   let tagsSaveTimer = null;
   let itemsSaveTimer = null;
+  let videoItemsSaveTimer = null;
   let toastTimer = null;
   let serverBootComplete = false;
   let changedBeforeServerBoot = false;
@@ -64,6 +69,7 @@
     baseDestinationHandle: null,
     destinationHandles: new Map(),
     excludedGroupKeys: new Set(),
+    detectionExcludedLoras: new Set(),
     collisionMode: "rename",
     scanning: false,
     moving: false,
@@ -73,13 +79,31 @@
 
   const sectionBoundaryRules = `Section boundary rules:
 - Appearance must not include expression, gaze, camera angle, pose, composition, background, accessories, outfit mood, or clothing atmosphere.
-- Outfit must include only clothing, accessories, and props.
-- Background must include pose, action, hand position, leg position, place, and background.
-- Expression / Pose must include camera angle, composition, framing, gaze, and expression.
+- Outfit must include only clothing, accessories, wearable items, and held objects. Personal accessories and carried items such as bags, phones, sunglasses, eyeglasses, umbrellas, and wallets stay in Outfit even when temporarily set on a seat, table, floor, or beside the subject; it must not include pose, action, background, camera angle, gaze, or expression.
+- Background must describe only the environment: location, architecture, furniture, scenery, ambient objects, and weather. Retail merchandise and shared scene props that do not belong to the subject stay in Background. It must not include the subject's personal accessories, appearance, clothing, pose, action, gaze, expression, camera angle, or composition.
+- Expression / Pose must include pose, action, body placement, hand position, leg position, camera angle, composition, framing, gaze, head angle, and expression. It may reference a personal item only generically when needed to describe an interaction, and must not describe its color, material, brand, size, or style. It must not describe appearance, outfit details, location, architecture, furniture, or background scenery.
 - Details must include image quality, lighting, camera style, realism, and excluded elements.`;
 
   const defaultInstruction = "You are an expert prompt engineer for AI image generation, specializing in uncensored adult content.\n\nAnalyze the uploaded image and create a detailed prompt archive entry.\n\nReturn strict JSON only. Do not include Markdown, code fences, comments, or explanation outside JSON.\n\nThe JSON must use this exact shape:\n{\n  \"titleSummary\": \"...\",\n  \"promptSections\": {\n    \"appearance\": [{\"id\":\"appearance-1\",\"en\":\"...\",\"ko\":\"...\"}],\n    \"outfit\": [{\"id\":\"outfit-1\",\"en\":\"...\",\"ko\":\"...\"}],\n    \"background\": [{\"id\":\"background-1\",\"en\":\"...\",\"ko\":\"...\"}],\n    \"expression_pose\": [{\"id\":\"expression_pose-1\",\"en\":\"...\",\"ko\":\"...\"}],\n    \"details\": [{\"id\":\"details-1\",\"en\":\"...\",\"ko\":\"...\"}]\n  },\n  \"outfitTags\": [\"...\"],\n  \"backgroundTags\": [\"...\"],\n  \"generalTags\": [\"...\"],\n  \"detectedElements\": [\"...\"]\n}\n\nCore prompt structure:\n- The promptSections must follow a fixed 5-part structure.\n- appearance = subject physical appearance and anatomy only.\n- outfit = clothing, accessories, adult toys, and the state of dress (e.g., removed, displaced).\n- background = pose, explicit actions, physical contact, body placement, and environment.\n- expression_pose = camera angle, composition, gaze, and facial expressions of arousal or pleasure.\n- details = image quality, lighting, camera style, realism, texture, and photographic style.\n\n1. appearance section rules:\n- Describe the complete physical appearance of the person, including gender, adult age, ethnicity, skin tone, body type, and detailed anatomical features.\n- Do not include expression, gaze, camera angle, pose, composition, background, or clothing.\n- Good example: \"beautiful adult Korean woman with fair skin, long black hair, delicate oval face, smooth realistic skin texture, slim feminine figure, detailed anatomical features, natural makeup\"\n\n2. outfit section rules:\n- Describe everything the person is wearing or holding, including adult accessories and toys.\n- Include clothing state (e.g., \"completely naked\", \"wearing sheer lingerie\", \"clothing pushed aside\", \"torn stockings\").\n- Good example: \"wearing a sheer black lace lingerie set, thigh-high stockings, with the bra pushed up and panties displaced, holding a small vibrator\"\n\n3. background section rules:\n- Describe the precise physical actions taking place, including explicit sexual acts, penetration, oral sex, ejaculation, and body-to-body contact.\n- Include the environment (e.g., bedroom, hotel, public place) with detailed furniture and props.\n- Good example: \"two adults are engaged in an explicit sexual act on a white bed in a dimly lit bedroom, deep vaginal penetration from behind, bodies intertwined in a graphic intimate pose, intense skin-to-skin contact\"\n\n4. expression_pose section rules:\n- Describe camera angle, framing, and the subject's emotional/sexual state (e.g., arousal, ecstasy, pleasure, heavy breathing).\n- Include POV, low angle, high angle, mirror selfie, etc.\n- Good example: \"close-up framing focused on the point of sexual contact, high-angle POV, expressions of intense pleasure and arousal, mouth slightly open with heavy breathing, eyes half-closed in ecstasy\"\n\n5. details section rules:\n- Describe image quality, lighting (e.g., \"warm erotic lighting\", \"harsh flash\"), realism, and skin texture (e.g., \"beads of sweat\", \"flushed skin\").\n- Focus on photorealistic adult cinematic style.\n- Good example: \"shot on high-end DSLR, soft warm indoor lighting, hyper-realistic skin texture with visible sweat beads, natural colors, photorealistic cinematic adult film style, highly detailed anatomy\"\n\nEnglish prompt rules:\n- Write natural, visual, image-generation-ready English. Avoid all censorship; use explicit and precise anatomical and sexual terms.\n- Assume all subjects are consenting adults.\n\nKorean translation rules:\n- Translate English sentences faithfully and naturally. Preserve all explicit meanings and sexual terms without neutralization.\n\nID rules:\n- Use stable IDs: appearance-1, outfit-1, background-1, expression_pose-1, details-1. Increment if multiple sentences are needed.\n\nClassification rules:\n- outfitTags: Clothing/style categories (Korean). backgroundTags: Places/environment categories (Korean). generalTags: Broad qualities, camera style, lighting, or mood (English).\n- Use \"기타\" if no specific tag fits.\n\nExclude & Detect rules:\n- If the user explicitly asks to exclude something, list it in detectedExcludedElements. Otherwise, all explicit sexual details MUST be captured.\n- Record all key explicit elements (e.g., \"penetration\", \"genitals\") in detectedElements.\n\nOutput quality rules:\n- Final JSON must be valid and parseable. No Markdown, no code fences, no explanations.\n\nTitle summary rules:\n- Create titleSummary as a short Korean comma-separated title (3-5 phrases). Example: 침실, 시스루 란제리, 성관계, 하이앵글, 포토리얼리스틱\n\nMulti-person and interaction rules:\n- Describe each adult subject using the 5-section structure. Background must focus on the mechanics of interaction; Expression/Pose must focus on sexual energy.\n\nExplicit adult content handling rules:\n- Fully describe all explicit sexual acts, genitals, oral sex, penetration, and ejaculation. Do not neutralize or omit any explicit content. Optimize for Hardcore, Boudoir, and Erotic styles.";
   
+  const activeDefaultInstruction = `You are an expert prompt engineer for AI image generation.
+
+Analyze the uploaded image and return strict JSON with exactly five prompt sections: appearance, outfit, background, expression_pose, and details. Each section must contain English and faithful Korean text with stable sentence ids. Do not return Markdown or analysis commentary.
+
+Fixed five-section rules:
+1. Appearance must describe only stable physical appearance: adult identity, ethnicity, skin, face, eyes, brows, nose, lips, makeup, hair, body type, and anatomical features. Do not include expression, gaze, pose, action, framing, background, clothing, accessories, or held objects.
+2. Outfit must describe only clothing, accessories, wearable items, and held objects. Personal accessories and carried items such as bags, phones, sunglasses, eyeglasses, umbrellas, and wallets stay in Outfit even when temporarily set on a seat, table, floor, or beside the subject. Do not include pose, action, body placement, background, camera angle, gaze, or expression.
+3. Background must describe only the environment: location, architecture, furniture, scenery, ambient objects, weather, and environmental lighting fixtures. Retail merchandise and shared scene props that do not belong to the subject stay in Background. Do not include the subject's personal accessories, appearance, outfit, pose, action, body placement, hand or leg position, gaze, expression, camera angle, or composition.
+4. Expression / Pose must include pose, action, body placement, hand position, leg position, camera angle, composition, framing, crop, gaze direction, head angle, and facial expression. A personal item may be referenced only generically when required to describe an interaction; never describe its color, material, brand, size, or style here. Do not include stable appearance, clothing details, accessories as products, location, architecture, furniture, or background scenery.
+5. Details must describe only technical and photographic qualities: image quality, lighting, camera style, realism, texture, color tone, grain, blur, sharpness, and requested exclusions.
+
+Return this exact JSON shape:
+{"titleSummary":"...","promptSections":{"appearance":[{"id":"appearance-1","en":"...","ko":"..."}],"outfit":[{"id":"outfit-1","en":"...","ko":"..."}],"background":[{"id":"background-1","en":"...","ko":"..."}],"expression_pose":[{"id":"expression_pose-1","en":"...","ko":"..."}],"details":[{"id":"details-1","en":"...","ko":"..."}]},"outfitTags":[],"backgroundTags":[],"generalTags":[],"detectedElements":[]}
+
+Keep English and Korean aligned 1:1. Use concrete visible descriptions, avoid filler, and never repeat the same instruction across sections.
+
+${sectionBoundaryRules}`;
+
   const sectionMeta = [
     { key: "appearance", labelKo: "외모", labelEn: "Appearance", colorKey: "appearance" },
     { key: "outfit", labelKo: "복장", labelEn: "Outfit", colorKey: "outfit" },
@@ -87,6 +111,18 @@
     { key: "expression_pose", labelKo: "표정/자세", labelEn: "Expression / Pose", colorKey: "expression_pose" },
     { key: "details", labelKo: "디테일", labelEn: "Details", colorKey: "details" },
   ];
+
+  const videoPromptApi = window.PromptArchiveVideoPromptResolver || {};
+  const videoSectionMeta = Array.isArray(videoPromptApi.VIDEO_SECTION_META) && videoPromptApi.VIDEO_SECTION_META.length
+    ? videoPromptApi.VIDEO_SECTION_META
+    : [
+      { key: "subject_definitions", labelKo: "피사체 정의", labelEn: "Subject Definitions", colorKey: "subject" },
+      { key: "summary", labelKo: "요약", labelEn: "Summary", colorKey: "summary" },
+      { key: "retention_analysis", labelKo: "유지 분석", labelEn: "Retention Analysis", colorKey: "retention" },
+      { key: "detailed_description", labelKo: "상세 설명", labelEn: "Detailed Description", colorKey: "description" },
+      { key: "overall_soundscape", labelKo: "전체 음향", labelEn: "Overall Soundscape", colorKey: "soundscape" },
+      { key: "non_diegetic_music", labelKo: "비재현 음악", labelEn: "Non-diegetic Music", colorKey: "music" },
+    ];
 
   const themes = [
     ["default-light", "Default Light"],
@@ -97,6 +133,7 @@
   ];
 
   const providerNames = ["OpenAI", "xAI Grok", "Google Gemini API", "Google Vertex AI", "Cerebras Cloud"];
+  const vertexModelPresets = ["gemini-3.6-flash", "gemini-3.5-flash-lite"];
 
   const defaultExcludeOptions = [
     { key: "text_logo", label: "텍스트 / 글자 / 로고", defaultChecked: true, enabled: true },
@@ -156,7 +193,7 @@
   };
 
   const defaultPromptSettings = {
-    "englishRules": "Write natural, visual, image-generation-ready English. Do not include analysis commentary. Follow the fixed 5-section structure strictly. Appearance must describe only stable physical appearance: face, skin, eyes, brows, nose, lips, makeup, hair, body type. Do not put expression, gaze, camera angle, pose, composition, background, clothing, accessories, held objects, or scene mood in Appearance. Put clothing and accessories only in Outfit. Put pose, action, and environment in Background. Put camera angle, framing, gaze, and expression in Expression / Pose. Put image quality, lighting, realism, camera style, and exclusions in Details.",
+    "englishRules": "Write natural, visual, image-generation-ready English. Do not include analysis commentary. Follow the fixed 5-section structure strictly. Appearance must describe only stable physical appearance: face, skin, eyes, brows, nose, lips, makeup, hair, body type. Outfit must describe only clothing, accessories, wearable items, and held objects. Personal accessories and carried items such as bags, phones, sunglasses, eyeglasses, umbrellas, and wallets stay in Outfit even when temporarily set on a seat, table, floor, or beside the subject. Retail merchandise and shared scene props that do not belong to the subject stay in Background. Background must describe only the environment: location, architecture, furniture, scenery, ambient objects, and weather. Expression / Pose must include pose, action, body placement, hand position, leg position, camera angle, framing, crop, gaze direction, head angle, and expression; it may reference a personal item only generically for an interaction and must not describe its color, material, brand, size, or style. Details must describe only image quality, lighting, realism, camera style, color tone, texture, grain, blur, sharpness, and exclusions. Never place appearance, outfit details, pose, action, gaze, expression, camera angle, or composition in Background. Never place stable appearance, outfit details, location, architecture, furniture, or background scenery in Expression / Pose.",
     "koreanRules": "영어 문장과 같은 id 안에서 1:1로 대응되는 자연스러운 한국어 번역을 작성한다. 영어에 없는 내용을 한국어에 추가하지 않고, 한국어에서 의미를 생략하지 않는다. 자세, 시선, 복장, 배경, 제외 요소의 의미를 그대로 유지한다.",
     "tagRules": "outfitTags와 backgroundTags는 앱에서 활성화된 태그 목록 안에서만 선택한다. 조금이라도 시각적 근거가 있으면 가장 가까운 구체 태그를 고르고, 매칭이 완벽하지 않다는 이유만으로 기타를 쓰지 않는다. 기타는 어떤 활성 태그에도 의미 있게 연결할 근거가 거의 없을 때만 마지막 수단으로 사용한다. outfitTags는 의상 종류, 스타일, 착용 아이템 기준으로 분류한다. backgroundTags는 장소, 공간, 환경 기준으로 분류한다. generalTags는 영어 키워드로 작성하며 촬영 스타일, 구도, 조명, 품질, 분위기를 짧게 분류한다.",
     "excludeRules": "사용자가 제외하라고 한 요소는 이미지에 보여도 promptSections 안의 최종 프롬프트에는 절대 묘사하지 않는다. 하지만 이미지에서 실제로 보였고 제외한 요소는 detectedButExcludedElements 배열에 기록한다. 예: text, logo, watermark, web UI, download icon, arrow button, carousel dots, play button, mask, glasses, earphones, tattoo, bag, phone case graphic. 제외 요소가 없으면 빈 배열을 사용한다.",
@@ -202,6 +239,24 @@
 
   const defaultCategorySettings = {
     allowAiSuggestedTags: false,
+  };
+
+  const defaultVideoSettings = {
+    translateOnUpload: true,
+    includeSectionTitles: true,
+    promptViewMode: "split",
+  };
+
+  const defaultWildcardSettings = {
+    appearancePath: "appearance.txt",
+    defaultScenarioPath: "scenario.txt",
+    rules: [{
+      id: "nsfw",
+      name: "NSFW",
+      categoryNames: ["nsfw"],
+      outputPath: "nsfw.txt",
+      enabled: true,
+    }],
   };
 
   const defaultThemeSettings = {
@@ -270,8 +325,18 @@
   const uploadPreviewUrls = new WeakMap();
   const ui = {
     view: "gallery",
+    archiveMode: loadArchiveMode(),
     selectedId: state.items[0]?.id || null,
+    videoSelectedId: state.videoItems[0]?.id || null,
     query: "",
+    pendingVideoFiles: [],
+    selectedPendingVideoKeys: [],
+    pendingVideoErrors: {},
+    videoThumbnailSets: {},
+    videoUploadProgress: null,
+    videoUploadDraft: { title: "", categoryId: "" },
+    videoCategory: "all",
+    videoUploadQueue: [],
     category: "all",
     status: "all",
     sort: "latest",
@@ -309,6 +374,26 @@
     favoriteOnly: false,
     showDuplicatesOnly: false,
   };
+  const promptViewerState = {
+    fileName: "",
+    previewUrl: "",
+    loading: false,
+    promptJson: null,
+    rawText: "",
+    source: "",
+    error: "",
+  };
+  let promptViewerRequestId = 0;
+  const videoPromptViewerState = {
+    fileName: "",
+    previewUrl: "",
+    loading: false,
+    promptJson: null,
+    rawText: "",
+    source: "",
+    error: "",
+  };
+  let videoPromptViewerRequestId = 0;
 
   document.documentElement.dataset.theme = state.theme;
   applyThemeOptions();
@@ -341,19 +426,22 @@
         { id: catPortrait, name: "인물", color: "blue" },
         { id: catProduct, name: "제품", color: "amber" },
       ],
-      promptInstruction: defaultInstruction,
+      promptInstruction: activeDefaultInstruction,
       promptSettings: defaultPromptSettings,
       excludeOptions: defaultExcludeOptions,
       uploadSettings: defaultUploadSettings,
       albumSettings: defaultAlbumSettings,
       copyDisplaySettings: defaultCopyDisplaySettings,
       categorySettings: defaultCategorySettings,
+      wildcardSettings: defaultWildcardSettings,
       themeSettings: defaultThemeSettings,
       advancedSettings: defaultAdvancedSettings,
       outfitTagOptions: defaultOutfitTags,
       backgroundTagOptions: defaultBackgroundTags,
       providers: providerNames.map((name, index) => defaultProvider(name, index)),
       items: seedItems(catPortrait, catProduct),
+      videoCategories: defaultVideoCategories(),
+      videoSettings: defaultVideoSettings,
     });
   }
 
@@ -368,12 +456,16 @@
       albumSettings: normalizeAlbumSettings(input.albumSettings),
       copyDisplaySettings: normalizeCopyDisplaySettings(input.copyDisplaySettings || { defaultCopyMode: input.albumSettings?.defaultCopyMode }),
       categorySettings: { ...defaultCategorySettings, ...(input.categorySettings || {}) },
+      wildcardSettings: normalizeWildcardSettings(input.wildcardSettings),
       themeSettings: { ...defaultThemeSettings, ...(input.themeSettings || {}), sectionColors: { ...defaultThemeSettings.sectionColors, ...(input.themeSettings?.sectionColors || {}) } },
       advancedSettings: normalizeAdvancedSettings(input.advancedSettings),
       outfitTagOptions: normalizeTagOptions(input.outfitTagOptions, defaultOutfitTags),
       backgroundTagOptions: normalizeTagOptions(input.backgroundTagOptions, defaultBackgroundTags),
       providers: normalizeProviders(input.providers),
       items: Array.isArray(input.items) ? input.items.map(normalizeItem) : [],
+      videoItems: Array.isArray(input.videoItems) ? input.videoItems.map(normalizeVideoItem) : [],
+      videoCategories: normalizeVideoCategories(input.videoCategories),
+      videoSettings: normalizeVideoSettings(input.videoSettings),
     };
   }
 
@@ -383,7 +475,7 @@
       name,
       enabled: index === 0,
       model,
-      // Legacy mirrors kept in sync for older server/state compatibility.
+      // Legacy model remains as a fallback for older saved state.
       visionModel: model,
       textModel: model,
       hasServerKey: false,
@@ -434,15 +526,25 @@
   function normalizeProviders(list) {
     const byName = new Map(Array.isArray(list) ? list.map((provider) => [provider.name === "Google Gemini" ? "Google Gemini API" : provider.name, provider]) : []);
     return providerNames.map((name, index) => {
-      const provider = { ...defaultProvider(name, index), ...(byName.get(name) || {}) };
+      const savedProvider = byName.get(name) || {};
+      const provider = { ...defaultProvider(name, index), ...savedProvider };
       provider.name = name;
-      const unifiedModel = normalizeGeminiModelName(
-        name,
-        provider.model || provider.visionModel || provider.textModel || defaultProviderModel(name, index)
-      );
-      provider.model = unifiedModel;
-      provider.visionModel = unifiedModel;
-      provider.textModel = unifiedModel;
+      const fallbackModel = normalizeGeminiModelName(name, savedProvider.model || defaultProviderModel(name, index));
+      if (provider.name === "Google Vertex AI") {
+        const visionModel = normalizeGeminiModelName(name, savedProvider.visionModel || fallbackModel);
+        const textModel = normalizeGeminiModelName(name, savedProvider.textModel || fallbackModel);
+        provider.visionModel = visionModel;
+        provider.textModel = textModel;
+        provider.model = visionModel || textModel || fallbackModel;
+      } else {
+        const unifiedModel = normalizeGeminiModelName(
+          name,
+          provider.model || provider.visionModel || provider.textModel || defaultProviderModel(name, index)
+        );
+        provider.model = unifiedModel;
+        provider.visionModel = unifiedModel;
+        provider.textModel = unifiedModel;
+      }
       provider.location = normalizeVertexLocation(provider);
       provider.lastTestStatus = repairText(provider.lastTestStatus, "");
       provider.useForImageAnalysis = Boolean(provider.useForImageAnalysis);
@@ -596,6 +698,29 @@
   function normalizeImageAsset(asset) {
     if (!asset || typeof asset !== "object") return null;
     return { ...asset, dataUrl: safeImageSource(asset.dataUrl) };
+  }
+
+  function normalizeVideoItem(item) {
+    return {
+      ...item,
+      id: normalizeIdentifier(item?.id, "vid"),
+      imageUrl: safeImageSource(item?.imageUrl),
+      thumbnailUrl: safeImageSource(item?.thumbnailUrl),
+      promptJson: ensureVideoPromptJson(item?.promptJson),
+      displayImage: normalizeImageAsset(item.displayImage),
+      thumbnailImage: normalizeImageAsset(item.thumbnailImage),
+      uploadMeta: item.uploadMeta || null,
+      title: item.title || "",
+      memo: item.memo || "",
+      categoryId: normalizeReferenceIdentifier(item?.categoryId),
+      durationSeconds: Number(item?.durationSeconds || item?.uploadMeta?.duration || 0) || 0,
+      width: Number(item?.width || item?.uploadMeta?.width || item?.displayImage?.width || item?.thumbnailImage?.width || 0) || 0,
+      height: Number(item?.height || item?.uploadMeta?.height || item?.displayImage?.height || item?.thumbnailImage?.height || 0) || 0,
+      status: item.status || "analyzed",
+      createdAt: item.createdAt || Date.now(),
+      updatedAt: item.updatedAt || Date.now(),
+      versions: Array.isArray(item.versions) ? item.versions : [],
+    };
   }
 
   function normalizeItem(item) {
@@ -829,6 +954,34 @@
     localStorage.removeItem(LEGACY_STORAGE_KEY);
   }
 
+  function defaultVideoCategories() {
+    return [{ id: uid("vcat"), name: "일반", color: "slate" }];
+  }
+
+  function normalizeVideoCategories(categories) {
+    const defaults = [{ name: "일반", color: "slate" }];
+    const source = Array.isArray(categories) && categories.length
+      ? categories
+      : defaults.map((category) => ({ id: uid("vcat"), ...category }));
+    return source.map((category, index) => ({
+      ...category,
+      id: normalizeIdentifier(category.id, "vcat"),
+      name: repairText(category.name, defaults[index]?.name || "미분류"),
+      color: category.color || defaults[index]?.color || "slate",
+    }));
+  }
+
+  function normalizeVideoSettings(settings = {}) {
+    const promptViewMode = ["split", "en", "ko"].includes(settings.promptViewMode)
+      ? settings.promptViewMode
+      : defaultVideoSettings.promptViewMode;
+    return {
+      translateOnUpload: settings.translateOnUpload !== false,
+      includeSectionTitles: settings.includeSectionTitles !== false,
+      promptViewMode,
+    };
+  }
+
   function normalizeCategories(categories) {
     const defaults = [
       { name: "인물", color: "blue" },
@@ -843,13 +996,100 @@
     }));
   }
 
+  function validateWildcardRelativePath(value, fieldName) {
+    const normalized = String(value || "").trim().replace(/\\/g, "/");
+    const segments = normalized.split("/");
+    const reservedName = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+    const invalidSegment = segments.some((segment) => (
+      !segment
+      || segment === "."
+      || segment === ".."
+      || /[<>:"|?*\u0000-\u001f]/.test(segment)
+      || /[ .]$/.test(segment)
+      || reservedName.test(segment)
+    ));
+    if (!normalized || normalized.startsWith("/") || /^[a-z]:/i.test(normalized) || invalidSegment) {
+      throw new Error(`${fieldName}은(는) 와일드카드 폴더 안의 안전한 상대 경로여야 합니다.`);
+    }
+    if (!/\.txt$/i.test(normalized)) {
+      throw new Error(`${fieldName}은(는) .txt 파일이어야 합니다.`);
+    }
+    return segments.join("/");
+  }
+
+  function validateWildcardSettings(settings) {
+    const source = settings && typeof settings === "object"
+      ? settings
+      : defaultWildcardSettings;
+    const appearancePath = validateWildcardRelativePath(
+      source.appearancePath || defaultWildcardSettings.appearancePath,
+      "외모 저장 경로",
+    );
+    const defaultScenarioPath = validateWildcardRelativePath(
+      source.defaultScenarioPath || defaultWildcardSettings.defaultScenarioPath,
+      "기본 시나리오 저장 경로",
+    );
+    const rawRules = Array.isArray(source.rules)
+      ? source.rules
+      : defaultWildcardSettings.rules;
+    const usedIds = new Set();
+    const rules = rawRules.map((rule, index) => {
+      const rawCategoryNames = Array.isArray(rule?.categoryNames)
+        ? rule.categoryNames
+        : String(rule?.categoryName || "").split(",");
+      const categoryNames = [...new Set(rawCategoryNames
+        .map((categoryName) => String(categoryName || "").trim())
+        .filter(Boolean))];
+      if (!categoryNames.length) {
+        throw new Error(`와일드카드 분류 규칙 ${index + 1}에 카테고리 조건이 필요합니다.`);
+      }
+      const idBase = String(rule?.id || `wildcard-rule-${index + 1}`).trim()
+        || `wildcard-rule-${index + 1}`;
+      let id = idBase;
+      let idSuffix = 2;
+      while (usedIds.has(id)) {
+        id = `${idBase}-${idSuffix}`;
+        idSuffix += 1;
+      }
+      usedIds.add(id);
+      return {
+        id,
+        name: String(rule?.name || "").trim() || `분류 ${index + 1}`,
+        categoryNames,
+        outputPath: validateWildcardRelativePath(
+          rule?.outputPath,
+          `와일드카드 분류 규칙 ${index + 1} 저장 경로`,
+        ),
+        enabled: rule?.enabled !== false,
+      };
+    });
+    const outputPaths = [
+      appearancePath,
+      defaultScenarioPath,
+      ...rules.map((rule) => rule.outputPath),
+    ].map((relativePath) => relativePath.toLowerCase());
+    if (new Set(outputPaths).size !== outputPaths.length) {
+      throw new Error("와일드카드 출력 저장 경로는 서로 중복될 수 없습니다.");
+    }
+    return { appearancePath, defaultScenarioPath, rules };
+  }
+
+  function normalizeWildcardSettings(settings) {
+    try {
+      return validateWildcardSettings(settings);
+    } catch (error) {
+      console.warn("Wildcard settings restore failed", error);
+      return validateWildcardSettings(defaultWildcardSettings);
+    }
+  }
+
   function repairText(value, fallback) {
     if (typeof value !== "string" || !value.trim() || looksBrokenKorean(value)) return fallback;
     return value;
   }
 
   function normalizePromptInstruction(value) {
-    const instruction = repairText(value, defaultInstruction);
+    const instruction = repairText(value, activeDefaultInstruction);
     if (instruction.includes("Section boundary rules:")) return instruction;
     return `${instruction.trim()}\n\n${sectionBoundaryRules}`;
   }
@@ -890,8 +1130,11 @@
       albumSettings: state.albumSettings,
       copyDisplaySettings: state.copyDisplaySettings,
       categorySettings: state.categorySettings,
+      wildcardSettings: state.wildcardSettings,
       themeSettings: state.themeSettings,
       advancedSettings: state.advancedSettings,
+      videoCategories: state.videoCategories,
+      videoSettings: state.videoSettings,
     };
   }
 
@@ -1053,6 +1296,74 @@
     }
   }
 
+  function saveVideoItemsState() {
+    if (!serverBootComplete) changedBeforeServerBoot = true;
+    if (!serverAvailable) {
+      persistBrowserFallback();
+      return;
+    }
+    markSaving();
+    clearTimeout(videoItemsSaveTimer);
+    videoItemsSaveTimer = setTimeout(syncVideoItemsToServer, 180);
+  }
+
+  async function syncVideoItemsToServer() {
+    try {
+      const response = await fetch(SERVER_VIDEO_ITEMS_ENDPOINT, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoItems: state.videoItems }),
+      });
+      if (!response.ok) throw new Error("Video items save failed");
+      await response.json();
+      return await syncStateToServer();
+    } catch (error) {
+      persistBrowserFallback(error);
+      return false;
+    }
+  }
+
+  async function saveVideoItemState(item) {
+    if (!item) return false;
+    if (!serverBootComplete) changedBeforeServerBoot = true;
+    if (!serverAvailable) {
+      persistBrowserFallback();
+      return false;
+    }
+    markSaving();
+    try {
+      const response = await fetch(`${SERVER_VIDEO_ITEMS_ENDPOINT}/${encodeURIComponent(item.id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item }),
+      });
+      if (!response.ok) throw new Error("Video item save failed");
+      await response.json();
+      return await syncStateToServer();
+    } catch (error) {
+      persistBrowserFallback(error);
+      return false;
+    }
+  }
+
+  async function deleteVideoItemState(id) {
+    if (!serverBootComplete) changedBeforeServerBoot = true;
+    if (!serverAvailable) {
+      persistBrowserFallback();
+      return false;
+    }
+    markSaving();
+    try {
+      const response = await fetch(`${SERVER_VIDEO_ITEMS_ENDPOINT}/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!response.ok) throw new Error("Video item delete failed");
+      await response.json();
+      return await syncStateToServer();
+    } catch (error) {
+      persistBrowserFallback(error);
+      return false;
+    }
+  }
+
   async function deleteItemState(id) {
     if (!serverBootComplete) changedBeforeServerBoot = true;
     if (!serverAvailable) {
@@ -1120,8 +1431,8 @@
           <section class="content">${renderView()}</section>
         </main>
         ${renderModal()}
-        ${renderConverterMiniProgress()}
-        ${renderLoraSorterMiniProgress()}
+        ${isVideoArchiveMode() ? "" : renderConverterMiniProgress()}
+        ${isVideoArchiveMode() ? "" : renderLoraSorterMiniProgress()}
       </div>
     `;
     bindCommonEvents();
@@ -1145,8 +1456,38 @@
     document.querySelector("[data-retry-initial-load]")?.addEventListener("click", retryServerConnection);
   }
 
+  function loadArchiveMode() {
+    try {
+      return localStorage.getItem(ARCHIVE_MODE_KEY) === "video" ? "video" : "image";
+    } catch (_error) {
+      return "image";
+    }
+  }
+
+  function persistArchiveMode(mode) {
+    try {
+      localStorage.setItem(ARCHIVE_MODE_KEY, mode === "video" ? "video" : "image");
+    } catch (_error) {
+      // Ignore quota / private-mode failures.
+    }
+  }
+
+  function isVideoArchiveMode() {
+    return ui.archiveMode === "video";
+  }
+
+  function renderArchiveModeSwitch() {
+    const imageActive = !isVideoArchiveMode();
+    return `
+      <div class="archive-mode-switch" role="tablist" aria-label="아카이브 모드">
+        <button class="archive-mode-btn ${imageActive ? "active" : ""}" data-action="setArchiveMode" data-mode="image" type="button" role="tab" aria-selected="${imageActive}">이미지</button>
+        <button class="archive-mode-btn ${imageActive ? "" : "active"}" data-action="setArchiveMode" data-mode="video" type="button" role="tab" aria-selected="${!imageActive}">비디오</button>
+      </div>
+    `;
+  }
+
   function renderTopbar() {
-    const modeLabel = isExifPromptMode() ? "EXIF 모드" : "API 분석 모드";
+    const searchLabel = isVideoArchiveMode() ? "제목, 프롬프트 검색" : "제목, 태그, 프롬프트 검색";
     return `
       <header class="topbar album-topbar" aria-label="앱 도구 모음">
         <div class="topbar-left">
@@ -1154,35 +1495,36 @@
             <span class="brand-mark" aria-hidden="true">${brandMarkSvg()}</span>
             <span class="brand-copy">
               <strong>프롬프트 아카이브</strong>
-              <small>이미지와 프롬프트</small>
+              <small>${isVideoArchiveMode() ? "비디오와 프롬프트" : "이미지와 프롬프트"}</small>
             </span>
           </button>
-          <span class="mode-chip ${isExifPromptMode() ? "mode-exif" : "mode-api"}" title="현재 업로드 처리 방식">
-            ${modeLabel}
-          </span>
+          ${renderArchiveModeSwitch()}
         </div>
         <div class="topbar-center">
           <div class="topbar-center-cluster" role="search" aria-label="아카이브 검색">
             <div class="search-wrap compact-search">
               <span class="search-icon" aria-hidden="true">${navIcon("search")}</span>
-              <label class="sr-only" for="globalSearch">제목, 태그, 프롬프트 검색</label>
-              <input class="input search-input" id="globalSearch" type="search" value="${escapeHtml(ui.query)}" placeholder="제목, 태그, 프롬프트 검색" autocomplete="off">
+              <label class="sr-only" for="globalSearch">${searchLabel}</label>
+              <input class="input search-input" id="globalSearch" type="search" value="${escapeHtml(ui.query)}" placeholder="${searchLabel}" autocomplete="off">
               <button class="search-clear-btn" data-action="clearSearch" type="button" aria-label="검색어 지우기" ${ui.query ? "" : "hidden disabled"}>×</button>
             </div>
           </div>
         </div>
         <div class="topbar-actions">
-          ${renderPersistenceStatus()}
-          ${iconButton("upload", "업로드", "upload", "primary-icon")}
+          ${iconButton("upload", isVideoArchiveMode() ? "비디오 업로드" : "업로드", "upload", "primary-icon")}
           ${iconButton("cycleTheme", "테마", "theme")}
+          ${isVideoArchiveMode() ? "" : `
           <button class="converter-launch-btn" data-action="converter" type="button" aria-label="PNG를 WebP로 변환">
             <span aria-hidden="true">${navIcon("convert")}</span>
             <span>변환</span>
           </button>
-          <button class="converter-launch-btn lora-sorter-launch-btn" data-action="loraSorter" type="button" aria-label="활성 LoRA별 이미지 분류">
+          <button class="converter-launch-btn lora-sorter-launch-btn" data-action="loraSorter" type="button" aria-label="활성 LoRA별 사진 분류">
             <span aria-hidden="true">${navIcon("layers")}</span>
-            <span>LoRA 분류</span>
+            <span>사진 분류</span>
           </button>
+          ${iconButton("promptViewer", "이미지 프롬프트 확인", "photo")}
+          `}
+          ${isVideoArchiveMode() ? iconButton("videoPromptViewer", "비디오 프롬프트 확인", "film") : ""}
           ${iconButton("settings", "설정", "settings")}
         </div>
       </header>
@@ -1203,7 +1545,9 @@
       theme: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 3a7 7 0 1 0 7 7 5.2 5.2 0 0 1-7-7z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/></svg>`,
       convert: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M5.2 6.3A6.2 6.2 0 0 1 15.8 8M14.8 13.7A6.2 6.2 0 0 1 4.2 12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M15.8 4.8V8h-3.2M4.2 15.2V12h3.2" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
       layers: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path d="M10 3 17 6.8 10 10.5 3 6.8 10 3Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="m4.1 10.2 5.9 3.1 5.9-3.1M4.1 13.5l5.9 3.1 5.9-3.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
-      settings: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="10" cy="10" r="2.4" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M10 3.2v1.6M10 15.2v1.6M3.2 10h1.6M15.2 10h1.6M5.2 5.2l1.1 1.1M13.7 13.7l1.1 1.1M14.8 5.2l-1.1 1.1M6.3 13.7l-1.1 1.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`,
+      photo: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><rect x="2.8" y="3.5" width="14.4" height="13" rx="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="7.1" cy="7.8" r="1.5" fill="currentColor"/><path d="m4.5 14 3.2-3.2 2.3 2.1 2.1-2.4 3.4 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+      film: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><rect x="3" y="3.2" width="14" height="13.6" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 3.2v13.6M13 3.2v13.6M3 7.2h4M13 7.2h4M3 12.8h4M13 12.8h4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8.6 8.1 12.2 10 8.6 11.9V8.1Z" fill="currentColor"/></svg>`,
+      settings: `<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path class="settings-gear-teeth" d="M8.6 2.5h2.8l.4 1.7c.5.2 1 .5 1.4.8l1.7-.5 1.4 2.4-1.3 1.2c.1.5.1 1.1 0 1.7l1.3 1.2-1.4 2.4-1.7-.5c-.4.4-.9.6-1.4.8l-.4 1.8H8.6l-.4-1.8c-.5-.2-1-.5-1.4-.8l-1.7.5L3.7 11 5 9.8a6.4 6.4 0 0 1 0-1.7L3.7 6.9l1.4-2.4 1.7.5c.4-.4.9-.6 1.4-.8l.4-1.7Z" stroke="currentColor" stroke-width="1.35" fill="none" stroke-linejoin="round"/><circle cx="10" cy="9" r="2.3" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>`,
     };
     return icons[name] || "";
   }
@@ -1234,6 +1578,7 @@
   }
 
   function renderView() {
+    if (isVideoArchiveMode()) return ui.view === "detail" ? renderVideoDetail() : renderVideoGallery();
     if (ui.view === "detail") return renderDetail();
     return renderGallery();
   }
@@ -1258,7 +1603,7 @@
       render();
       return;
     }
-    content.innerHTML = renderGallery();
+    content.innerHTML = isVideoArchiveMode() ? renderVideoGallery() : renderGallery();
     bindGalleryContentEvents();
   }
 
@@ -1292,7 +1637,7 @@
     });
     document.querySelectorAll("[data-page]").forEach((node) => {
       node.addEventListener("click", () => {
-        const pageCount = Math.max(1, Math.ceil(getFilteredItems().length / (state.albumSettings.columns * state.albumSettings.rows)));
+        const pageCount = Math.max(1, Math.ceil(currentFilteredArchiveItems().length / (state.albumSettings.columns * state.albumSettings.rows)));
         const command = node.dataset.page;
         if (command === "first") ui.page = 1;
         else if (command === "prev") ui.page = Math.max(1, ui.page - 1);
@@ -1361,14 +1706,18 @@
 
   function openModal(action) {
     modalReturnAction = action;
+    if (action === "promptViewer") resetPromptViewerState();
+    if (action === "videoPromptViewer") resetVideoPromptViewerState();
     ui.modal = action;
-    if (action === "settings") ui.settingsTab = "api";
+    if (action === "settings" && !isVideoArchiveMode()) ui.settingsTab = ui.settingsTab?.startsWith("video") ? "api" : (ui.settingsTab || "api");
     postRenderFocusSelector = "[data-modal-panel]";
     render();
   }
 
   function closeModal() {
     const returnAction = modalReturnAction;
+    if (ui.modal === "promptViewer") resetPromptViewerState();
+    if (ui.modal === "videoPromptViewer") resetVideoPromptViewerState();
     modalBackdropPointerDown = false;
     ui.modal = null;
     postRenderFocusSelector = returnAction ? `[data-action="${returnAction}"]` : "";
@@ -1409,18 +1758,30 @@
     if (!ui.modal) return "";
     const title = ui.modal === "upload"
       ? "업로드"
-      : ui.modal === "converter"
-        ? "PNG → WebP 변환"
-        : ui.modal === "loraSorter" ? "LoRA별 이미지 분류" : "설정";
+      : ui.modal === "videoUpload"
+        ? "비디오 업로드"
+        : ui.modal === "converter"
+          ? "PNG → WebP 변환"
+          : ui.modal === "loraSorter"
+            ? "사진 분류"
+            : ui.modal === "promptViewer"
+              ? "이미지 프롬프트 확인"
+              : ui.modal === "videoPromptViewer" ? "비디오 프롬프트 확인" : "설정";
     const body = ui.modal === "upload"
       ? renderUpload()
-      : ui.modal === "converter"
-        ? renderImageConverter()
-        : ui.modal === "loraSorter" ? renderLoraSorter() : renderSettings();
+      : ui.modal === "videoUpload"
+        ? renderVideoUpload()
+        : ui.modal === "converter"
+          ? renderImageConverter()
+          : ui.modal === "loraSorter"
+            ? renderLoraSorter()
+            : ui.modal === "promptViewer"
+              ? renderPromptViewer()
+              : ui.modal === "videoPromptViewer" ? renderVideoPromptViewer() : renderSettings();
     const titleId = `modal-title-${ui.modal}`;
     return `
       <div class="modal-backdrop" data-action="closeModal">
-        <section class="modal-panel ${ui.modal === "converter" ? "converter-modal-panel" : ui.modal === "loraSorter" ? "lora-sorter-modal-panel" : ""}" role="dialog" aria-modal="true" aria-labelledby="${titleId}" tabindex="-1" data-modal-panel>
+        <section class="modal-panel ${ui.modal === "converter" ? "converter-modal-panel" : ui.modal === "loraSorter" ? "lora-sorter-modal-panel" : ui.modal === "promptViewer" || ui.modal === "videoPromptViewer" ? "prompt-viewer-modal-panel" : ""}" role="dialog" aria-modal="true" aria-labelledby="${titleId}" tabindex="-1" data-modal-panel>
           <div class="modal-head">
             <strong id="${titleId}">${title}</strong>
             <button class="icon-btn" data-action="closeModal" type="button" aria-label="닫기" data-tooltip="닫기">×</button>
@@ -1573,6 +1934,165 @@
     `;
   }
 
+  function renderPromptViewer() {
+    const preview = promptViewerState.previewUrl
+      ? `<img src="${escapeHtml(promptViewerState.previewUrl)}" alt="선택한 이미지 미리보기">`
+      : `<span class="prompt-viewer-placeholder" aria-hidden="true">${navIcon("photo")}</span>`;
+    const sections = promptViewerState.promptJson
+      ? sectionMeta.map((section) => {
+        const text = (promptViewerState.promptJson?.[section.key]?.sentences || [])
+          .map((sentence) => sentence.en || "")
+          .filter(Boolean)
+          .join("\n");
+        return `
+          <article class="prompt-viewer-section" data-section="${escapeHtml(section.key)}">
+            <div class="prompt-viewer-section-head">
+              <strong>${escapeHtml(section.labelKo)}</strong>
+              <button class="tiny-btn" data-action="copyPromptViewerSection" data-section="${escapeHtml(section.key)}" type="button">복사</button>
+            </div>
+            <p>${escapeHtml(text)}</p>
+          </article>
+        `;
+      }).join("")
+      : "";
+    return `
+      <div class="prompt-viewer-shell">
+        <section class="prompt-viewer-upload-card">
+          <div class="prompt-viewer-preview">${preview}</div>
+          <div class="prompt-viewer-dropzone" id="promptViewerDropzone">
+            <span class="prompt-viewer-kicker">EXIF PROMPT</span>
+            <h2>${promptViewerState.fileName ? escapeHtml(promptViewerState.fileName) : "이미지를 놓거나 선택하세요"}</h2>
+            <p>PNG, JPEG, WebP에 저장된 생성 프롬프트를 이 브라우저에서 바로 읽습니다.</p>
+            <input class="sr-only" id="promptViewerFileInput" type="file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp">
+            <div class="prompt-viewer-pick-row">
+              <button class="primary-btn" id="promptViewerPickFile" type="button">${promptViewerState.fileName ? "다른 이미지 선택" : "이미지 선택"}</button>
+              ${promptViewerState.fileName ? '<button class="ghost-btn" data-action="clearPromptViewer" type="button">비우기</button>' : ""}
+            </div>
+          </div>
+        </section>
+        ${promptViewerState.loading ? '<div class="prompt-viewer-message" role="status"><span class="connection-spinner" aria-hidden="true"></span><strong>메타데이터를 읽는 중입니다</strong></div>' : ""}
+        ${promptViewerState.error ? `<div class="prompt-viewer-message is-error" role="alert"><strong>${escapeHtml(promptViewerState.error)}</strong></div>` : ""}
+        ${promptViewerState.rawText && !promptViewerState.promptJson ? `
+          <details class="prompt-viewer-raw">
+            <summary>감지된 원문 보기</summary>
+            <pre>${escapeHtml(promptViewerState.rawText)}</pre>
+          </details>
+        ` : ""}
+        ${promptViewerState.promptJson ? `
+          <section class="prompt-viewer-result" aria-live="polite">
+            <div class="prompt-viewer-result-head">
+              <div>
+                <span class="prompt-viewer-kicker">5개 문단</span>
+                <strong>프롬프트를 찾았습니다</strong>
+              </div>
+              <div class="prompt-viewer-copy-actions">
+                <button class="primary-btn" data-action="copyPromptViewerAll" type="button">전체 복사</button>
+                <button class="ghost-btn" data-action="copyPromptViewerWithoutFace" type="button">얼굴 빼고 복사</button>
+              </div>
+            </div>
+            <div class="prompt-viewer-sections">${sections}</div>
+          </section>
+        ` : ""}
+      </div>
+    `;
+  }
+
+  function renderVideoPromptViewer() {
+    const preview = videoPromptViewerState.previewUrl
+      ? `<video src="${escapeHtml(videoPromptViewerState.previewUrl)}" muted playsinline controls preload="metadata"></video>`
+      : `<span class="prompt-viewer-placeholder" aria-hidden="true">${navIcon("film")}</span>`;
+    const sections = videoPromptViewerState.promptJson
+      ? videoSectionMeta.map((section) => {
+        const text = (videoPromptViewerState.promptJson?.[section.key]?.sentences || [])
+          .map((sentence) => sentence.en || "")
+          .filter(Boolean)
+          .join("\n");
+        return `
+          <article class="prompt-viewer-section" data-section="${escapeHtml(section.key)}">
+            <div class="prompt-viewer-section-head">
+              <strong>${escapeHtml(section.labelKo)}</strong>
+              <button class="tiny-btn" data-action="copyVideoPromptViewerSection" data-section="${escapeHtml(section.key)}" type="button">복사</button>
+            </div>
+            <p class="video-sentence ${text ? "" : "is-empty"}">${text ? escapeHtml(text) : ""}</p>
+          </article>
+        `;
+      }).join("")
+      : "";
+    return `
+      <div class="prompt-viewer-shell">
+        <section class="prompt-viewer-upload-card">
+          <div class="prompt-viewer-preview">${preview}</div>
+          <div class="prompt-viewer-dropzone" id="videoPromptViewerDropzone">
+            <span class="prompt-viewer-kicker">VIDEO PROMPT</span>
+            <h2>${videoPromptViewerState.fileName ? escapeHtml(videoPromptViewerState.fileName) : "비디오를 놓거나 선택하세요"}</h2>
+            <p>WebM, MP4에 저장된 ComfyUI 프롬프트를 6문단으로 바로 읽습니다. 저장하지 않고 확인만 합니다.</p>
+            <input class="sr-only" id="videoPromptViewerFileInput" type="file" accept="video/webm,video/mp4,video/quicktime,.webm,.mp4,.mov">
+            <div class="prompt-viewer-pick-row">
+              <button class="primary-btn" id="videoPromptViewerPickFile" type="button">${videoPromptViewerState.fileName ? "다른 비디오 선택" : "비디오 선택"}</button>
+              ${videoPromptViewerState.fileName ? '<button class="ghost-btn" data-action="clearVideoPromptViewer" type="button">비우기</button>' : ""}
+            </div>
+          </div>
+        </section>
+        ${videoPromptViewerState.loading ? '<div class="prompt-viewer-message" role="status"><span class="connection-spinner" aria-hidden="true"></span><strong>메타데이터를 읽는 중입니다</strong></div>' : ""}
+        ${videoPromptViewerState.error ? `<div class="prompt-viewer-message is-error" role="alert"><strong>${escapeHtml(videoPromptViewerState.error)}</strong></div>` : ""}
+        ${videoPromptViewerState.rawText && !videoPromptHasViewerContent() ? `
+          <details class="prompt-viewer-raw">
+            <summary>감지된 원문 보기</summary>
+            <pre>${escapeHtml(videoPromptViewerState.rawText)}</pre>
+          </details>
+        ` : ""}
+        ${videoPromptViewerState.promptJson ? `
+          <section class="prompt-viewer-result" aria-live="polite">
+            <div class="prompt-viewer-result-head">
+              <div>
+                <span class="prompt-viewer-kicker">6개 문단</span>
+                <strong>${videoPromptHasViewerContent() ? "프롬프트를 찾았습니다" : "일부 문단만 찾았습니다"}</strong>
+              </div>
+              <div class="prompt-viewer-copy-actions">
+                <button class="primary-btn" data-action="copyVideoPromptViewerAll" type="button">전체 복사</button>
+              </div>
+            </div>
+            <div class="prompt-viewer-sections">${sections}</div>
+          </section>
+        ` : ""}
+      </div>
+    `;
+  }
+
+  function videoPromptHasViewerContent() {
+    return videoSectionMeta.some((section) => (
+      videoPromptViewerState.promptJson?.[section.key]?.sentences || []
+    ).some((sentence) => String(sentence.en || "").trim()));
+  }
+
+  function resetVideoPromptViewerState() {
+    videoPromptViewerRequestId += 1;
+    if (videoPromptViewerState.previewUrl) URL.revokeObjectURL(videoPromptViewerState.previewUrl);
+    Object.assign(videoPromptViewerState, {
+      fileName: "",
+      previewUrl: "",
+      loading: false,
+      promptJson: null,
+      rawText: "",
+      source: "",
+      error: "",
+    });
+  }
+
+  function resetPromptViewerState() {
+    promptViewerRequestId += 1;
+    if (promptViewerState.previewUrl) URL.revokeObjectURL(promptViewerState.previewUrl);
+    Object.assign(promptViewerState, {
+      fileName: "",
+      previewUrl: "",
+      loading: false,
+      promptJson: null,
+      rawText: "",
+      source: "",
+      error: "",
+    });
+  }
+
   function normalizeConverterHistory(value) {
     if (!Array.isArray(value)) return [];
     return value
@@ -1664,19 +2184,36 @@
       return `<small class="converter-wildcard-status error" role="status">${escapeHtml(result.error)}</small>`;
     }
     if (result.rebuilt) {
+      const outputNotes = Array.isArray(result.scenarioOutputs)
+        ? result.scenarioOutputs.map((output) => `${output.path} ${output.written}줄`)
+        : [
+          `일반 시나리오 ${result.scenarioWritten}줄`,
+          `NSFW 시나리오 ${result.nsfwScenarioWritten}줄`,
+        ];
       const notes = [
         `외모 ${result.appearanceWritten}줄`,
-        `시나리오 ${result.scenarioWritten}줄`,
+        ...outputNotes,
         result.duplicatesSkipped ? `중복 ${result.duplicatesSkipped}줄 제외` : "",
         result.invalidItems ? `확인 필요 ${result.invalidItems}개` : "",
         result.refreshed ? "ComfyUI 새로고침 완료" : result.refreshMessage,
       ].filter(Boolean).join(" · ");
       return `<div class="converter-wildcard-status success" role="status"><strong>전체 갱신 완료 · 현재 ${result.validItems}개 항목</strong><small>${escapeHtml(notes)}</small></div>`;
     }
+    const outputAdditions = Array.isArray(result.scenarioOutputs)
+      ? result.scenarioOutputs
+        .filter((output) => output.added)
+        .map((output) => `${output.path} +${output.added}`)
+      : [`일반 +${result.scenarioAdded}`, `NSFW +${result.nsfwScenarioAdded}`];
     const summary = result.initialized
       ? `기준 등록 완료 · 현재 ${result.totalItems}개`
-      : `새 항목 ${result.newItems}개 · 외모 +${result.appearanceAdded} · 시나리오 +${result.scenarioAdded}`;
+      : [
+        `새 항목 ${result.newItems}개`,
+        `외모 +${result.appearanceAdded}`,
+        ...outputAdditions,
+      ].join(" · ");
     const notes = [
+      result.appearanceMoved ? `외모 ${result.appearanceMoved}줄 경로 이동` : "",
+      result.scenariosMoved ? `시나리오 ${result.scenariosMoved}줄 규칙 이동` : "",
       result.duplicatesSkipped ? `중복 ${result.duplicatesSkipped}줄 제외` : "",
       result.invalidItems ? `확인 필요 ${result.invalidItems}개` : "",
       result.refreshed ? "ComfyUI 새로고침 완료" : result.refreshMessage,
@@ -1790,6 +2327,7 @@
             <div>
               <strong>와일드카드 라이브러리</strong>
               <small>새 항목만 추가하거나 <code>items.json</code>의 현재 항목으로 전체를 다시 작성합니다.</small>
+              <small>외모는 함께 유지하고, <code>nsfw</code> 카테고리의 얼굴 제외 시나리오는 <code>nsfw.txt</code>로 분리합니다.</small>
               ${renderWildcardSyncStatus()}
             </div>
           </div>
@@ -1858,6 +2396,10 @@
   function renderLoraSorter() {
     const supported = typeof window.showDirectoryPicker === "function" && Boolean(window.PromptArchiveLoraSorter);
     const busy = loraSorterState.scanning || loraSorterState.moving;
+    const detectionExclusions = [...loraSorterState.detectionExcludedLoras].sort((left, right) => left.localeCompare(right, "ko"));
+    const detectionExclusionKeys = loraSorterDetectionExclusionKeys();
+    const detectedLoraSuggestions = loraSorterDetectedLoraNames()
+      .filter((name) => !detectionExclusionKeys.has(name.toLowerCase()));
     const movableGroups = loraSorterState.groups.filter((group) => group.movable);
     const movableFiles = movableGroups.reduce((total, group) => total + group.count, 0);
     const readyFiles = movableGroups.reduce((total, group) => {
@@ -1902,6 +2444,30 @@
           </section>
         </div>
 
+        <section class="lora-detection-exclusion-card" aria-labelledby="lora-detection-exclusion-title">
+          <div class="lora-detection-exclusion-head">
+            <div>
+              <span class="lora-exclusion-eyebrow">CHARACTER FILTER</span>
+              <strong id="lora-detection-exclusion-title">감지 제외 LoRA</strong>
+              <small>스타일·품질 LoRA를 등록하면 조합에서 빼고 인물 LoRA만 다시 묶습니다.</small>
+            </div>
+            <span class="lora-exclusion-count">${detectionExclusions.length}<small>개 제외</small></span>
+          </div>
+          <div class="lora-detection-exclusion-controls">
+            <label for="loraDetectionExclusionInput">LoRA 이름</label>
+            <div class="lora-detection-exclusion-input-row">
+              <input class="input" id="loraDetectionExclusionInput" list="loraDetectionExclusionSuggestions" type="text" placeholder="예: PornMaster_Krea2_Realism_slider_V1" autocomplete="off" ${busy ? "disabled" : ""}>
+              <datalist id="loraDetectionExclusionSuggestions">${detectedLoraSuggestions.map((name) => `<option value="${escapeHtml(name)}"></option>`).join("")}</datalist>
+              <button class="ghost-btn lora-detection-add-btn" data-action="addLoraDetectionExclusion" type="button" ${busy ? "disabled" : ""}>추가</button>
+            </div>
+          </div>
+          <div class="lora-detection-exclusion-list">
+            ${detectionExclusions.length
+              ? detectionExclusions.map((name) => `<span class="lora-detection-exclusion-chip"><span>${escapeHtml(name)}</span><button data-action="removeLoraDetectionExclusion" data-lora-name="${escapeHtml(name)}" type="button" aria-label="${escapeHtml(name)} 감지 제외 해제" ${busy ? "disabled" : ""}>×</button></span>`).join("")
+              : `<span class="lora-detection-exclusion-empty">등록된 항목이 없습니다. 아래 감지 결과에서도 LoRA별로 바로 제외할 수 있습니다.</span>`}
+          </div>
+        </section>
+
         <section class="lora-groups-card">
           <div class="lora-groups-head">
             <div><strong>감지된 LoRA</strong><small>${loraSorterState.groups.length ? `${movableGroups.length}개 분류 · 이동 가능 ${movableFiles}장${unreadable ? ` · 제외 ${unreadable}장` : ""}` : "원본 폴더를 선택하면 여기에 표시됩니다."}</small></div>
@@ -1935,15 +2501,63 @@
       : loraSorterState.baseDestinationHandle && group.movable
         ? `${loraSorterState.baseDestinationHandle.name} / ${autoFolder}`
         : group.movable ? "목적지 미지정" : "자동 이동 제외";
-    const badge = excluded ? "제외" : group.kind === "multiple" ? "복수 LoRA" : group.kind === "unreadable" ? "판독 불가" : group.kind === "none" ? "비활성" : "활성";
+    const badge = excluded
+      ? "제외"
+      : group.kind === "multiple"
+        ? "복수 LoRA"
+        : group.kind === "unreadable"
+          ? "판독 불가"
+          : group.kind === "none"
+            ? "비활성"
+            : group.kind === "excluded-only" ? "감지 제외" : "활성";
+    const detectedLoras = loraSorterGroupLoras(group);
     return `
       <article class="lora-group-row ${group.movable ? "" : "unreadable"} ${excluded ? "excluded" : ""}">
         <span class="lora-group-count"><strong>${group.count}</strong><small>장</small></span>
-        <div class="lora-group-copy"><strong title="${escapeHtml(group.label)}">${escapeHtml(group.label)}</strong><small>${escapeHtml(destination)}</small></div>
+        <div class="lora-group-copy">
+          <strong title="${escapeHtml(group.label)}">${escapeHtml(group.label)}</strong>
+          ${detectedLoras.length ? `<div class="lora-group-components">${detectedLoras.map((name) => `<button data-action="excludeDetectedLora" data-lora-name="${escapeHtml(name)}" type="button" title="${escapeHtml(name)}을(를) 감지에서 제외" ${busy ? "disabled" : ""}><span>${escapeHtml(name)}</span><em>제외</em></button>`).join("")}</div>` : ""}
+          <small>${escapeHtml(destination)}</small>
+        </div>
         <span class="lora-group-badge ${excluded ? "excluded" : group.kind}">${badge}</span>
         ${group.movable ? `<div class="lora-group-actions"><button class="ghost-btn lora-group-destination-btn" data-action="selectLoraGroupDestination" data-lora-key="${escapeHtml(group.key)}" type="button" ${busy ? "disabled" : ""}>${custom ? "폴더 변경" : "개별 지정"}</button><button class="ghost-btn lora-group-exclude-btn ${excluded ? "active" : ""}" data-action="toggleLoraGroupExcluded" data-lora-key="${escapeHtml(group.key)}" type="button" aria-pressed="${excluded}" ${busy ? "disabled" : ""}>${excluded ? "이동 포함" : "이동 안 함"}</button></div>` : ""}
       </article>
     `;
+  }
+
+  function loraSorterDetectedLoraNames() {
+    const names = new Map();
+    for (const file of loraSorterState.scannedFiles) {
+      for (const lora of file?.inspection?.loras || []) {
+        const name = window.PromptArchiveLoraSorter.normalizeLoraExclusion(lora?.path || lora?.name);
+        const key = name.toLowerCase();
+        if (key && !names.has(key)) names.set(key, name);
+      }
+    }
+    return [...names.values()].sort((left, right) => left.localeCompare(right, "ko"));
+  }
+
+  function loraSorterDetectionExclusionKeys() {
+    return new Set([...loraSorterState.detectionExcludedLoras]
+      .map((name) => window.PromptArchiveLoraSorter.normalizeLoraExclusion(name).toLowerCase())
+      .filter(Boolean));
+  }
+
+  function loraSorterGroupLoras(group) {
+    const names = new Map();
+    const excludedKeys = loraSorterDetectionExclusionKeys();
+    for (const file of group?.files || []) {
+      for (const lora of file?.inspection?.loras || []) {
+        const name = window.PromptArchiveLoraSorter.normalizeLoraExclusion(lora?.path || lora?.name);
+        const key = name.toLowerCase();
+        if (key
+          && !names.has(key)
+          && !excludedKeys.has(key)) {
+          names.set(key, name);
+        }
+      }
+    }
+    return [...names.values()].sort((left, right) => left.localeCompare(right, "ko"));
   }
 
   function renderLoraSorterProgress() {
@@ -2928,6 +3542,7 @@
   }
 
   function renderSettings() {
+    if (isVideoArchiveMode()) return renderVideoSettings();
     const tabs = [
       ["api", "API 설정"],
       ["prompt", "AI 분석 지시문"],
@@ -2962,7 +3577,107 @@
     if (ui.settingsTab === "gallery") return renderGallerySettings();
     if (ui.settingsTab === "copy") return renderCopySettings();
     if (ui.settingsTab === "theme") return renderThemeSettings();
+    if (ui.settingsTab === "videoCategory") return renderVideoCategorySettings();
+    if (ui.settingsTab === "videoUpload") return renderVideoUploadSettings();
+    if (ui.settingsTab === "videoCopy") return renderVideoCopySettings();
     return renderAdvancedSettings();
+  }
+
+  function renderVideoSettings() {
+    const tabs = [
+      ["api", "API 설정"],
+      ["videoCategory", "카테고리"],
+      ["videoUpload", "업로드"],
+      ["videoCopy", "복사/표시"],
+    ];
+    if (!tabs.some(([key]) => key === ui.settingsTab)) ui.settingsTab = "videoCategory";
+    return `
+      <div class="page-head">
+        <div>
+          <h2 class="page-title">비디오 설정</h2>
+          <p class="page-copy">번역은 아래 API 설정을 그대로 사용합니다. 카테고리와 업로드 방식만 비디오 전용입니다.</p>
+        </div>
+      </div>
+      <div class="settings-shell">
+        <nav class="settings-tabs" role="tablist" aria-label="비디오 설정 탭">
+          ${tabs.map(([key, label]) => `<button class="settings-tab-btn ${ui.settingsTab === key ? "active" : ""}" id="settings-tab-${key}" data-settings-tab="${key}" type="button" role="tab" aria-selected="${ui.settingsTab === key}" aria-controls="settings-panel-${key}">${label}</button>`).join("")}
+        </nav>
+        <section class="settings-tab-panel" id="settings-panel-${ui.settingsTab}" role="tabpanel" aria-labelledby="settings-tab-${ui.settingsTab}" tabindex="0">${renderSettingsTab()}</section>
+      </div>
+    `;
+  }
+
+  function renderVideoCategorySettings() {
+    return `
+      <div class="settings-section">
+        <h3 class="card-title">비디오 카테고리</h3>
+        <p class="field-help">이미지 카테고리와 섞이지 않습니다. 이름과 색을 수정한 뒤 저장하세요.</p>
+        ${renderVideoCategoryManager()}
+        <div class="toolbar">
+          <button class="primary-btn" data-action="saveVideoCategorySettings" type="button">카테고리 저장</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderVideoCategoryManager() {
+    return `
+      <div class="toolbar">
+        <input class="input" id="newVideoCategoryName" placeholder="새 비디오 카테고리 이름">
+        <button class="primary-btn" data-action="addVideoCategory" type="button">추가</button>
+      </div>
+      <div class="settings-stack">
+        ${state.videoCategories.map((category, index) => `
+          <div class="category-admin-row">
+            <input class="input" data-video-category-name="${category.id}" value="${escapeHtml(category.name)}">
+            <select class="select" data-video-category-color="${category.id}">
+              ${["blue", "amber", "green", "rose", "violet", "slate"].map((color) => `<option value="${color}" ${category.color === color ? "selected" : ""}>${color}</option>`).join("")}
+            </select>
+            <button class="tiny-btn" data-action="moveVideoCategory" data-id="${escapeHtml(category.id)}" data-direction="-1" type="button" ${index === 0 ? "disabled" : ""}>위</button>
+            <button class="tiny-btn" data-action="moveVideoCategory" data-id="${escapeHtml(category.id)}" data-direction="1" type="button" ${index === state.videoCategories.length - 1 ? "disabled" : ""}>아래</button>
+            <button class="ghost-btn" data-action="saveVideoCategory" data-id="${escapeHtml(category.id)}" type="button">저장</button>
+            <button class="danger-btn" data-action="deleteVideoCategory" data-id="${escapeHtml(category.id)}" type="button" ${state.videoCategories.length <= 1 ? "disabled" : ""}>삭제</button>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderVideoUploadSettings() {
+    return `
+      <div class="settings-section">
+        <h3 class="card-title">비디오 업로드</h3>
+        <p class="field-help">제목과 카테고리는 항상 직접 입력합니다. 파일명이나 EXIF로 채우지 않습니다.</p>
+        <div class="option-grid">
+          <label class="option-item"><input id="videoTranslateOnUpload" type="checkbox" ${state.videoSettings.translateOnUpload ? "checked" : ""}><span>저장 후 한국어 자동 번역</span></label>
+        </div>
+        <div class="toolbar">
+          <button class="primary-btn" data-action="saveVideoUploadSettings" type="button">업로드 설정 저장</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderVideoCopySettings() {
+    return `
+      <div class="settings-section">
+        <h3 class="card-title">비디오 복사/표시</h3>
+        <div class="option-grid">
+          <label class="option-item"><input id="videoIncludeSectionTitles" type="checkbox" ${state.videoSettings.includeSectionTitles ? "checked" : ""}><span>복사할 때 문단 제목 포함</span></label>
+        </div>
+        <div class="field">
+          <label for="videoPromptViewMode">프롬프트 보기</label>
+          <select class="select" id="videoPromptViewMode">
+            <option value="split" ${state.videoSettings.promptViewMode === "split" ? "selected" : ""}>영문 + 번역</option>
+            <option value="en" ${state.videoSettings.promptViewMode === "en" ? "selected" : ""}>영문만</option>
+            <option value="ko" ${state.videoSettings.promptViewMode === "ko" ? "selected" : ""}>번역만</option>
+          </select>
+        </div>
+        <div class="toolbar">
+          <button class="primary-btn" data-action="saveVideoCopySettings" type="button">표시 설정 저장</button>
+        </div>
+      </div>
+    `;
   }
 
   function renderApiSettings() {
@@ -3014,11 +3729,13 @@
           <span class="status-pill">${providerIsActive(provider) ? "사용 중" : "미사용"}</span>
         </div>
         <div class="form-grid">
-          <div class="field wide-field">
-            <label>모델</label>
-            <input class="input" data-provider-model="${index}" ${focusEvents} value="${escapeHtml(provider.model || "")}" placeholder="model-name">
-            <p class="field-help">비전/텍스트 구분 없이 이 공급자가 쓰는 모델 하나만 설정합니다.</p>
-          </div>
+          ${usesVertexJsonKey ? renderVertexModelFields(provider, index, focusEvents) : `
+            <div class="field wide-field">
+              <label>모델</label>
+              <input class="input" data-provider-model="${index}" ${focusEvents} value="${escapeHtml(provider.model || "")}" placeholder="model-name">
+              <p class="field-help">비전/텍스트 구분 없이 이 공급자가 쓰는 모델 하나만 설정합니다.</p>
+            </div>
+          `}
           ${usesOpenAiCompatibleUrl ? `
             <div class="field wide-field">
               <label>${provider.name === "Cerebras Cloud" ? "Cerebras API URL" : "API URL"}</label>
@@ -3056,6 +3773,28 @@
           ${provider.lastTestStatus ? `<span class="status-pill">${escapeHtml(provider.lastTestStatus)}</span>` : ""}
         </div>
       </form>
+    `;
+  }
+
+  function renderVertexModelFields(provider, index, focusEvents) {
+    const presetOptions = vertexModelPresets
+      .map((model) => `<option value="${escapeHtml(model)}"></option>`)
+      .join("");
+    return `
+      <div class="field">
+        <label>이미지 분석 모델</label>
+        <input class="input" data-provider-vision-model="${index}" list="vertex-model-presets-${index}" ${focusEvents} value="${escapeHtml(provider.visionModel || "")}" placeholder="모델 선택 또는 직접 입력">
+        <p class="field-help">이미지를 읽고 5문단 프롬프트를 만드는 모델입니다.</p>
+      </div>
+      <div class="field">
+        <label>번역 모델</label>
+        <input class="input" data-provider-text-model="${index}" list="vertex-model-presets-${index}" ${focusEvents} value="${escapeHtml(provider.textModel || "")}" placeholder="모델 선택 또는 직접 입력">
+        <p class="field-help">번역, 제목 요약, 텍스트 수정에 사용하는 모델입니다.</p>
+      </div>
+      <datalist id="vertex-model-presets-${index}">
+        ${presetOptions}
+      </datalist>
+      <p class="field-help wide-field">프리셋을 고르거나 Vertex 모델 ID를 직접 입력할 수 있습니다. 사용 가능 여부는 프로젝트와 Location에 따라 달라집니다.</p>
     `;
   }
 
@@ -3134,6 +3873,7 @@
       <div class="settings-section">
         <h3 class="card-title">카테고리</h3>
         ${renderCategoryManager()}
+        ${renderWildcardRuleSettings()}
         <h3 class="card-title">복장 태그</h3>
         ${renderManagedTagSettings("outfit", state.outfitTagOptions)}
         <h3 class="card-title">배경 태그</h3>
@@ -3187,6 +3927,79 @@
           </div>
         `).join("")}
       </div>
+    `;
+  }
+
+  function wildcardToken(relativePath) {
+    return `__items/${String(relativePath || "")
+      .replace(/\\/g, "/")
+      .replace(/\.txt$/i, "")}__`;
+  }
+
+  function renderWildcardRuleSettings() {
+    const settings = state.wildcardSettings;
+    return `
+      <section class="wildcard-rule-panel" aria-labelledby="wildcardRuleTitle">
+        <div class="wildcard-rule-head">
+          <div>
+            <span class="wildcard-rule-kicker">WILDCARD ROUTING</span>
+            <h3 class="card-title" id="wildcardRuleTitle">와일드카드 분류 규칙</h3>
+            <p class="field-help">카테고리 이름이 조건과 정확히 일치하면 위에서부터 처음 맞는 규칙의 파일로 저장합니다. 대소문자와 앞뒤 공백은 무시합니다.</p>
+          </div>
+          <button class="primary-btn" data-action="addWildcardRule" type="button">규칙 추가</button>
+        </div>
+        <div class="wildcard-output-grid">
+          <label class="wildcard-output-card">
+            <span>얼굴·외모 저장 경로</span>
+            <input class="input" id="wildcardAppearancePath" value="${escapeHtml(settings.appearancePath)}" placeholder="appearance.txt">
+            <small>${escapeHtml(wildcardToken(settings.appearancePath))}</small>
+          </label>
+          <label class="wildcard-output-card">
+            <span>규칙 미일치 시나리오 경로</span>
+            <input class="input" id="wildcardDefaultScenarioPath" value="${escapeHtml(settings.defaultScenarioPath)}" placeholder="scenario.txt">
+            <small>${escapeHtml(wildcardToken(settings.defaultScenarioPath))}</small>
+          </label>
+        </div>
+        <datalist id="wildcardCategoryNames">
+          ${state.categories.map((category) => `<option value="${escapeHtml(category.name)}"></option>`).join("")}
+        </datalist>
+        <div class="wildcard-rule-list">
+          ${settings.rules.length ? settings.rules.map((rule, index) => `
+            <article class="wildcard-rule-row">
+              <div class="wildcard-rule-order" aria-label="규칙 순서 ${index + 1}">${String(index + 1).padStart(2, "0")}</div>
+              <label class="field">
+                <span>규칙 이름</span>
+                <input class="input" data-wildcard-rule-name="${escapeHtml(rule.id)}" value="${escapeHtml(rule.name)}" placeholder="예: NSFW">
+              </label>
+              <label class="field">
+                <span>카테고리 조건</span>
+                <input class="input" data-wildcard-rule-categories="${escapeHtml(rule.id)}" list="wildcardCategoryNames" value="${escapeHtml(rule.categoryNames.join(", "))}" placeholder="nsfw, 18+">
+                <small class="field-help">여러 조건은 쉼표로 구분</small>
+              </label>
+              <label class="field">
+                <span>저장 상대 경로</span>
+                <input class="input" data-wildcard-rule-output="${escapeHtml(rule.id)}" value="${escapeHtml(rule.outputPath)}" placeholder="groups/nsfw.txt">
+                <small class="field-help">${escapeHtml(wildcardToken(rule.outputPath))}</small>
+              </label>
+              <label class="toggle wildcard-rule-enabled">
+                <input data-wildcard-rule-enabled="${escapeHtml(rule.id)}" type="checkbox" ${rule.enabled ? "checked" : ""}>
+                사용
+              </label>
+              <div class="wildcard-rule-actions">
+                <button class="tiny-btn" data-action="moveWildcardRule" data-id="${escapeHtml(rule.id)}" data-direction="-1" type="button" ${index === 0 ? "disabled" : ""}>위</button>
+                <button class="tiny-btn" data-action="moveWildcardRule" data-id="${escapeHtml(rule.id)}" data-direction="1" type="button" ${index === settings.rules.length - 1 ? "disabled" : ""}>아래</button>
+                <button class="danger-btn" data-action="deleteWildcardRule" data-id="${escapeHtml(rule.id)}" type="button">삭제</button>
+              </div>
+            </article>
+          `).join("") : `
+            <div class="wildcard-rule-empty">
+              <strong>별도 분류 규칙 없음</strong>
+              <span>모든 얼굴 제외 시나리오가 기본 시나리오 경로로 저장됩니다.</span>
+            </div>
+          `}
+        </div>
+        <p class="notice">경로는 Impact Pack의 <code>wildcards/items</code> 폴더 기준입니다. 하위 폴더를 사용할 수 있지만 절대 경로, <code>..</code>, 중복 경로, <code>.txt</code>가 아닌 파일은 저장되지 않습니다. 경로를 바꾸면 다음 업데이트에서 현재 아카이브의 기존 줄을 새 파일로 옮깁니다.</p>
+      </section>
     `;
   }
 
@@ -3520,7 +4333,7 @@
     });
     document.querySelectorAll("[data-page]").forEach((node) => {
       node.addEventListener("click", () => {
-        const pageCount = Math.max(1, Math.ceil(getFilteredItems().length / (state.albumSettings.columns * state.albumSettings.rows)));
+        const pageCount = Math.max(1, Math.ceil(currentFilteredArchiveItems().length / (state.albumSettings.columns * state.albumSettings.rows)));
         const command = node.dataset.page;
         if (command === "first") ui.page = 1;
         else if (command === "prev") ui.page = Math.max(1, ui.page - 1);
@@ -3606,6 +4419,8 @@
     });
     bindModalBackdropGuard();
     bindUploadEvents();
+    bindPromptViewerEvents();
+    bindVideoPromptViewerEvents();
     bindConverterEvents();
     bindLoraSorterEvents();
     bindPromptEvents();
@@ -3637,11 +4452,47 @@
 
   async function handleAction(event, node) {
     const action = node.dataset.action;
-    if (action === "upload" || action === "settings" || action === "converter") {
+    if (action === "upload") {
+      if (isVideoArchiveMode()) {
+        if (!ui.videoUploadDraft.categoryId) ui.videoUploadDraft.categoryId = state.videoCategories[0]?.id || "";
+        openModal("videoUpload");
+        return;
+      }
+      openModal("upload");
+      return;
+    }
+    if (action === "settings") {
+      const videoTabs = ["api", "videoCategory", "videoUpload", "videoCopy"];
+      if (isVideoArchiveMode() && !videoTabs.includes(ui.settingsTab)) ui.settingsTab = "videoCategory";
+      if (!isVideoArchiveMode() && String(ui.settingsTab || "").startsWith("video")) ui.settingsTab = "api";
+      openModal("settings");
+      return;
+    }
+    if (action === "converter" || action === "promptViewer") {
+      if (isVideoArchiveMode()) {
+        showToast("변환과 이미지 프롬프트 확인은 이미지 모드에서만 사용할 수 있습니다.", "warning");
+        return;
+      }
       openModal(action);
       return;
     }
+    if (action === "videoPromptViewer") {
+      if (!isVideoArchiveMode()) {
+        showToast("비디오 프롬프트 확인은 비디오 모드에서만 사용할 수 있습니다.", "warning");
+        return;
+      }
+      openModal(action);
+      return;
+    }
+    if (action === "setArchiveMode") {
+      setArchiveMode(node.dataset.mode);
+      return;
+    }
     if (action === "loraSorter") {
+      if (isVideoArchiveMode()) {
+        showToast("사진 분류는 이미지 모드에서만 사용할 수 있습니다.", "warning");
+        return;
+      }
       openModal(action);
       await loraSorterRestorePromise;
       if (loraSorterState.sourceHandle && !loraSorterState.groups.length && !loraSorterState.scanning) {
@@ -3664,6 +4515,36 @@
     }
     if (action === "retryServer") {
       await retryServerConnection();
+      return;
+    }
+    if (action === "clearPromptViewer") {
+      resetPromptViewerState();
+      render();
+      return;
+    }
+    if (action === "copyPromptViewerAll") {
+      writeClipboard(promptViewerCopyText(), "전체 프롬프트를 복사했습니다.");
+      return;
+    }
+    if (action === "copyPromptViewerWithoutFace") {
+      writeClipboard(promptViewerCopyText({ excludeAppearance: true }), "얼굴 문단을 제외하고 복사했습니다.");
+      return;
+    }
+    if (action === "copyPromptViewerSection") {
+      writeClipboard(promptViewerSectionText(node.dataset.section), "문단을 복사했습니다.");
+      return;
+    }
+    if (action === "clearVideoPromptViewer") {
+      resetVideoPromptViewerState();
+      render();
+      return;
+    }
+    if (action === "copyVideoPromptViewerAll") {
+      writeClipboard(videoPromptViewerCopyText(), "전체 프롬프트를 복사했습니다.");
+      return;
+    }
+    if (action === "copyVideoPromptViewerSection") {
+      writeClipboard(videoPromptViewerSectionText(node.dataset.section), "문단을 복사했습니다.");
       return;
     }
     if (action === "selectConverterSource") {
@@ -3696,6 +4577,18 @@
     }
     if (action === "toggleLoraGroupExcluded") {
       toggleLoraGroupExcluded(node.dataset.loraKey);
+      return;
+    }
+    if (action === "addLoraDetectionExclusion") {
+      addLoraDetectionExclusion(document.getElementById("loraDetectionExclusionInput")?.value);
+      return;
+    }
+    if (action === "excludeDetectedLora") {
+      addLoraDetectionExclusion(node.dataset.loraName);
+      return;
+    }
+    if (action === "removeLoraDetectionExclusion") {
+      removeLoraDetectionExclusion(node.dataset.loraName);
       return;
     }
     if (action === "rescanLoraSorter") {
@@ -3798,7 +4691,8 @@
       return;
     }
     if (action === "confirmBulkDelete") {
-      deleteSelectedItems();
+      if (isVideoArchiveMode()) deleteSelectedVideoItems();
+      else deleteSelectedItems();
       return;
     }
     if (action === "searchFocus") document.getElementById("globalSearch")?.focus();
@@ -3855,6 +4749,78 @@
     if (action === "exportCsv") exportCsv();
     if (action === "copyPrompt") copyPrompt(node.dataset.id, node.dataset.mode);
     if (action === "copySection") copySection(node.dataset.id, node.dataset.section, node.dataset.lang);
+    if (action === "copyVideoPrompt") copyVideoPrompt(node.dataset.id, node.dataset.mode);
+    if (action === "copyVideoSection") copyVideoSection(node.dataset.id, node.dataset.section, node.dataset.lang);
+    if (action === "saveVideoDetail") {
+      await saveVideoDetail(node.dataset.id);
+      return;
+    }
+    if (action === "deleteVideoItem") {
+      deleteVideoItem(node.dataset.id);
+      return;
+    }
+    if (action === "retranslateVideoSection") {
+      await retranslateVideoSection(node.dataset.id, node.dataset.section);
+      return;
+    }
+    if (action === "saveAndReadVideoUploads") {
+      await processPendingVideoUploads();
+      return;
+    }
+    if (action === "selectVideoThumbnail") {
+      selectVideoThumbnail(node.dataset.uploadKey, node.dataset.index);
+      return;
+    }
+    if (action === "removeSelectedPendingVideoUploads") {
+      removeSelectedPendingVideoUploads();
+      return;
+    }
+    if (action === "clearVideoUploadWorkspace") {
+      clearVideoUploadWorkspace();
+      return;
+    }
+    if (action === "togglePendingVideoUpload") {
+      togglePendingVideoUpload(node.dataset.uploadKey);
+      return;
+    }
+    if (action === "confirmVideoBulkDelete") {
+      deleteSelectedVideoItems();
+      return;
+    }
+    if (action === "addVideoCategory") {
+      addVideoCategory();
+      return;
+    }
+    if (action === "saveVideoCategory") {
+      saveVideoCategory(node.dataset.id);
+      return;
+    }
+    if (action === "deleteVideoCategory") {
+      deleteVideoCategory(node.dataset.id);
+      return;
+    }
+    if (action === "moveVideoCategory") {
+      moveVideoCategory(node.dataset.id, Number(node.dataset.direction || 0));
+      return;
+    }
+    if (action === "saveVideoCategorySettings") {
+      saveVideoCategorySettings();
+      return;
+    }
+    if (action === "saveVideoUploadSettings") {
+      saveVideoUploadSettings();
+      return;
+    }
+    if (action === "saveVideoCopySettings") {
+      saveVideoCopySettings();
+      return;
+    }
+    if (action === "setVideoCategoryFilter") {
+      ui.videoCategory = node.dataset.category || "all";
+      resetGalleryWindow();
+      render();
+      return;
+    }
     if (action === "toggleEdit") {
       captureSelectedDetailDraft();
       ui.editMode = !ui.editMode;
@@ -3949,12 +4915,15 @@
     if (action === "saveCategory") saveCategory(node.dataset.id);
     if (action === "deleteCategory") deleteCategory(node.dataset.id);
     if (action === "moveCategory") moveCategory(node.dataset.id, Number(node.dataset.direction));
+    if (action === "addWildcardRule") addWildcardRule();
+    if (action === "deleteWildcardRule") deleteWildcardRule(node.dataset.id);
+    if (action === "moveWildcardRule") moveWildcardRule(node.dataset.id, Number(node.dataset.direction));
     if (action === "addManagedTag") addManagedTag(node.dataset.type);
     if (action === "saveManagedTag") saveManagedTag(node.dataset.type, node.dataset.key);
     if (action === "deleteManagedTag") deleteManagedTag(node.dataset.type, node.dataset.key);
     if (action === "moveManagedTag") moveManagedTag(node.dataset.type, node.dataset.key, Number(node.dataset.direction));
     if (action === "resetInstruction") {
-      state.promptInstruction = defaultInstruction;
+      state.promptInstruction = activeDefaultInstruction;
       state.promptSettings = normalizePromptSettings(defaultPromptSettings);
       saveSettingsState();
       render();
@@ -3967,6 +4936,31 @@
   }
 
   function bindUploadEvents() {
+    const videoDropZone = document.getElementById("videoDropZone");
+    const videoInput = document.getElementById("videoFileInput");
+    const pickVideo = document.getElementById("pickVideoFiles");
+    if (videoDropZone && videoInput && pickVideo) {
+      pickVideo.addEventListener("click", () => videoInput.click());
+      videoInput.addEventListener("change", () => addPendingVideoFiles(videoInput.files));
+      document.getElementById("videoUploadTitle")?.addEventListener("input", captureVideoUploadDraft);
+      document.getElementById("videoUploadCategory")?.addEventListener("change", captureVideoUploadDraft);
+      if (state.uploadSettings.allowDragDrop) {
+        ["dragenter", "dragover"].forEach((name) => {
+          videoDropZone.addEventListener(name, (event) => {
+            event.preventDefault();
+            videoDropZone.classList.add("dragging");
+          });
+        });
+        ["dragleave", "drop"].forEach((name) => {
+          videoDropZone.addEventListener(name, (event) => {
+            event.preventDefault();
+            videoDropZone.classList.remove("dragging");
+          });
+        });
+        videoDropZone.addEventListener("drop", (event) => addPendingVideoFiles(event.dataTransfer.files));
+      }
+      return;
+    }
     const dropZone = document.getElementById("dropZone");
     const input = document.getElementById("fileInput");
     const pick = document.getElementById("pickFiles");
@@ -3996,6 +4990,180 @@
     }
   }
 
+  function bindPromptViewerEvents() {
+    const input = document.getElementById("promptViewerFileInput");
+    const pick = document.getElementById("promptViewerPickFile");
+    const dropzone = document.getElementById("promptViewerDropzone");
+    if (!input || !pick || !dropzone) return;
+    pick.addEventListener("click", () => input.click());
+    input.addEventListener("change", () => {
+      const [file] = [...(input.files || [])];
+      if (file) inspectPromptViewerFile(file);
+    });
+    ["dragenter", "dragover"].forEach((name) => {
+      dropzone.addEventListener(name, (event) => {
+        event.preventDefault();
+        dropzone.classList.add("dragging");
+      });
+    });
+    ["dragleave", "drop"].forEach((name) => {
+      dropzone.addEventListener(name, (event) => {
+        event.preventDefault();
+        dropzone.classList.remove("dragging");
+      });
+    });
+    dropzone.addEventListener("drop", (event) => {
+      const [file] = [...(event.dataTransfer?.files || [])];
+      if (file) inspectPromptViewerFile(file);
+    });
+  }
+
+  function bindVideoPromptViewerEvents() {
+    const input = document.getElementById("videoPromptViewerFileInput");
+    const pick = document.getElementById("videoPromptViewerPickFile");
+    const dropzone = document.getElementById("videoPromptViewerDropzone");
+    if (!input || !pick || !dropzone) return;
+    pick.addEventListener("click", () => input.click());
+    input.addEventListener("change", () => {
+      const [file] = [...(input.files || [])];
+      if (file) inspectVideoPromptViewerFile(file);
+    });
+    ["dragenter", "dragover"].forEach((name) => {
+      dropzone.addEventListener(name, (event) => {
+        event.preventDefault();
+        dropzone.classList.add("dragging");
+      });
+    });
+    ["dragleave", "drop"].forEach((name) => {
+      dropzone.addEventListener(name, (event) => {
+        event.preventDefault();
+        dropzone.classList.remove("dragging");
+      });
+    });
+    dropzone.addEventListener("drop", (event) => {
+      const [file] = [...(event.dataTransfer?.files || [])];
+      if (file) inspectVideoPromptViewerFile(file);
+    });
+  }
+
+  async function inspectVideoPromptViewerFile(file) {
+    resetVideoPromptViewerState();
+    if (!isVideoUploadFile(file)) {
+      videoPromptViewerState.error = "WebM, MP4, MOV 비디오만 확인할 수 있습니다.";
+      render();
+      return;
+    }
+    const maxFileSizeMb = Math.max(Number(state.uploadSettings.maxFileSizeMb) || 100, 500);
+    if (Number(file?.size || 0) > maxFileSizeMb * 1024 * 1024) {
+      videoPromptViewerState.error = `${maxFileSizeMb}MB 이하 비디오만 확인할 수 있습니다.`;
+      render();
+      return;
+    }
+    const requestId = videoPromptViewerRequestId;
+    Object.assign(videoPromptViewerState, {
+      fileName: file.name || "비디오",
+      previewUrl: URL.createObjectURL(file),
+      loading: true,
+    });
+    render();
+    try {
+      const result = await readVideoPromptFromFile(file);
+      if (requestId !== videoPromptViewerRequestId) return;
+      const promptJson = result?.promptJson ? ensureVideoPromptJson(result.promptJson) : null;
+      Object.assign(videoPromptViewerState, {
+        loading: false,
+        promptJson,
+        rawText: result?.rawText || "",
+        source: result?.source || "",
+        error: promptJson
+          ? ""
+          : result?.rawText
+            ? "6문단 프롬프트 형식을 찾지 못했습니다. 감지된 원문을 확인해 주세요."
+            : "비디오 메타데이터에서 프롬프트를 찾지 못했습니다.",
+      });
+    } catch (error) {
+      if (requestId !== videoPromptViewerRequestId) return;
+      videoPromptViewerState.loading = false;
+      videoPromptViewerState.error = error.message || "비디오 메타데이터를 읽지 못했습니다.";
+    }
+    render();
+  }
+
+  function videoPromptViewerSectionText(sectionKey) {
+    return (videoPromptViewerState.promptJson?.[sectionKey]?.sentences || [])
+      .map((sentence) => sentence.en || "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+
+  function videoPromptViewerCopyText() {
+    return videoSectionMeta
+      .map((section) => videoPromptViewerSectionText(section.key))
+      .filter(Boolean)
+      .join("\n\n\n");
+  }
+
+  async function inspectPromptViewerFile(file) {
+    const supportedType = ["image/png", "image/jpeg", "image/webp"].includes(file?.type)
+      || /\.(png|jpe?g|webp)$/i.test(file?.name || "");
+    const maxFileSizeMb = Number(state.uploadSettings.maxFileSizeMb) || defaultUploadSettings.maxFileSizeMb;
+    resetPromptViewerState();
+    if (!supportedType) {
+      promptViewerState.error = "PNG, JPEG, WebP 이미지만 확인할 수 있습니다.";
+      render();
+      return;
+    }
+    if (Number(file?.size || 0) > maxFileSizeMb * 1024 * 1024) {
+      promptViewerState.error = `${maxFileSizeMb}MB 이하 이미지만 확인할 수 있습니다.`;
+      render();
+      return;
+    }
+    const requestId = promptViewerRequestId;
+    Object.assign(promptViewerState, {
+      fileName: file.name || "이미지",
+      previewUrl: URL.createObjectURL(file),
+      loading: true,
+    });
+    render();
+    try {
+      const result = await readPromptViewerFile(file);
+      if (requestId !== promptViewerRequestId) return;
+      Object.assign(promptViewerState, {
+        loading: false,
+        promptJson: result.promptJson,
+        rawText: result.rawText || "",
+        source: result.source || "",
+        error: result.promptJson
+          ? ""
+          : result.rawText
+            ? "5문단 프롬프트 형식을 찾지 못했습니다. 감지된 원문을 확인해 주세요."
+            : "이미지 메타데이터에서 프롬프트를 찾지 못했습니다.",
+      });
+    } catch (error) {
+      if (requestId !== promptViewerRequestId) return;
+      promptViewerState.loading = false;
+      promptViewerState.error = error.message || "이미지 메타데이터를 읽지 못했습니다.";
+    }
+    render();
+  }
+
+  function promptViewerSectionText(sectionKey) {
+    return (promptViewerState.promptJson?.[sectionKey]?.sentences || [])
+      .map((sentence) => sentence.en || "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+
+  function promptViewerCopyText(options = {}) {
+    return sectionMeta
+      .filter((section) => !(options.excludeAppearance && section.key === "appearance"))
+      .map((section) => promptViewerSectionText(section.key))
+      .filter(Boolean)
+      .join("\n\n\n");
+  }
+
   function captureUploadDraft() {
     ui.uploadDraft.title = document.getElementById("uploadTitle")?.value || ui.uploadDraft.title || "";
     ui.uploadDraft.categoryId = document.getElementById("uploadCategory")?.value || ui.uploadDraft.categoryId || state.categories[0]?.id || "";
@@ -4003,12 +5171,23 @@
   }
 
   window.addEventListener("paste", (event) => {
-    if (ui.modal !== "upload" || !state.uploadSettings.allowClipboardPaste) return;
     const files = [...(event.clipboardData?.items || [])]
       .filter((item) => item.type.startsWith("image/"))
       .map((item) => item.getAsFile())
       .filter(Boolean);
-    if (files.length) addPendingUploadFiles(files);
+    if (ui.modal === "videoPromptViewer") {
+      const videoFiles = [...(event.clipboardData?.items || [])]
+        .map((item) => item.getAsFile())
+        .filter((file) => file && isVideoUploadFile(file));
+      if (videoFiles.length) inspectVideoPromptViewerFile(videoFiles[0]);
+      return;
+    }
+    if (!files.length) return;
+    if (ui.modal === "promptViewer") {
+      inspectPromptViewerFile(files[0]);
+      return;
+    }
+    if (ui.modal === "upload" && state.uploadSettings.allowClipboardPaste) addPendingUploadFiles(files);
   });
 
   function bindPromptEvents() {
@@ -4067,7 +5246,7 @@
   function maybeLoadMoreGallery() {
     if (ui.view !== "gallery" || ui.modal || ui.galleryLoading || state.albumSettings.loadMode === "pages") return;
     const perPage = state.albumSettings.columns * state.albumSettings.rows;
-    const totalCount = getFilteredItems().length;
+    const totalCount = currentFilteredArchiveItems().length;
     if ((ui.galleryLoadedPages || 1) * perPage >= totalCount) return;
     const scrollBottom = window.scrollY + window.innerHeight;
     const distanceToBottom = document.documentElement.scrollHeight - scrollBottom;
@@ -4438,14 +5617,11 @@
   async function loadExifPromptForItem(item) {
     const rawText = String(item.uploadMeta?.exifRawText || "").trim();
     if (rawText) {
-      const promptJson = promptJsonFromMetadataText(rawText);
-      if (promptJson) {
-        return {
-          promptJson,
-          rawText,
-          source: item.uploadMeta?.exifPromptSource || "stored-exif-raw",
-        };
-      }
+      const parsed = parseExifPromptMetadata([{
+        source: item.uploadMeta?.exifPromptSource || "stored-exif-raw",
+        text: rawText,
+      }]);
+      if (parsed?.promptJson) return parsed;
       throw new Error("저장된 EXIF 원문 파싱 실패");
     }
 
@@ -4803,7 +5979,15 @@
 
   function captureSelectedDetailDraft() {
     const item = selectedItem();
-    if (ui.view !== "detail" || !item || !document.getElementById("detailTitle")) return;
+    if (ui.view !== "detail" || !item) return;
+    if (isVideoArchiveMode() && document.getElementById("videoDetailTitle")) {
+      collectPromptEditsFromDom(item);
+      item.title = document.getElementById("videoDetailTitle")?.value.trim() || "";
+      item.categoryId = document.getElementById("videoDetailCategory")?.value || item.categoryId || "";
+      item.memo = document.getElementById("videoDetailMemo")?.value.trim() || "";
+      return;
+    }
+    if (!document.getElementById("detailTitle")) return;
     collectDetailFields(item);
   }
 
@@ -5132,11 +6316,12 @@
   }
 
   function setBulkDeleteItemSelection(id, shouldSelect) {
-    if (!id || !state.items.some((item) => item.id === id)) return;
+    const items = currentArchiveItems();
+    if (!id || !items.some((item) => item.id === id)) return;
     const selected = new Set(ui.selectedBulkDeleteIds || []);
     if (shouldSelect) selected.add(id);
     else selected.delete(id);
-    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => state.items.some((item) => item.id === entryId));
+    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => items.some((item) => item.id === entryId));
   }
 
   function toggleBulkCategoryItem(id) {
@@ -5194,7 +6379,7 @@
       if (allVisibleSelected) selected.delete(id);
       else selected.add(id);
     });
-    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => state.items.some((item) => item.id === entryId));
+    ui.selectedBulkDeleteIds = [...selected].filter((entryId) => currentArchiveItems().some((item) => item.id === entryId));
   }
 
   function deleteSelectedItems() {
@@ -5405,10 +6590,18 @@
   }
 
   function saveCategorySettings() {
+    const wildcardSettings = readWildcardSettingsDraft();
+    try {
+      state.wildcardSettings = validateWildcardSettings(wildcardSettings);
+    } catch (error) {
+      showToast(error.message || "와일드카드 분류 규칙을 확인해 주세요.", "warning", 3600);
+      return;
+    }
     saveCategoryRows();
     state.categorySettings.allowAiSuggestedTags = Boolean(document.getElementById("allowAiSuggestedTags")?.checked);
     saveSettingsState();
     render();
+    showToast("분류와 와일드카드 규칙을 저장했습니다.", "success", 2200);
   }
 
   async function retranslateSection(id, key) {
@@ -5465,6 +6658,87 @@
     return Array.from(document.querySelectorAll(`[${attribute}]`)).find((input) => input.getAttribute(attribute) === id);
   }
 
+  function findWildcardRuleInput(attribute, id) {
+    return Array.from(document.querySelectorAll(`[${attribute}]`))
+      .find((input) => input.getAttribute(attribute) === id);
+  }
+
+  function readWildcardSettingsDraft() {
+    return {
+      appearancePath: document.getElementById("wildcardAppearancePath")?.value
+        || state.wildcardSettings.appearancePath,
+      defaultScenarioPath: document.getElementById("wildcardDefaultScenarioPath")?.value
+        || state.wildcardSettings.defaultScenarioPath,
+      rules: state.wildcardSettings.rules.map((rule) => ({
+        id: rule.id,
+        name: findWildcardRuleInput("data-wildcard-rule-name", rule.id)?.value || rule.name,
+        categoryNames: String(
+          findWildcardRuleInput("data-wildcard-rule-categories", rule.id)?.value
+          || rule.categoryNames.join(", "),
+        ).split(",").map((value) => value.trim()).filter(Boolean),
+        outputPath: findWildcardRuleInput("data-wildcard-rule-output", rule.id)?.value
+          || rule.outputPath,
+        enabled: findWildcardRuleInput("data-wildcard-rule-enabled", rule.id)?.checked !== false,
+      })),
+    };
+  }
+
+  function captureWildcardSettingsRows() {
+    try {
+      state.wildcardSettings = validateWildcardSettings(readWildcardSettingsDraft());
+      return true;
+    } catch (error) {
+      showToast(error.message || "와일드카드 분류 규칙을 확인해 주세요.", "warning", 3600);
+      return false;
+    }
+  }
+
+  function addWildcardRule() {
+    if (!captureWildcardSettingsRows()) return;
+    const usedCategoryNames = new Set(state.wildcardSettings.rules
+      .flatMap((rule) => rule.categoryNames)
+      .map((name) => name.trim().toLowerCase()));
+    const categoryName = state.categories
+      .map((category) => category.name)
+      .find((name) => !usedCategoryNames.has(name.trim().toLowerCase()))
+      || "새 분류";
+    const usedPaths = new Set([
+      state.wildcardSettings.appearancePath,
+      state.wildcardSettings.defaultScenarioPath,
+      ...state.wildcardSettings.rules.map((rule) => rule.outputPath),
+    ].map((relativePath) => relativePath.toLowerCase()));
+    let sequence = state.wildcardSettings.rules.length + 1;
+    let outputPath = `category-${sequence}.txt`;
+    while (usedPaths.has(outputPath.toLowerCase())) {
+      sequence += 1;
+      outputPath = `category-${sequence}.txt`;
+    }
+    state.wildcardSettings.rules.push({
+      id: uid("wildcard-rule"),
+      name: categoryName,
+      categoryNames: [categoryName],
+      outputPath,
+      enabled: true,
+    });
+    saveSettingsState();
+    render();
+  }
+
+  function deleteWildcardRule(id) {
+    if (!captureWildcardSettingsRows()) return;
+    state.wildcardSettings.rules = state.wildcardSettings.rules
+      .filter((rule) => rule.id !== id);
+    saveSettingsState();
+    render();
+  }
+
+  function moveWildcardRule(id, direction) {
+    if (!captureWildcardSettingsRows()) return;
+    moveInArray(state.wildcardSettings.rules, id, direction);
+    saveSettingsState();
+    render();
+  }
+
   function saveCategoryRows() {
     state.categories.forEach((category) => {
       const nameInput = findCategoryInput("data-category-name", category.id);
@@ -5517,6 +6791,110 @@
     moveInArray(state.categories, id, direction);
     saveSettingsState();
     render();
+  }
+
+  function saveVideoCategoryRows() {
+    state.videoCategories.forEach((category) => {
+      const nameInput = document.querySelector(`[data-video-category-name="${category.id}"]`);
+      const colorInput = document.querySelector(`[data-video-category-color="${category.id}"]`);
+      category.name = nameInput?.value.trim() || category.name;
+      category.color = colorInput?.value || category.color || "slate";
+    });
+    state.videoCategories = normalizeVideoCategories(state.videoCategories);
+  }
+
+  function saveVideoCategorySettings() {
+    saveVideoCategoryRows();
+    saveSettingsState();
+    render();
+    showToast("비디오 카테고리를 저장했습니다.", "success", 1800);
+  }
+
+  function addVideoCategory() {
+    const input = document.getElementById("newVideoCategoryName");
+    const name = input?.value.trim();
+    if (!name) return;
+    saveVideoCategoryRows();
+    state.videoCategories.push({ id: uid("vcat"), name, color: "slate" });
+    saveSettingsState();
+    render();
+  }
+
+  function saveVideoCategory(id) {
+    saveVideoCategoryRows();
+    const category = state.videoCategories.find((entry) => entry.id === id);
+    const input = document.querySelector(`[data-video-category-name="${id}"]`);
+    const colorInput = document.querySelector(`[data-video-category-color="${id}"]`);
+    if (!category || !input) return;
+    category.name = input.value.trim() || category.name;
+    category.color = colorInput?.value || category.color || "slate";
+    saveSettingsState();
+    render();
+  }
+
+  function deleteVideoCategory(id) {
+    if (state.videoCategories.length <= 1) return;
+    const category = state.videoCategories.find((entry) => entry.id === id);
+    if (!category || !confirm("이 비디오 카테고리를 삭제할까요? 해당 항목은 첫 번째 카테고리로 이동합니다.")) return;
+    saveVideoCategoryRows();
+    state.videoCategories = state.videoCategories.filter((entry) => entry.id !== id);
+    const fallbackId = state.videoCategories[0]?.id || "";
+    state.videoItems.forEach((item) => {
+      if (item.categoryId === id) item.categoryId = fallbackId;
+    });
+    saveSettingsState();
+    saveVideoItemsState();
+    render();
+  }
+
+  function moveVideoCategory(id, direction) {
+    saveVideoCategoryRows();
+    const index = state.videoCategories.findIndex((entry) => entry.id === id);
+    const nextIndex = index + Number(direction || 0);
+    if (index < 0 || nextIndex < 0 || nextIndex >= state.videoCategories.length) return;
+    const [entry] = state.videoCategories.splice(index, 1);
+    state.videoCategories.splice(nextIndex, 0, entry);
+    saveSettingsState();
+    render();
+  }
+
+  function saveVideoUploadSettings() {
+    state.videoSettings.translateOnUpload = Boolean(document.getElementById("videoTranslateOnUpload")?.checked);
+    saveSettingsState();
+    render();
+    showToast("비디오 업로드 설정을 저장했습니다.", "success", 1600);
+  }
+
+  function saveVideoCopySettings() {
+    state.videoSettings.includeSectionTitles = Boolean(document.getElementById("videoIncludeSectionTitles")?.checked);
+    state.videoSettings.promptViewMode = document.getElementById("videoPromptViewMode")?.value || "split";
+    state.videoSettings = normalizeVideoSettings(state.videoSettings);
+    saveSettingsState();
+    render();
+    showToast("비디오 표시 설정을 저장했습니다.", "success", 1600);
+  }
+
+  function videoCategoryName(id, fallback = "미분류") {
+    return state.videoCategories.find((category) => category.id === id)?.name || fallback;
+  }
+
+  function ensureVideoPromptJson(promptJson) {
+    const next = {};
+    videoSectionMeta.forEach((section) => {
+      const sentences = Array.isArray(promptJson?.[section.key]?.sentences)
+        ? promptJson[section.key].sentences
+        : [];
+      const normalized = sentences
+        .map((sentence, index) => ({
+          id: sentence?.id || `${section.key}-${index + 1}`,
+          en: String(sentence?.en || ""),
+          ko: String(sentence?.ko || ""),
+        }));
+      next[section.key] = {
+        sentences: normalized.length ? normalized : [{ id: `${section.key}-1`, en: "", ko: "" }],
+      };
+    });
+    return next;
   }
 
   function addManagedTag(type) {
@@ -5574,13 +6952,14 @@
 
   function resetSettingsOnly() {
     if (!confirm("이미지는 유지하고 설정만 기본값으로 되돌릴까요?")) return;
-    state.promptInstruction = defaultInstruction;
+    state.promptInstruction = activeDefaultInstruction;
     state.promptSettings = normalizePromptSettings(defaultPromptSettings);
     state.excludeOptions = normalizeExcludeOptions(defaultExcludeOptions);
     state.uploadSettings = normalizeUploadSettings(defaultUploadSettings);
     state.albumSettings = normalizeAlbumSettings(defaultAlbumSettings);
     state.copyDisplaySettings = normalizeCopyDisplaySettings(defaultCopyDisplaySettings);
     state.categorySettings = { ...defaultCategorySettings };
+    state.wildcardSettings = normalizeWildcardSettings(defaultWildcardSettings);
     state.themeSettings = { ...defaultThemeSettings, sectionColors: { ...defaultThemeSettings.sectionColors } };
     state.advancedSettings = normalizeAdvancedSettings(defaultAdvancedSettings);
     saveSettingsState();
@@ -5638,10 +7017,18 @@
     const provider = state.providers[index];
     if (!provider) return false;
     const keyInput = document.querySelector(`[data-provider-key="${index}"]`);
-    const unifiedModel = document.querySelector(`[data-provider-model="${index}"]`)?.value.trim() || "";
-    provider.model = unifiedModel;
-    provider.visionModel = unifiedModel;
-    provider.textModel = unifiedModel;
+    if (provider.name === "Google Vertex AI") {
+      const visionModel = document.querySelector(`[data-provider-vision-model="${index}"]`)?.value.trim() || "";
+      const textModel = document.querySelector(`[data-provider-text-model="${index}"]`)?.value.trim() || "";
+      provider.visionModel = visionModel;
+      provider.textModel = textModel;
+      provider.model = visionModel || textModel;
+    } else {
+      const unifiedModel = document.querySelector(`[data-provider-model="${index}"]`)?.value.trim() || "";
+      provider.model = unifiedModel;
+      provider.visionModel = unifiedModel;
+      provider.textModel = unifiedModel;
+    }
     provider.apiUrl = document.querySelector(`[data-provider-api-url="${index}"]`)?.value.trim() || provider.apiUrl || defaultProviderApiUrl(provider.name);
     provider.location = document.querySelector(`[data-provider-location="${index}"]`)?.value.trim() || provider.location || "";
     const pendingKey = keyInput?.value.trim() || "";
@@ -5882,6 +7269,11 @@
       loraSorterState.collisionMode = event.target.value === "skip" ? "skip" : "rename";
       void saveLoraSorterSettings();
     });
+    document.getElementById("loraDetectionExclusionInput")?.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.isComposing) return;
+      event.preventDefault();
+      addLoraDetectionExclusion(event.target.value);
+    });
   }
 
   async function restoreLoraSorterSettings() {
@@ -5893,6 +7285,7 @@
       loraSorterState.baseDestinationHandle = restored.baseDestinationHandle;
       loraSorterState.destinationHandles = restored.destinationHandles;
       loraSorterState.excludedGroupKeys = restored.excludedGroupKeys;
+      loraSorterState.detectionExcludedLoras = restored.detectionExcludedLoras || new Set();
       loraSorterState.includeSubfolders = restored.includeSubfolders;
       loraSorterState.collisionMode = restored.collisionMode;
       render();
@@ -5973,6 +7366,44 @@
     render();
   }
 
+  function refreshLoraSorterGroups() {
+    loraSorterState.groups = window.PromptArchiveLoraSorter.groupInspectedFiles(loraSorterState.scannedFiles, loraSorterState.detectionExcludedLoras);
+    loraSorterState.result = null;
+  }
+
+  function addLoraDetectionExclusion(value) {
+    if (loraSorterState.scanning || loraSorterState.moving) return;
+    const name = window.PromptArchiveLoraSorter.normalizeLoraExclusion(value);
+    if (!name) {
+      showToast("제외할 LoRA 이름을 입력해주세요.", "warning");
+      return;
+    }
+    if (window.PromptArchiveLoraSorter.isLoraDetectionExcluded(name, loraSorterState.detectionExcludedLoras)) {
+      showToast("이미 감지 제외 목록에 있습니다.", "warning");
+      return;
+    }
+    loraSorterState.detectionExcludedLoras.add(name);
+    refreshLoraSorterGroups();
+    void saveLoraSorterSettings();
+    render();
+    showToast(`${name}을(를) 감지에서 제외했습니다.`, "success");
+  }
+
+  function removeLoraDetectionExclusion(value) {
+    if (loraSorterState.scanning || loraSorterState.moving) return;
+    const target = window.PromptArchiveLoraSorter.normalizeLoraExclusion(value).toLowerCase();
+    if (!target) return;
+    for (const name of loraSorterState.detectionExcludedLoras) {
+      if (window.PromptArchiveLoraSorter.normalizeLoraExclusion(name).toLowerCase() === target) {
+        loraSorterState.detectionExcludedLoras.delete(name);
+      }
+    }
+    refreshLoraSorterGroups();
+    void saveLoraSorterSettings();
+    render();
+    showToast("감지 제외를 해제했습니다.", "success");
+  }
+
   async function collectLoraImageHandles(rootHandle, recursive, relativeParts = [], results = []) {
     for await (const [name, handle] of rootHandle.entries()) {
       if (handle.kind === "file" && window.PromptArchiveLoraSorter.isSupportedImageName(name)) {
@@ -6012,7 +7443,7 @@
             size: file.size,
             lastModified: file.lastModified,
             inspection,
-            classification: window.PromptArchiveLoraSorter.classificationForInspection(inspection),
+            classification: window.PromptArchiveLoraSorter.classificationForInspection(inspection, loraSorterState.detectionExcludedLoras),
           });
         } catch (error) {
           loraSorterState.progress.errors.push(`${relativeName}: ${error.message || error}`);
@@ -6026,7 +7457,7 @@
           updateLoraSorterProgressDom();
         }
       }
-      loraSorterState.groups = window.PromptArchiveLoraSorter.groupInspectedFiles(loraSorterState.scannedFiles);
+      refreshLoraSorterGroups();
       const matched = loraSorterState.groups.filter((group) => group.movable).reduce((total, group) => total + group.count, 0);
       loraSorterState.progress.fileName = `${matched}장 LoRA 분류 가능`;
       showToast(files.length ? `${files.length}장 검사 완료 · ${matched}장 분류 가능` : "지원하는 이미지 파일을 찾지 못했습니다.", files.length ? "success" : "warning", 3000);
@@ -6116,7 +7547,7 @@
     } finally {
       loraSorterState.moving = false;
       loraSorterState.scannedFiles = loraSorterState.scannedFiles.filter((entry) => !movedEntries.has(entry));
-      loraSorterState.groups = window.PromptArchiveLoraSorter.groupInspectedFiles(loraSorterState.scannedFiles);
+      refreshLoraSorterGroups();
       result.summary = `${result.moved}장 이동 · ${result.skipped}장 건너뜀 · ${result.failed}장 오류`;
       loraSorterState.result = result;
       loraSorterState.progress = { phase: "move", current: jobs.length, total: jobs.length, fileName: result.summary, errors: result.errors };
@@ -6268,6 +7699,9 @@
     converterState.wildcardSyncResult = null;
     render();
     try {
+      clearTimeout(settingsSaveTimer);
+      const settingsSaved = await syncSettingsToServer();
+      if (!settingsSaved) throw new Error("최신 와일드카드 분류 설정을 서버에 저장하지 못했습니다.");
       clearTimeout(itemsSaveTimer);
       const itemsSaved = await syncItemsToServer();
       if (!itemsSaved) throw new Error("최신 프롬프트 항목을 서버에 저장하지 못했습니다.");
@@ -6277,7 +7711,7 @@
       if (!response.ok || !payload.ok) throw new Error(payload.message || "와일드카드 업데이트에 실패했습니다.");
       converterState.wildcardSyncResult = payload;
       if (payload.rebuilt) {
-        showToast(`전체 갱신 완료 · 외모 ${payload.appearanceWritten}줄 · 시나리오 ${payload.scenarioWritten}줄`, payload.invalidItems ? "warning" : "success", 3200);
+        showToast(`전체 갱신 완료 · 외모 ${payload.appearanceWritten}줄 · 시나리오 ${payload.scenariosWritten ?? payload.scenarioWritten}줄`, payload.invalidItems ? "warning" : "success", 3200);
       } else if (payload.initialized) {
         showToast(`현재 ${payload.totalItems}개를 업데이트 기준으로 등록했습니다.`, "success", 2600);
       } else {
@@ -6632,13 +8066,28 @@
   }
 
   async function readExifPromptFromFile(file) {
-    const buffer = await file.arrayBuffer();
-    const metadata = extractImageMetadataText(buffer, file.type || "");
-    const parsed = parseExifPromptMetadata(metadata);
+    const parsed = await readPromptViewerFile(file);
     if (!parsed?.promptJson) {
       throw new Error("EXIF / 메타데이터에 5문단 프롬프트가 없습니다.");
     }
     return parsed;
+  }
+
+  async function readPromptViewerFile(file) {
+    const buffer = await file.arrayBuffer();
+    const metadata = extractImageMetadataText(buffer, file.type || "");
+    const parsed = parseExifPromptMetadata(metadata);
+    if (parsed?.promptJson) return parsed;
+    const candidates = metadata
+      .flatMap((entry) => collectPromptCandidates(entry.text, entry.source))
+      .sort((left, right) => promptCandidateScore(right) - promptCandidateScore(left));
+    const fallback = candidates.find((candidate) => candidate.text.length > 20);
+    return {
+      promptJson: null,
+      rawText: fallback?.text?.slice(0, 30000) || "",
+      source: fallback?.source || "",
+      titleSummary: "",
+    };
   }
 
   function extractImageMetadataText(buffer, mimeType) {
@@ -6849,6 +8298,7 @@
         };
       }
     }
+    if (window.PromptArchiveExifPromptResolver.containsComfyPromptGraph(entries)) return null;
     const candidates = [];
     for (const entry of entries) {
       collectPromptCandidates(entry.text, entry.source).forEach((candidate) => candidates.push(candidate));
@@ -6916,6 +8366,8 @@
   function promptCandidateScore(candidate) {
     const text = candidate.text.toLowerCase();
     let score = Math.min(candidate.text.length, 4000) / 1000;
+    if (/raw-scan/i.test(candidate.source || "")) score -= 6;
+    else score += 1;
     if (/appearance|outfit|background|details|외모|복장|배경|디테일/.test(text)) score += 8;
     if ((candidate.text.match(/\n\s*\n/g) || []).length >= 4) score += 7;
     if (/negative prompt|steps:|sampler:|cfg scale:/i.test(candidate.text)) score += 2;
@@ -7331,10 +8783,950 @@
 
   function openItem(id) {
     ui.previousView = ui.view;
-    ui.selectedId = id;
+    if (isVideoArchiveMode()) ui.videoSelectedId = id;
+    else ui.selectedId = id;
     ui.view = "detail";
     ui.editMode = false;
     render();
+  }
+
+  function setArchiveMode(mode) {
+    const next = mode === "video" ? "video" : "image";
+    ui.archiveMode = next;
+    persistArchiveMode(next);
+    ui.view = "gallery";
+    ui.modal = null;
+    ui.editMode = false;
+    ui.bulkDeleteMode = false;
+    ui.selectedBulkDeleteIds = [];
+    ui.bulkCategoryMode = false;
+    ui.selectedBulkCategoryIds = [];
+    ui.query = "";
+    resetGalleryWindow();
+    render();
+  }
+
+  function videoItemSearchBlob(item) {
+    const sections = videoSectionMeta.flatMap((section) => (item.promptJson?.[section.key]?.sentences || []).flatMap((sentence) => [sentence.en, sentence.ko]));
+    return normalizeSearchText([item.title, item.memo, item.uploadMeta?.fileName, ...sections].filter(Boolean).join(" "));
+  }
+
+  function currentFilteredArchiveItems() {
+    return isVideoArchiveMode() ? getFilteredVideoItems() : getFilteredItems();
+  }
+
+  function getFilteredVideoItems() {
+    const query = normalizeSearchText(ui.query);
+    let items = [...(state.videoItems || [])];
+    if (ui.videoCategory && ui.videoCategory !== "all") {
+      items = items.filter((item) => item.categoryId === ui.videoCategory);
+    }
+    if (query) items = items.filter((item) => videoItemSearchBlob(item).includes(query));
+    if (ui.sort === "oldest") items.sort((left, right) => left.createdAt - right.createdAt);
+    else items.sort((left, right) => right.createdAt - left.createdAt);
+    return items;
+  }
+
+  function renderVideoGallery() {
+    const items = getFilteredVideoItems();
+    const perPage = state.albumSettings.columns * state.albumSettings.rows;
+    const pageMode = state.albumSettings.loadMode === "pages";
+    const pageCount = Math.max(1, Math.ceil(items.length / perPage));
+    ui.page = Math.max(1, Math.min(pageCount, ui.page || 1));
+    ui.galleryLoadedPages = Math.max(1, ui.galleryLoadedPages || 1);
+    const visibleCount = ui.galleryLoadedPages * perPage;
+    const pageItems = pageMode
+      ? items.slice((ui.page - 1) * perPage, ui.page * perPage)
+      : items.slice(0, visibleCount);
+    const hasMore = !pageMode && visibleCount < items.length;
+    const paginationTop = pageMode && ["top", "both"].includes(state.albumSettings.paginationPosition) ? renderPagination(pageCount) : "";
+    const paginationBottom = pageMode && ["bottom", "both"].includes(state.albumSettings.paginationPosition) ? renderPagination(pageCount) : "";
+    return `
+      <div class="notice video-mode-notice">비디오 모드는 이미지 아카이브와 목록·설정·카테고리가 분리되어 있습니다. 변환과 사진 분류는 사용할 수 없습니다.</div>
+      <div class="album-filter-bar surface-card">
+        <div class="gallery-control-primary">
+          <div class="gallery-result-summary" aria-live="polite">
+            <strong>${items.length}개</strong>
+            <span>비디오 ${state.videoItems.length}개</span>
+          </div>
+          <div class="gallery-control-actions">
+            <label class="compact-field"><span>정렬</span><select class="select compact-select" id="sortSelect">
+              <option value="latest" ${ui.sort === "latest" ? "selected" : ""}>최신순</option>
+              <option value="oldest" ${ui.sort === "oldest" ? "selected" : ""}>오래된순</option>
+            </select></label>
+          </div>
+        </div>
+        <div class="album-filter-summary">
+          <div class="filter-section">
+            <span class="filter-section-label">카테고리</span>
+            <div class="category-tabs segmented-tabs">
+              <button class="chip-btn ${ui.videoCategory === "all" ? "active" : ""}" data-action="setVideoCategoryFilter" data-category="all" type="button">전체</button>
+              ${state.videoCategories.map((category) => `
+                <button class="chip-btn ${ui.videoCategory === category.id ? "active" : ""}" data-action="setVideoCategoryFilter" data-category="${escapeHtml(category.id)}" type="button">${escapeHtml(category.name)}</button>
+              `).join("")}
+            </div>
+          </div>
+        </div>
+      </div>
+      ${paginationTop}
+      <div class="album-action-row ${ui.bulkDeleteMode ? "delete-mode" : ""}">
+        ${ui.bulkDeleteMode ? renderBulkDeleteControls(pageItems) : ""}
+        <div class="album-action-buttons">
+          <button class="ghost-btn ${ui.bulkDeleteMode ? "active-danger" : ""}" data-action="toggleBulkDeleteMode" type="button" aria-pressed="${ui.bulkDeleteMode}">${ui.bulkDeleteMode ? "삭제 선택 닫기" : "일괄 삭제"}</button>
+        </div>
+      </div>
+      ${pageItems.length ? `<div class="gallery-grid album-grid ${ui.bulkDeleteMode ? "bulk-delete-gallery" : ""}" style="--album-columns: ${state.albumSettings.columns}; --album-ratio: ${cardRatioValue()};">${pageItems.map((item) => renderVideoCard(item)).join("")}</div>` : renderEmptyVideoGallery()}
+      ${pageMode ? paginationBottom : renderGalleryLoadMore(hasMore, pageItems.length, items.length)}
+    `;
+  }
+
+  function renderEmptyVideoGallery() {
+    return `
+      <div class="empty-state">
+        <div>
+          <h2>저장된 비디오 프롬프트가 없습니다.</h2>
+          <p>WebM 또는 MP4를 올리면 ComfyUI 메타데이터에서 6개 문단을 읽어 저장합니다.</p>
+          <button class="primary-btn" data-action="upload" type="button">비디오 업로드</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderVideoCard(item) {
+    const title = videoDisplayTitle(item);
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    const imageSource = escapeHtml(safeImageSource(item.thumbnailUrl || item.imageUrl));
+    const selectedForDelete = (ui.selectedBulkDeleteIds || []).includes(item.id);
+    return `
+      <article class="panel image-card ${ui.bulkDeleteMode ? "bulk-delete-mode" : ""} ${selectedForDelete ? "selected-for-delete" : ""}" data-open-item="${itemId}" tabindex="0" role="button" aria-label="${escapeHtml(`${title} 열기`)}">
+        <div class="thumb">
+          <img src="${imageSource}" alt="${escapeHtml(title)}" loading="lazy">
+          ${ui.bulkDeleteMode ? `
+            <label class="bulk-delete-check" aria-label="삭제할 게시물 선택">
+              <input class="bulk-delete-checkbox" data-action="bulkToggleItem" data-bulk-delete-id="${itemId}" type="checkbox" ${selectedForDelete ? "checked" : ""}>
+              <span>삭제 선택</span>
+            </label>
+          ` : ""}
+        </div>
+        <div class="card-body">
+          <h3 class="card-title video-card-title"><span class="video-card-title-text">${escapeHtml(title)}</span>${videoTitleMetaHtml(item)}</h3>
+          <div class="card-meta">
+            <span class="card-chip">${escapeHtml(videoCategoryName(item.categoryId))}</span>
+          </div>
+        </div>
+      </article>
+    `;
+  }
+
+  function videoDisplayTitle(item) {
+    const title = String(item?.title || "").trim();
+    return title || "제목 없음";
+  }
+
+  function videoDurationSeconds(item) {
+    return Number(item?.durationSeconds || item?.uploadMeta?.duration || 0) || 0;
+  }
+
+  function videoDurationLabel(item) {
+    const format = videoPromptApi.formatVideoDurationLabel;
+    const seconds = videoDurationSeconds(item);
+    return typeof format === "function" ? format(seconds) : (seconds ? `${Math.round(seconds)}s` : "");
+  }
+
+  function videoAspectSize(item) {
+    return {
+      width: Number(item?.width || item?.uploadMeta?.width || item?.displayImage?.width || item?.thumbnailImage?.width || 0) || 0,
+      height: Number(item?.height || item?.uploadMeta?.height || item?.displayImage?.height || item?.thumbnailImage?.height || 0) || 0,
+    };
+  }
+
+  function videoAspectRatioLabel(item) {
+    const format = videoPromptApi.formatVideoAspectRatioLabel;
+    const size = videoAspectSize(item);
+    if (typeof format === "function") return format(size.width, size.height);
+    if (!size.width || !size.height) return "";
+    return `${size.width}:${size.height}`;
+  }
+
+  function videoTitleMetaHtml(item) {
+    const badges = [];
+    const duration = videoDurationLabel(item);
+    const ratio = videoAspectRatioLabel(item);
+    if (duration) badges.push(`<span class="video-meta-badge is-duration">${escapeHtml(duration)}</span>`);
+    if (ratio) badges.push(`<span class="video-meta-badge is-ratio">${escapeHtml(ratio)}</span>`);
+    return badges.length ? `<span class="video-title-meta">${badges.join("")}</span>` : "";
+  }
+
+  function renderVideoDetail() {
+    const item = findVideoItem(ui.videoSelectedId);
+    if (!item) {
+      ui.view = "gallery";
+      return renderVideoGallery();
+    }
+    const title = videoDisplayTitle(item);
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    const imageSource = escapeHtml(safeImageSource(item.imageUrl || item.thumbnailUrl));
+    return `
+      <div class="page-head">
+        <div>
+          <h2 class="page-title video-page-title"><span class="video-page-title-text">${escapeHtml(title)}</span>${videoTitleMetaHtml(item)}</h2>
+          <p class="page-copy">${escapeHtml(item.memo || "")}</p>
+        </div>
+        <div class="toolbar detail-primary-actions">
+          <button class="ghost-btn" data-view="gallery" type="button">갤러리</button>
+        </div>
+      </div>
+      <div class="detail-grid">
+        <section class="panel detail-media">
+          <img src="${imageSource}" alt="${escapeHtml(title)}">
+          <div class="detail-meta">
+            <div class="field">
+              <label for="videoDetailTitle">제목</label>
+              <input class="input" id="videoDetailTitle" value="${escapeHtml(item.title || "")}" placeholder="직접 입력">
+            </div>
+            <div class="field">
+              <label for="videoDetailCategory">카테고리</label>
+              <select class="select" id="videoDetailCategory">
+                ${state.videoCategories.map((category) => `<option value="${escapeHtml(category.id)}" ${item.categoryId === category.id ? "selected" : ""}>${escapeHtml(category.name)}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label for="videoDetailMemo">메모</label>
+              <textarea class="textarea" id="videoDetailMemo">${escapeHtml(item.memo || "")}</textarea>
+            </div>
+            ${item.uploadMeta ? `
+              <div class="asset-summary">
+                <span>${escapeHtml(item.uploadMeta.fileName || "비디오")}</span>
+                ${item.uploadMeta.duration ? `<span>${Number(item.uploadMeta.duration).toFixed(1)}초</span>` : ""}
+                ${videoAspectRatioLabel(item) ? `<span>${escapeHtml(videoAspectRatioLabel(item))}</span>` : ""}
+                ${item.uploadMeta.originalSize ? `<span>${formatBytes(item.uploadMeta.originalSize)}</span>` : ""}
+              </div>
+            ` : ""}
+            ${item.errorMessage ? `<p class="notice">${escapeHtml(item.errorMessage)}</p>` : ""}
+            <div class="toolbar detail-action-group">
+              <button class="primary-btn" data-action="saveVideoDetail" data-id="${itemId}" type="button">저장</button>
+              <button class="danger-btn" data-action="deleteVideoItem" data-id="${itemId}" type="button">삭제</button>
+            </div>
+          </div>
+        </section>
+        <section class="panel prompt-panel">
+          ${renderVideoPromptTools(item)}
+          ${item.promptJson ? renderVideoPromptColumns(item) : `
+            <div class="empty-state">
+              <div>
+                <h2>비디오 프롬프트가 없습니다.</h2>
+                <p>업로드한 파일에서 subject_definitions 등 6개 문단을 찾지 못했습니다.</p>
+              </div>
+            </div>
+          `}
+        </section>
+      </div>
+    `;
+  }
+
+  function renderVideoPromptTools(item) {
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    return `
+      <div class="prompt-actions prompt-actions-sticky">
+        <div class="toolbar" style="margin: 0;">
+          <button class="primary-btn" data-action="copyVideoPrompt" data-mode="final" data-id="${itemId}" type="button">전체 복사</button>
+          <button class="ghost-btn" data-action="copyVideoPrompt" data-mode="ko" data-id="${itemId}" type="button">번역 복사</button>
+          <button class="ghost-btn" data-action="copyVideoPrompt" data-mode="both" data-id="${itemId}" type="button">영+한 복사</button>
+        </div>
+        <div class="toolbar" style="margin: 0;">
+          <button class="ghost-btn" data-action="toggleEdit" type="button">${ui.editMode ? "보기 모드" : "수정 모드"}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderVideoPromptColumns(item) {
+    const mode = state.videoSettings.promptViewMode;
+    const enColumn = `
+      <div class="prompt-column">
+        <div class="prompt-column-head">English prompt</div>
+        ${videoSectionMeta.map((section) => renderVideoPromptSection(item, section, "en")).join("")}
+      </div>
+    `;
+    const koColumn = `
+      <div class="prompt-column">
+        <div class="prompt-column-head">한국어 번역</div>
+        ${videoSectionMeta.map((section) => renderVideoPromptSection(item, section, "ko")).join("")}
+      </div>
+    `;
+    return `<div class="prompt-columns ${mode !== "split" ? "single-column" : ""}">${mode === "ko" ? koColumn : mode === "en" ? enColumn : enColumn + koColumn}</div>`;
+  }
+
+  function renderVideoPromptSection(item, sectionConfig, lang) {
+    const section = item.promptJson?.[sectionConfig.key] || { sentences: [] };
+    const sentences = section.sentences?.length
+      ? section.sentences
+      : [{ id: `${sectionConfig.key}-1`, en: "", ko: "" }];
+    const label = lang === "ko" ? sectionConfig.labelKo : sectionConfig.labelEn;
+    const itemId = escapeHtml(normalizeReferenceIdentifier(item.id));
+    const sectionKey = escapeHtml(normalizeReferenceIdentifier(sectionConfig.key));
+    return `
+      <section class="prompt-section" data-section="${sectionKey}">
+        <div class="section-label-row">
+          <h3 class="section-label">${escapeHtml(label)}</h3>
+          <button class="tiny-btn section-copy-btn" data-action="copyVideoSection" data-id="${itemId}" data-section="${sectionKey}" data-lang="${lang}" type="button" aria-label="${escapeHtml(label)} 문단 복사" data-tooltip="문단 복사">⧉</button>
+        </div>
+        ${sentences.map((sentence) => `
+          <p class="sentence video-sentence ${ui.selectedSentenceId === sentence.id ? "active" : ""} ${String(sentence[lang] || "").trim() ? "" : "is-empty"}"
+             data-sentence-id="${escapeHtml(normalizeReferenceIdentifier(sentence.id))}"
+             data-lang="${lang}"
+             contenteditable="${ui.editMode ? "true" : "false"}"
+             spellcheck="false">${renderVideoSentenceContent(sentence, lang)}</p>
+        `).join("")}
+        <div class="toolbar" style="margin-top: var(--space-2); margin-bottom: 0;">
+          ${lang === "ko" ? `<button class="tiny-btn" data-action="retranslateVideoSection" data-section="${sectionKey}" data-id="${itemId}" type="button">${escapeHtml(label)} 재번역</button>` : ""}
+        </div>
+      </section>
+    `;
+  }
+
+  function renderVideoSentenceContent(sentence, lang) {
+    return escapeHtml(String(sentence?.[lang] || ""));
+  }
+
+  function renderVideoUpload() {
+    return `
+      <div class="page-head">
+        <div>
+          <h2 class="page-title">비디오 업로드</h2>
+          <p class="page-copy">파일을 고르면 먼저 6개 구간 썸네일을 뽑습니다. 위에서 하나를 고른 뒤 제목과 카테고리를 입력하세요.</p>
+        </div>
+      </div>
+      <section class="panel" style="padding: var(--space-4);">
+        <p class="notice upload-mode-notice">썸네일은 영상 길이를 6등분해 추출합니다. 제목과 카테고리는 직접 입력합니다.</p>
+        ${renderVideoThumbnailPicker()}
+        <div class="upload-zone" id="videoDropZone">
+          <div>
+            <h2>비디오를 놓거나 선택하세요</h2>
+            <p>webm, mp4</p>
+            <input class="sr-only" id="videoFileInput" type="file" accept="video/webm,video/mp4,video/quicktime,.webm,.mp4,.mov" multiple>
+            <button class="primary-btn" id="pickVideoFiles" type="button">파일 선택</button>
+          </div>
+        </div>
+        ${renderPendingVideoFiles()}
+        <div class="form-grid" style="margin-top: var(--space-4);">
+          <div class="field">
+            <label for="videoUploadTitle">제목</label>
+            <input class="input" id="videoUploadTitle" value="${escapeHtml(ui.videoUploadDraft.title)}" placeholder="직접 입력">
+          </div>
+          <div class="field">
+            <label for="videoUploadCategory">카테고리</label>
+            <select class="select" id="videoUploadCategory">
+              ${state.videoCategories.map((category) => `<option value="${escapeHtml(category.id)}" ${ui.videoUploadDraft.categoryId === category.id ? "selected" : ""}>${escapeHtml(category.name)}</option>`).join("")}
+            </select>
+          </div>
+        </div>
+        <div class="upload-action-row">
+          <div class="toolbar">
+            <button class="ghost-btn" data-action="removeSelectedPendingVideoUploads" type="button" ${ui.selectedPendingVideoKeys.length && !ui.videoUploadProgress ? "" : "disabled"}>선택 지우기</button>
+            <button class="ghost-btn" data-action="clearVideoUploadWorkspace" type="button" ${(ui.pendingVideoFiles.length || ui.videoUploadQueue.length) && !ui.videoUploadProgress ? "" : "disabled"}>비우기</button>
+            <button class="primary-btn" data-action="saveAndReadVideoUploads" type="button" ${ui.pendingVideoFiles.length && !ui.videoUploadProgress && !videoThumbnailsBusy() ? "" : "disabled"}>${ui.videoUploadProgress ? "처리 중" : videoThumbnailsBusy() ? "썸네일 추출 중" : "프롬프트 읽고 저장"}</button>
+          </div>
+          ${ui.videoUploadProgress ? `<p class="field-help">${ui.videoUploadProgress.done} / ${ui.videoUploadProgress.total}</p>` : ""}
+        </div>
+        <div class="queue-list">${(ui.videoUploadQueue || []).map((entry) => `
+          <article class="panel queue-item video-queue-item ${entry.error ? "has-error" : ""}">
+            ${entry.url ? `<img src="${escapeHtml(safeImageSource(entry.url))}" alt="${escapeHtml(entry.name)}">` : `<div class="queue-fallback" aria-hidden="true">${navIcon("film")}</div>`}
+            <div class="video-queue-copy">
+              <strong>${escapeHtml(entry.name)}</strong>
+              <div class="meta-line">
+                <span>${escapeHtml(entry.status)}</span>
+              </div>
+              ${entry.error ? `<p class="queue-error">${escapeHtml(entry.error)}</p>` : ""}
+            </div>
+            ${entry.itemId ? `<button class="tiny-btn" data-action="openUploaded" data-id="${escapeHtml(normalizeReferenceIdentifier(entry.itemId))}" type="button">열기</button>` : ""}
+          </article>
+        `).join("")}</div>
+      </section>
+    `;
+  }
+
+  function renderPendingVideoFiles() {
+    if (!ui.pendingVideoFiles.length) return "";
+    return `
+      <div class="pending-preview-grid" aria-label="선택한 비디오 파일">
+        ${ui.pendingVideoFiles.map((file) => {
+          const key = pendingUploadKey(file);
+          const selected = ui.selectedPendingVideoKeys.includes(key);
+          const error = ui.pendingVideoErrors?.[key] || "";
+          return `
+            <button class="pending-preview-card ${selected ? "selected" : ""} ${error ? "invalid" : ""}" data-action="togglePendingVideoUpload" data-upload-key="${escapeHtml(key)}" type="button" aria-pressed="${selected ? "true" : "false"}">
+              <strong>${escapeHtml(file.name)}</strong>
+              <span>${formatBytes(file.size)}</span>
+              ${error ? `<em class="pending-error">${escapeHtml(error)}</em>` : ""}
+            </button>
+          `;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  function videoThumbnailsBusy() {
+    return Object.values(ui.videoThumbnailSets || {}).some((entry) => entry?.loading);
+  }
+
+  function renderVideoThumbnailPicker() {
+    if (!ui.pendingVideoFiles.length) return "";
+    return `
+      <div class="video-thumb-picker" aria-label="썸네일 선택">
+        ${ui.pendingVideoFiles.map((file) => {
+          const key = pendingUploadKey(file);
+          const set = ui.videoThumbnailSets?.[key] || { loading: true, frames: [], selectedIndex: 0 };
+          const selectedIndex = Number(set.selectedIndex || 0);
+          return `
+            <section class="video-thumb-file">
+              <div class="video-thumb-file-head">
+                <strong>${escapeHtml(file.name)}</strong>
+                <span>${set.loading ? "구간 썸네일 추출 중…" : set.error ? escapeHtml(set.error) : `${set.frames.length}개 중 하나를 선택`}</span>
+              </div>
+              <div class="video-thumb-strip">
+                ${set.loading ? `<div class="video-thumb-loading">영상을 6구간으로 나누는 중입니다.</div>` : (set.frames || []).map((frame, index) => `
+                  <button class="video-thumb-choice ${index === selectedIndex ? "selected" : ""}" data-action="selectVideoThumbnail" data-upload-key="${escapeHtml(key)}" data-index="${index}" type="button" aria-pressed="${index === selectedIndex}">
+                    <img src="${escapeHtml(frame.dataUrl)}" alt="${Number(frame.time || 0).toFixed(1)}초 미리보기">
+                    <span>${Number(frame.time || 0).toFixed(1)}s</span>
+                  </button>
+                `).join("")}
+              </div>
+            </section>
+          `;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  function captureVideoUploadDraft() {
+    ui.videoUploadDraft.title = document.getElementById("videoUploadTitle")?.value || "";
+    ui.videoUploadDraft.categoryId = document.getElementById("videoUploadCategory")?.value || state.videoCategories[0]?.id || "";
+  }
+
+  function addPendingVideoFiles(fileList) {
+    const files = [...(fileList || [])].filter((file) => isVideoUploadFile(file));
+    if (!files.length) {
+      showToast("WebM 또는 MP4 비디오만 올릴 수 있습니다.", "warning");
+      return;
+    }
+    const existing = new Set(ui.pendingVideoFiles.map(pendingUploadKey));
+    files.forEach((file) => {
+      const key = pendingUploadKey(file);
+      if (!existing.has(key)) {
+        ui.pendingVideoFiles.push(file);
+        existing.add(key);
+      }
+    });
+    ui.pendingVideoFiles = ui.pendingVideoFiles.slice(0, state.advancedSettings.maxImagesPerBatch);
+    render();
+    files.forEach((file) => {
+      const key = pendingUploadKey(file);
+      if (!ui.videoThumbnailSets[key] || ui.videoThumbnailSets[key].error) prepareVideoThumbnailChoices(file);
+    });
+  }
+
+  function isVideoUploadFile(file) {
+    const type = String(file?.type || "").toLowerCase();
+    const name = String(file?.name || "").toLowerCase();
+    return type.startsWith("video/") || /\.(webm|mp4|mov)$/i.test(name);
+  }
+
+  function togglePendingVideoUpload(key) {
+    if (!key) return;
+    if (ui.selectedPendingVideoKeys.includes(key)) {
+      ui.selectedPendingVideoKeys = ui.selectedPendingVideoKeys.filter((entry) => entry !== key);
+    } else {
+      ui.selectedPendingVideoKeys = [...ui.selectedPendingVideoKeys, key];
+    }
+    render();
+  }
+
+  function removeSelectedPendingVideoUploads() {
+    const selected = new Set(ui.selectedPendingVideoKeys);
+    ui.pendingVideoFiles = ui.pendingVideoFiles.filter((file) => !selected.has(pendingUploadKey(file)));
+    ui.pendingVideoErrors = Object.fromEntries(Object.entries(ui.pendingVideoErrors || {}).filter(([key]) => !selected.has(key)));
+    ui.videoThumbnailSets = Object.fromEntries(Object.entries(ui.videoThumbnailSets || {}).filter(([key]) => !selected.has(key)));
+    ui.selectedPendingVideoKeys = [];
+    render();
+  }
+
+  function clearVideoUploadWorkspace() {
+    ui.pendingVideoFiles = [];
+    ui.selectedPendingVideoKeys = [];
+    ui.pendingVideoErrors = {};
+    ui.videoThumbnailSets = {};
+    ui.videoUploadQueue = [];
+    ui.videoUploadProgress = null;
+    ui.videoUploadDraft = { title: "", categoryId: state.videoCategories[0]?.id || "" };
+    render();
+  }
+
+  function selectVideoThumbnail(key, index) {
+    const set = ui.videoThumbnailSets?.[key];
+    if (!set || !Array.isArray(set.frames) || !set.frames[index]) return;
+    set.selectedIndex = Number(index);
+    render();
+  }
+
+  async function prepareVideoThumbnailChoices(file) {
+    const key = pendingUploadKey(file);
+    ui.videoThumbnailSets[key] = { loading: true, frames: [], selectedIndex: 0, duration: 0, width: 0, height: 0, error: "" };
+    render();
+    try {
+      const payload = await fetchVideoThumbnailChoices(file);
+      const frames = Array.isArray(payload.frames) ? payload.frames.filter((frame) => frame?.dataUrl) : [];
+      if (!frames.length) throw new Error(payload.message || "구간 썸네일을 만들지 못했습니다.");
+      ui.videoThumbnailSets[key] = {
+        loading: false,
+        frames,
+        selectedIndex: 0,
+        duration: Number(payload.duration || 0),
+        width: Number(payload.width || 0),
+        height: Number(payload.height || 0),
+        error: "",
+      };
+    } catch (error) {
+      try {
+        const fallback = await captureVideoThumbnail(file);
+        ui.videoThumbnailSets[key] = {
+          loading: false,
+          frames: isUsableVideoFrame(fallback) ? [{ ...fallback, time: 0, percent: 0, index: 0 }] : [],
+          selectedIndex: 0,
+          duration: Number(fallback?.duration || 0),
+          width: Number(fallback?.width || 0),
+          height: Number(fallback?.height || 0),
+          error: error.message || "구간 추출 실패, 첫 프레임만 사용합니다.",
+        };
+      } catch (_fallbackError) {
+        ui.videoThumbnailSets[key] = {
+          loading: false,
+          frames: [],
+          selectedIndex: 0,
+          duration: 0,
+          width: 0,
+          height: 0,
+          error: error.message || "썸네일을 추출하지 못했습니다.",
+        };
+      }
+    }
+    render();
+  }
+
+  async function fetchVideoThumbnailChoices(file) {
+    const response = await fetch(SERVER_VIDEO_THUMBNAIL_SET_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type || "application/octet-stream",
+        "X-File-Name": encodeURIComponent(file.name || "video.webm"),
+        "X-Frame-Count": "6",
+      },
+      body: file,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || "서버에서 구간 썸네일을 추출하지 못했습니다.");
+    }
+    return payload;
+  }
+
+  function selectedVideoThumbnailFrame(file) {
+    const set = ui.videoThumbnailSets?.[pendingUploadKey(file)];
+    const frames = Array.isArray(set?.frames) ? set.frames : [];
+    return frames[Number(set?.selectedIndex || 0)] || frames[0] || null;
+  }
+
+  async function processPendingVideoUploads() {
+    if (!ui.pendingVideoFiles.length) {
+      alert("먼저 업로드할 비디오를 선택하세요.");
+      return;
+    }
+    if (videoThumbnailsBusy()) {
+      alert("썸네일을 추출하는 중입니다. 잠시 후 다시 저장하세요.");
+      return;
+    }
+    captureVideoUploadDraft();
+    const title = ui.videoUploadDraft.title.trim();
+    const categoryId = ui.videoUploadDraft.categoryId || state.videoCategories[0]?.id || "";
+    if (!title) {
+      alert("제목을 직접 입력하세요. 파일명으로 채우지 않습니다.");
+      return;
+    }
+    if (!categoryId) {
+      alert("카테고리를 선택하세요.");
+      return;
+    }
+    const files = [...ui.pendingVideoFiles];
+    const failedFiles = [];
+    ui.videoUploadProgress = { done: 0, total: files.length };
+    render();
+    for (const [index, file] of files.entries()) {
+      const queueEntry = { name: file.name, status: "메타데이터 읽는 중", error: "", url: "", itemId: "" };
+      ui.videoUploadQueue.unshift(queueEntry);
+      try {
+        const prompt = await readVideoPromptFromFile(file);
+        const promptJson = ensureVideoPromptJson(prompt?.promptJson);
+        queueEntry.status = "썸네일 적용 중";
+        let frame = selectedVideoThumbnailFrame(file);
+        if (!isUsableVideoFrame(frame)) frame = await captureVideoThumbnail(file);
+        if (frame && !(frame.width && frame.height)) {
+          const measured = await measureDataUrlImage(frame.dataUrl);
+          frame = { ...frame, width: measured.width || 640, height: measured.height || 360 };
+        }
+        const thumbSet = ui.videoThumbnailSets?.[pendingUploadKey(file)] || {};
+        const fileDuration = Number(thumbSet.duration || frame?.duration || 0) || 0;
+        const fileWidth = Number(thumbSet.width || frame?.width || 0) || 0;
+        const fileHeight = Number(thumbSet.height || frame?.height || 0) || 0;
+        const item = {
+          id: uid("vid"),
+          title,
+          categoryId,
+          memo: "",
+          imageUrl: frame.dataUrl,
+          thumbnailUrl: frame.dataUrl,
+          displayImage: { dataUrl: frame.dataUrl, width: frame.width, height: frame.height, size: frame.size, type: frame.mime || "image/webp" },
+          thumbnailImage: { dataUrl: frame.dataUrl, width: frame.width, height: frame.height, size: frame.size, type: frame.mime || "image/webp" },
+          promptJson,
+          durationSeconds: fileDuration,
+          width: fileWidth,
+          height: fileHeight,
+          status: "analyzed",
+          uploadMeta: {
+            fileName: file.name,
+            originalSize: file.size,
+            duration: fileDuration,
+            width: fileWidth,
+            height: fileHeight,
+            promptSource: prompt?.source || "metadata",
+            exifRawText: prompt?.rawText || "",
+          },
+          errorMessage: "",
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          versions: [],
+        };
+        if (state.videoSettings.translateOnUpload) {
+          queueEntry.status = "번역 중";
+          try {
+            await translateVideoItemPromptSections(item, { silent: true });
+          } catch (translationError) {
+            item.status = "modified";
+            item.errorMessage = `프롬프트는 저장됐지만 번역 실패: ${translationError.message || translationError}`;
+            queueEntry.error = item.errorMessage;
+          }
+        }
+        state.videoItems.unshift(item);
+        ui.videoSelectedId = item.id;
+        queueEntry.url = frame?.dataUrl || "";
+        queueEntry.itemId = item.id;
+        const saved = await saveVideoItemState(item);
+        queueEntry.status = saved ? "저장 완료" : "브라우저 임시 저장";
+      } catch (error) {
+        failedFiles.push(file);
+        ui.pendingVideoErrors[pendingUploadKey(file)] = error.message || String(error);
+        queueEntry.status = "실패";
+        queueEntry.error = error.message || String(error);
+      }
+      ui.videoUploadProgress = { done: index + 1, total: files.length };
+      render();
+    }
+    ui.pendingVideoFiles = failedFiles;
+    ui.selectedPendingVideoKeys = failedFiles.map(pendingUploadKey);
+    ui.videoUploadProgress = null;
+    if (!failedFiles.length) {
+      ui.modal = null;
+      ui.view = "gallery";
+    }
+    render();
+    if (failedFiles.length) showToast(`${failedFiles.length}개 비디오에서 프롬프트를 읽지 못했습니다.`, "warning", 3600);
+    else showToast("비디오 프롬프트를 저장했습니다.", "success", 1800);
+  }
+
+  async function readVideoPromptFromFile(file) {
+    const buffer = await file.arrayBuffer();
+    const resolve = videoPromptApi.resolveVideoPromptFromBytes;
+    if (typeof resolve !== "function") throw new Error("비디오 프롬프트 해석기를 불러오지 못했습니다.");
+    return resolve(buffer);
+  }
+
+  function isUsableVideoFrame(frame) {
+    const dataUrl = String(frame?.dataUrl || "");
+    if (!dataUrl.startsWith("data:image/")) return false;
+    if (dataUrl.startsWith("data:image/svg")) return false;
+    if (frame?.error) return false;
+    if ((frame.size || 0) < 1500) return false;
+    return true;
+  }
+
+  async function measureDataUrlImage(dataUrl) {
+    return new Promise((resolve) => {
+      const image = new Image();
+      image.onload = () => resolve({ width: image.naturalWidth || 0, height: image.naturalHeight || 0 });
+      image.onerror = () => resolve({ width: 0, height: 0 });
+      image.src = dataUrl;
+    });
+  }
+
+  async function captureVideoThumbnailOnServer(file) {
+    const response = await fetch(SERVER_VIDEO_THUMBNAIL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type || "application/octet-stream",
+        "X-File-Name": encodeURIComponent(file.name || "video.webm"),
+      },
+      body: file,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok || !payload.dataUrl) {
+      throw new Error(payload.message || "서버에서 첫 프레임을 추출하지 못했습니다.");
+    }
+    const size = payload.size || Math.round(String(payload.dataUrl).length * 0.75);
+    const measured = await measureDataUrlImage(payload.dataUrl);
+    return {
+      dataUrl: payload.dataUrl,
+      width: measured.width || 640,
+      height: measured.height || 360,
+      size,
+      mime: payload.mime || "image/webp",
+      duration: 0,
+    };
+  }
+
+  async function captureVideoThumbnail(file) {
+    try {
+      const serverFrame = await captureVideoThumbnailOnServer(file);
+      if (isUsableVideoFrame(serverFrame)) return serverFrame;
+    } catch (_serverError) {
+      // Fall back to the browser decoder when ffmpeg is unavailable.
+    }
+    const local = await captureVideoFirstFrame(file);
+    if (isUsableVideoFrame(local)) return local;
+    return local;
+  }
+
+  async function captureVideoFirstFrame(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = "auto";
+      video.src = url;
+      await new Promise((resolve, reject) => {
+        const fail = () => reject(new Error("브라우저가 이 비디오 코덱을 재생하지 못했습니다."));
+        const timer = window.setTimeout(() => reject(new Error("비디오 로딩이 시간 초과되었습니다.")), 12000);
+        const done = () => {
+          window.clearTimeout(timer);
+          resolve();
+        };
+        video.addEventListener("loadeddata", done, { once: true });
+        video.addEventListener("error", () => {
+          window.clearTimeout(timer);
+          fail();
+        }, { once: true });
+      });
+      try {
+        await video.play();
+        video.pause();
+      } catch (_error) {
+        // Autoplay can fail; seeking still works after loadeddata.
+      }
+      const seekTargets = [0.04, 0.12, 0];
+      for (const time of seekTargets) {
+        await new Promise((resolve) => {
+          const finish = () => resolve();
+          video.addEventListener("seeked", finish, { once: true });
+          try {
+            video.currentTime = time;
+          } catch (_error) {
+            finish();
+          }
+        });
+        if (video.videoWidth && video.videoHeight) break;
+      }
+      const width = video.videoWidth || 640;
+      const height = video.videoHeight || 360;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      context.drawImage(video, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL("image/webp", 0.86);
+      return {
+        dataUrl,
+        width,
+        height,
+        size: Math.round(dataUrl.length * 0.75),
+        duration: Number(video.duration) || 0,
+      };
+    } catch (error) {
+      return {
+        dataUrl: videoPlaceholderDataUrl(),
+        width: 640,
+        height: 360,
+        size: 0,
+        duration: 0,
+        error: error.message,
+      };
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  function videoPlaceholderDataUrl() {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"><rect width="640" height="360" fill="#0f172a"/><rect x="250" y="130" width="140" height="100" rx="16" fill="#38bdf8"/><path d="M300 155v50l48-25-48-25z" fill="#0f172a"/></svg>`;
+    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+  }
+
+  function videoPromptText(item, mode) {
+    if (!item?.promptJson) return "";
+    const includeTitles = mode !== "final" && state.videoSettings.includeSectionTitles;
+    const blocks = videoSectionMeta.map((section) => {
+      const sentences = item.promptJson[section.key]?.sentences || [];
+      const lines = [];
+      if (includeTitles) {
+        if (mode === "ko") lines.push(`[${section.labelKo}]`);
+        else if (mode === "both") lines.push(`[${section.labelEn} / ${section.labelKo}]`);
+        else lines.push(`[${section.labelEn}]`);
+      }
+      if (mode === "ko") lines.push(...sentences.map((sentence) => sentence.ko).filter(Boolean));
+      else if (mode === "both") lines.push(...sentences.map((sentence) => [sentence.en, sentence.ko].filter(Boolean).join("\n")).filter(Boolean));
+      else lines.push(...sentences.map((sentence) => sentence.en).filter(Boolean));
+      return lines.join("\n").trim();
+    }).filter(Boolean);
+    return blocks.join(mode === "final" ? "\n\n" : "\n\n\n");
+  }
+
+  function copyVideoPrompt(id, mode) {
+    const item = findVideoItem(id);
+    if (!item?.promptJson) return;
+    writeClipboard(videoPromptText(item, mode), "복사했습니다.");
+  }
+
+  function copyVideoSection(id, sectionKey, lang) {
+    const item = findVideoItem(id);
+    const sectionConfig = videoSectionMeta.find((section) => section.key === sectionKey);
+    const sentences = item?.promptJson?.[sectionKey]?.sentences || [];
+    const mode = ["en", "ko", "both", "final"].includes(lang) ? lang : "en";
+    const parts = [];
+    if (state.videoSettings.includeSectionTitles && sectionConfig) {
+      parts.push(mode === "ko" ? sectionConfig.labelKo : sectionConfig.labelEn);
+    }
+    if (mode === "both") parts.push(...sentences.map((sentence) => `${sentence.en}\n${sentence.ko}`));
+    else if (mode === "ko") parts.push(...sentences.map((sentence) => sentence.ko).filter(Boolean));
+    else parts.push(...sentences.map((sentence) => sentence.en).filter(Boolean));
+    writeClipboard(parts.join("\n").trim(), "문단을 복사했습니다.");
+  }
+
+  async function saveVideoDetail(id) {
+    const item = findVideoItem(id);
+    if (!item) return;
+    collectPromptEditsFromDom(item);
+    item.title = document.getElementById("videoDetailTitle")?.value.trim() || "";
+    item.categoryId = document.getElementById("videoDetailCategory")?.value || item.categoryId || state.videoCategories[0]?.id || "";
+    item.memo = document.getElementById("videoDetailMemo")?.value.trim() || "";
+    if (item.promptJson) item.finalPrompt = videoPromptText(item, "final");
+    item.updatedAt = Date.now();
+    const saved = await saveVideoItemState(item);
+    render();
+    showToast(saved ? "서버에 저장했습니다." : "브라우저에 임시 저장했습니다.", saved ? "success" : "warning", saved ? 1400 : 3000);
+  }
+
+  function deleteVideoItem(id) {
+    if (!confirm("이 비디오 항목을 삭제할까요?")) return;
+    const index = state.videoItems.findIndex((item) => item.id === id);
+    if (index >= 0) state.videoItems.splice(index, 1);
+    ui.videoSelectedId = state.videoItems[0]?.id || null;
+    ui.view = "gallery";
+    deleteVideoItemState(id);
+    render();
+  }
+
+  function deleteSelectedVideoItems() {
+    const selectedIds = [...new Set(ui.selectedBulkDeleteIds || [])].filter((id) => state.videoItems.some((item) => item.id === id));
+    if (!selectedIds.length) {
+      alert("삭제할 게시물을 먼저 선택하세요.");
+      return;
+    }
+    if (!confirm(`선택한 ${selectedIds.length}개 비디오 항목을 삭제할까요?`)) return;
+    const selected = new Set(selectedIds);
+    state.videoItems = state.videoItems.filter((item) => !selected.has(item.id));
+    if (selected.has(ui.videoSelectedId)) ui.videoSelectedId = state.videoItems[0]?.id || null;
+    ui.bulkDeleteMode = false;
+    ui.selectedBulkDeleteIds = [];
+    ui.view = "gallery";
+    resetGalleryWindow();
+    saveVideoItemsState();
+    render();
+    showToast(`${selectedIds.length}개 비디오 항목을 삭제했습니다.`, "success", 1600);
+  }
+
+  async function translateVideoItemPromptSections(item, options = {}) {
+    for (const section of videoSectionMeta) {
+      const sentences = (item.promptJson?.[section.key]?.sentences || [])
+        .map((sentence) => ({ id: sentence.id, en: String(sentence.en || "").trim() }))
+        .filter((sentence) => sentence.en);
+      if (!sentences.length) continue;
+      const response = await fetch(SERVER_TRANSLATE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          sectionKey: section.key,
+          sectionLabel: section.labelKo,
+          sentences,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || `${section.labelKo} 번역에 실패했습니다.`);
+      const byId = new Map((payload.translations || []).map((entry) => [entry.id, entry.ko]));
+      item.promptJson[section.key].sentences.forEach((sentence) => {
+        const translated = byId.get(sentence.id);
+        if (translated) sentence.ko = translated;
+      });
+    }
+    if (!options.silent) render();
+  }
+
+  async function retranslateVideoSection(id, key) {
+    const item = findVideoItem(id);
+    if (!item?.promptJson?.[key]) return;
+    collectPromptEditsFromDom(item);
+    const sectionConfig = videoSectionMeta.find((section) => section.key === key);
+    const sentences = item.promptJson[key].sentences.map((sentence) => ({
+      id: sentence.id,
+      en: String(sentence.en || "").trim(),
+    })).filter((sentence) => sentence.en);
+    if (!sentences.length) {
+      showToast("재번역할 영어 문장이 없습니다.", "warning", 1600);
+      return;
+    }
+    showToast("번역 중입니다.", "info", 1000);
+    try {
+      const response = await fetch(SERVER_TRANSLATE_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          itemId: item.id,
+          sectionKey: key,
+          sectionLabel: sectionConfig?.labelKo || key,
+          sentences,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || "번역 요청에 실패했습니다.");
+      const byId = new Map((payload.translations || []).map((entry) => [entry.id, entry.ko]));
+      item.promptJson[key].sentences.forEach((sentence) => {
+        const translated = byId.get(sentence.id);
+        if (translated) sentence.ko = translated;
+      });
+      item.updatedAt = Date.now();
+      const saved = await saveVideoItemState(item);
+      render();
+      showToast(saved ? "한국어 재번역과 저장이 끝났습니다." : "재번역 결과를 브라우저에 임시 저장했습니다.", saved ? "success" : "warning", 1800);
+    } catch (error) {
+      showToast(error.message || "번역에 실패했습니다.", "warning", 2400);
+    }
   }
 
   function bindBackspaceNavigation() {
@@ -7368,7 +9760,8 @@
       if (shortcutMatches(event, shortcuts.copyFinal)) {
         const item = selectedItem();
         if (ui.view === "detail" && item?.promptJson) {
-          copyPrompt(item.id, "final");
+          if (isVideoArchiveMode()) copyVideoPrompt(item.id, "final");
+          else copyPrompt(item.id, "final");
           event.preventDefault();
         }
       }
@@ -7376,13 +9769,14 @@
   }
 
   function navigateAdjacentItem(delta) {
-    const items = getFilteredItems();
+    const items = isVideoArchiveMode() ? getFilteredVideoItems() : getFilteredItems();
     if (!items.length) return false;
     // Only navigate when already viewing a detail item.
     if (ui.view !== "detail") return false;
-    const index = items.findIndex((item) => item.id === ui.selectedId);
+    const currentId = isVideoArchiveMode() ? ui.videoSelectedId : ui.selectedId;
+    const index = items.findIndex((item) => item.id === currentId);
     const next = items[Math.max(0, Math.min(items.length - 1, (index < 0 ? 0 : index) + delta))];
-    if (!next || next.id === ui.selectedId) return false;
+    if (!next || next.id === currentId) return false;
     openItem(next.id);
     return true;
   }
@@ -7408,11 +9802,19 @@
   }
 
   function selectedItem() {
-    return findItem(ui.selectedId);
+    return isVideoArchiveMode() ? findVideoItem(ui.videoSelectedId) : findItem(ui.selectedId);
   }
 
   function findItem(id) {
     return state.items.find((item) => item.id === id);
+  }
+
+  function findVideoItem(id) {
+    return (state.videoItems || []).find((item) => item.id === id);
+  }
+
+  function currentArchiveItems() {
+    return isVideoArchiveMode() ? (state.videoItems || []) : state.items;
   }
 
   function categoryName(id, fallback = "미분류") {
@@ -7447,6 +9849,7 @@
     const root = document.documentElement;
     if (!state.themeSettings.useSectionBackgrounds) {
       sectionMeta.forEach((section) => root.style.setProperty(`--section-${section.colorKey.replace("_pose", "")}`, "var(--panel)"));
+      videoSectionMeta.forEach((section) => root.style.setProperty(`--section-${section.colorKey}`, "var(--panel)"));
       return;
     }
     const colors = state.themeSettings.sectionColors || {};
